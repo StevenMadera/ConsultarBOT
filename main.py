@@ -3,9 +3,12 @@ import queue
 import re
 import sys
 import threading
+import time
 import unicodedata
 from datetime import datetime
+from difflib import get_close_matches
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import pymupdf
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -14,6 +17,8 @@ from playwright.sync_api import sync_playwright
 from comun import CAPTURAS, log
 from consulta_consilium import consultar_consilium
 from consulta_fbi import consultar_fbi
+from consulta_justicia import consultar_justicia
+from consulta_terroristas import consultar_terroristas
 
 URL = "https://www.procuraduria.gov.co/Pages/Consulta-de-Antecedentes.aspx"
 URL_RUNT = "https://portalpublico.runt.gov.co/#/consulta-ciudadano-documento/consulta/consulta-ciudadano-documento"
@@ -21,8 +26,8 @@ URL_SIMIT = "https://www.fcm.org.co/simit/#/home-public"
 URL_LIBRETA = "https://definicion.libretamilitar.mil.co/consulta-estado-situacion-militar"
 URL_OFAC = "https://sanctionssearch.ofac.treas.gov/"
 URL_GOVUK = "https://www.gov.uk/"
-URL_JUSTICIA = "https://www.justice.gov/"
-URL_EUMOSTWANTED = "https://eumostwanted.eu/"
+URL_EUMOSTWANTED = "https://eumostwanted.eu/search/node?keys={nombre}"
+URL_EURLEX = "https://eur-lex.europa.eu/legal-content/ES/TXT/HTML/?uri=OJ:L:2022:025:FULL&from=ES"
 ARCHIVO_CONSOLIDADO = Path(__file__).parent / "Plantilla" / "consolidatedLegacyByNAME.html"
 ANCHO_MAXIMO = 1600
 SALIDAS = Path(__file__).parent / "salidas"
@@ -92,14 +97,20 @@ def resolver_pregunta(texto: str, numero: str, nombre: str) -> str:
         ultimos = re.search(r"ultim[oa]s", t) is not None
         base = numero if cantidad[2] == "digitos" else sin_tildes(nombre.split()[0].lower())
         return base[-n:] if ultimos else base[:n]
+    if re.search(r"\bprimer nombre\b", t):
+        primer_nombre = sin_tildes(nombre.split()[0].lower())
+        if "letras" in t and re.search(r"\b(?:cantidad|numero|cuantas?)\b", t):
+            return str(len(primer_nombre))
+        return primer_nombre
     capital = re.search(r"capital\s+d(?:e|el|e la)\s+(.+?)\s*(?:\(|\?|$)", t)
     if capital:
-        depto = capital[1].strip()
+        depto = re.sub(r"[^a-z\s]", " ", capital[1]).strip()
+        depto = re.sub(r"\s+", " ", depto)
         if depto in CAPITALES:
             return CAPITALES[depto]
-        for nombre_depto, cap in CAPITALES.items():
-            if nombre_depto in depto:
-                return cap
+        coincidencia = get_close_matches(depto, CAPITALES, n=1, cutoff=0.78)
+        if coincidencia:
+            return CAPITALES[coincidencia[0]]
     raise ValueError(f"Pregunta desconocida: {texto!r}")
 
 
@@ -114,6 +125,8 @@ UBICACION_PDF = {
     "govuk": (4, "arriba"),
     "fbi": (4, "abajo"),
     "justicia": (5, "arriba"),
+    "terroristas": (5, "abajo"),
+    "consolium": (6, "arriba"),
     "eumostwanted": (6, "abajo"),
     "consilium": (7, "unico"),
     "consolidado": (3, "abajo"),
@@ -249,18 +262,97 @@ def consultar_runt(page, persona: dict, pedir_captcha) -> Path:
     return ruta
 
 
-def consultar_simit(page, persona: dict) -> Path:
+# null mientras SIMIT valida o carga; su validación de seguridad puede tardar más de 30 s.
+SIMIT_ESTADO_JS = """() => {
+    const visible = sel => [...document.querySelectorAll(sel)].some(
+        e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden'
+    );
+    if (visible('#whcModal') || visible('#loader.active')) return null;
+    if (visible('#modal-multiples-personas')) return 'varios';
+    if (/Comparendos:/.test(document.body.innerText)) return 'resultado';
+    if (visible('.modal.show, .swal2-popup, [role=alertdialog]')) return 'mensaje';
+    return null;
+}"""
+
+
+def esperar_simit(page) -> str:
+    try:
+        return page.wait_for_function(SIMIT_ESTADO_JS, timeout=120000, polling=500).json_value()
+    except PlaywrightTimeoutError:
+        raise ValueError("SIMIT no mostró el resultado en 2 minutos; no se generó captura.") from None
+
+
+def seleccionar_persona_simit(page, persona: dict, pedir_seleccion):
+    dialogo = page.locator("#modal-multiples-personas")
+    radios = dialogo.get_by_role("radio")
+    etiquetas = []
+    puntuaciones = []
+    tokens_nombre = [sin_tildes(token).upper() for token in persona["nombre"].split()]
+    for indice in range(radios.count()):
+        radio = radios.nth(indice)
+        etiqueta = radio.evaluate(
+            "e => e.labels?.[0]?.innerText || e.getAttribute('aria-label') || e.parentElement?.innerText || ''"
+        ).strip()
+        etiquetas.append(etiqueta)
+        prefijos = re.findall(r"([A-ZÁÉÍÓÚÜÑ]{2,})\*+", etiqueta.upper())
+        coincidencias = sum(any(token.startswith(prefijo) for token in tokens_nombre) for prefijo in prefijos)
+        puntuaciones.append(coincidencias / len(prefijos) if prefijos else 0)
+
+    mejor = max(puntuaciones, default=0)
+    candidatos = [i for i, puntuacion in enumerate(puntuaciones) if puntuacion == mejor and puntuacion >= 0.75]
+    if len(candidatos) == 1:
+        seleccion = candidatos[0]
+    else:
+        opciones = "\n".join(f"{i + 1}. {etiqueta}" for i, etiqueta in enumerate(etiquetas))
+        if pedir_seleccion is None:
+            raise ValueError(f"SIMIT requiere elegir una coincidencia:\n{opciones}")
+        valor = pedir_seleccion(
+            "SIMIT encontró varias personas. Elige la que corresponde al nombre consultado:\n"
+            f"{opciones}\nNúmero de opción: "
+        )
+        try:
+            seleccion = int(valor) - 1
+        except ValueError as error:
+            raise ValueError("La opción de persona de SIMIT debe ser un número.") from error
+        if not 0 <= seleccion < len(etiquetas):
+            raise ValueError("La opción de persona de SIMIT está fuera del rango mostrado.")
+
+    radio = radios.nth(seleccion)
+    radio_id = radio.get_attribute("id")
+    if radio_id:
+        dialogo.locator(f"label[for='{radio_id}']").click()
+    else:
+        radio.click(force=True)
+    dialogo.get_by_role("button", name=re.compile(r"continuar", re.I)).click()
+    dialogo.wait_for(state="hidden", timeout=120000)
+
+
+def consultar_simit(page, persona: dict, pedir_seleccion=None) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
     page.goto(URL_SIMIT, wait_until="domcontentloaded")
     page.reload(wait_until="domcontentloaded")
+    validacion = page.locator("#whcModal")
     try:
-        page.locator("button.close:visible").first.click(timeout=15000)
+        validacion.wait_for(state="visible", timeout=5000)
+    except PlaywrightTimeoutError:
+        pass
+    try:
+        validacion.wait_for(state="hidden", timeout=120000)
+    except PlaywrightTimeoutError:
+        raise ValueError("SIMIT no terminó su validación de seguridad en 2 minutos; no se generó captura.") from None
+    try:
+        page.locator("button.close:visible").first.click(timeout=5000)
     except PlaywrightTimeoutError:
         pass
     page.locator("#txtBusqueda").fill(numero)
-    page.locator("#consultar").click()
-    page.wait_for_url("**/estado-cuenta", timeout=20000)
-    page.get_by_text("Comparendos:").first.wait_for(timeout=20000)
+    page.locator("#consultar").click(timeout=120000)
+    page.wait_for_url("**/estado-cuenta", timeout=30000)
+    estado = esperar_simit(page)
+    if estado == "varios":
+        seleccionar_persona_simit(page, persona, pedir_seleccion)
+        estado = esperar_simit(page)
+    if estado != "resultado":
+        log("SIMIT: no apareció el resumen de comparendos; se captura el mensaje mostrado por el sitio.")
     page.wait_for_timeout(500)
 
     # Contrae la pestaña "Herramientas de accesibilidad" (el sitio recuerda su estado entre cargas).
@@ -327,31 +419,21 @@ def consultar_govuk(page, persona: dict) -> Path:
     return ruta
 
 
-def consultar_justicia(page, persona: dict) -> Path:
-    page.goto(URL_JUSTICIA, wait_until="domcontentloaded")
-    campo = page.locator("#search-field-en-small-desktop")
-    campo.fill(persona["nombre"])
-    campo.press("Enter")
-    page.wait_for_url("**/search**", timeout=20000)
-    page.get_by_text(re.compile(r"\d+ results?|no results", re.I)).first.wait_for(timeout=20000)
-
-    CAPTURAS.mkdir(exist_ok=True)
-    ruta = CAPTURAS / f"justicia_{re.sub(r'\D', '', persona['numero'])}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    captura_ajustada(page, ruta, "justicia")
-    return ruta
-
-
 def consultar_eumostwanted(page, persona: dict) -> Path:
-    page.goto(URL_EUMOSTWANTED, wait_until="domcontentloaded")
+    nombre = " ".join(persona["nombre"].split())
+    # El sitio a veces tarda más de 30 s en entregar el HTML completo.
+    page.goto(URL_EUMOSTWANTED.format(nombre=quote_plus(nombre)), wait_until="commit", timeout=60000)
+    page.get_by_role(
+        "heading", name=re.compile(r"search results|your search yielded no results", re.I)
+    ).first.wait_for(timeout=60000)
     try:
         page.get_by_text("I don't agree", exact=True).first.click(timeout=5000)
     except PlaywrightTimeoutError:
         pass
-    campo = page.locator("#edit-keys")
-    campo.fill(persona["nombre"])
-    campo.press("Enter")
-    page.wait_for_url("**/search**", timeout=20000)
-    page.wait_for_load_state("load")
+    try:
+        page.wait_for_load_state("load", timeout=30000)
+    except PlaywrightTimeoutError:
+        pass
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"eumostwanted_{re.sub(r'\D', '', persona['numero'])}_{datetime.now():%Y%m%d_%H%M%S}.png"
@@ -408,6 +490,24 @@ def consultar_documento(page, persona: dict) -> Path:
     return ruta
 
 
+def consultar_eurlex(page, persona: dict) -> Path:
+    """Busca el número en el Diario Oficial L 25/2022 como con Ctrl+F."""
+    numero = re.sub(r"\D", "", persona["numero"])
+    page.set_viewport_size({"width": 1600, "height": round(1600 * proporcion_zona("consolium"))})
+    page.goto(URL_EURLEX, wait_until="domcontentloaded", timeout=60000)
+    # La primera respuesta (HTTP 202) es una página intermedia que recarga sola el documento.
+    page.get_by_text("Diario Oficial").first.wait_for(timeout=60000)
+    page.wait_for_load_state("load", timeout=60000)
+    coincidencias = page.evaluate(BUSCAR_EN_DOCUMENTO_JS, numero)
+    log(f"EUR-Lex: {coincidencias} coincidencias para {numero}")
+    page.wait_for_timeout(500)
+
+    CAPTURAS.mkdir(exist_ok=True)
+    ruta = CAPTURAS / f"consolium_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
+    page.screenshot(path=str(ruta))
+    return ruta
+
+
 def consultar_ofac(page, persona: dict) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
     page.goto(URL_OFAC, wait_until="domcontentloaded")
@@ -443,24 +543,89 @@ def consultar_libreta(page, persona: dict) -> Path:
 
 def consultar(page, persona: dict) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
-    page.goto(URL, wait_until="domcontentloaded")
     form = page.frame_locator("iframe[src*='webcert']")
-    form.locator("#ddlTipoID").select_option(label=TIPOS[persona["tipo"].upper()])
-    form.locator("#txtNumID").fill(numero)
+    pregunta_loc = form.locator("#lblPregunta")
+    respuesta_loc = form.locator("#txtRespuestaPregunta")
+    cuerpo = form.locator("body")
+    datos_ciudadano = form.get_by_text("Datos del ciudadano").first
+    error_respuesta = form.get_by_text(
+        re.compile(r"el valor ingresado para la respuesta no responde a la pregunta", re.I)
+    ).first
+    no_registrado = form.get_by_text(
+        re.compile(r"el n[uú]mero de identificaci[oó]n ingresado no se encuentra registrado", re.I)
+    ).first
 
-    # La pregunta puede cambiar tras el postback del tipo de ID.
-    page.wait_for_load_state("networkidle")
-    pregunta = form.locator("#lblPregunta").inner_text().strip()
-    respuesta = resolver_pregunta(pregunta, numero, persona["nombre"])
-    log(f"Pregunta: {pregunta!r} -> {respuesta!r}")
-    form.locator("#txtRespuestaPregunta").fill(respuesta)
+    def cargar_formulario():
+        # El portal a veces tarda más de 30 s en cargar el formulario.
+        page.goto(URL, wait_until="domcontentloaded", timeout=90000)
+        form.locator("#ddlTipoID").select_option(label=TIPOS[persona["tipo"].upper()], timeout=90000)
+        form.locator("#txtNumID").fill(numero)
+        # La pregunta puede cambiar tras el postback del tipo de ID.
+        try:
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except PlaywrightTimeoutError:
+            pass
 
-    form.locator("#btnConsultar").click()
+    cargar_formulario()
+    for intento in range(3):
+        pregunta_loc.wait_for(state="visible", timeout=30000)
+        pregunta = pregunta_loc.inner_text().strip()
+        respuesta = resolver_pregunta(pregunta, numero, persona["nombre"])
+        log(f"Pregunta: {pregunta!r} -> {respuesta!r}")
+        respuesta_loc.fill(respuesta)
+        texto_inicial = cuerpo.inner_text(timeout=10000)
+        form.locator("#btnConsultar").click()
+        limite = time.monotonic() + 60
+        estado = None
+        consultando = False
+        texto_previo = texto_inicial
+        texto_estable_desde = None
+        while time.monotonic() < limite:
+            if datos_ciudadano.is_visible():
+                estado = "resultado"
+                break
+            if no_registrado.is_visible():
+                estado = "sin_registro"
+                break
+            if error_respuesta.is_visible():
+                estado = "respuesta_incorrecta"
+                break
+            texto_actual = cuerpo.inner_text(timeout=2000)
+            consultando = bool(re.search(r"consultando\s*,?\s*por favor espere|cargando", texto_actual, re.I))
+            if consultando:
+                texto_previo = texto_actual
+                texto_estable_desde = None
+                page.wait_for_timeout(300)
+                continue
+            if texto_actual != texto_inicial and texto_actual == texto_previo:
+                if texto_estable_desde is None:
+                    texto_estable_desde = time.monotonic()
+                elif time.monotonic() - texto_estable_desde >= 2:
+                    estado = "resultado_estable"
+                    break
+            else:
+                texto_previo = texto_actual
+                texto_estable_desde = None
+            page.wait_for_timeout(250)
+        if estado == "respuesta_incorrecta":
+            if intento == 2:
+                raise ValueError("Procuraduría rechazó tres respuestas de verificación.")
+            log("Procuraduría rechazó la respuesta; se resolverá el nuevo reto.")
+            continue
+        if estado is None:
+            if intento == 2:
+                raise ValueError("Procuraduría no mostró un resultado en 3 intentos; no se generó captura.")
+            motivo = "seguía consultando" if consultando else "la página no cambió"
+            log(f"Procuraduría: sin resultado en 60 s ({motivo}); se repite la consulta ({intento + 2}/3).")
+            cargar_formulario()
+            continue
+        if estado == "resultado_estable":
+            log("Procuraduría: contenido de resultado estable aunque cambió el rótulo del portal.")
+        break
     try:
-        form.get_by_text("Datos del ciudadano").wait_for(timeout=15000)
+        page.wait_for_load_state("networkidle", timeout=10000)
     except PlaywrightTimeoutError:
         pass
-    page.wait_for_load_state("networkidle")
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
@@ -526,12 +691,15 @@ class Trabajador(threading.Thread):
 
 def main():
     consola = consola_siempre_visible()
-    solicitudes_captcha = queue.Queue()
+    solicitudes_usuario = queue.Queue()
+
+    def pedir_usuario(mensaje: str) -> str:
+        respuesta = queue.Queue()
+        solicitudes_usuario.put((mensaje, respuesta))
+        return respuesta.get()
 
     def pedir_captcha() -> str:
-        respuesta = queue.Queue()
-        solicitudes_captcha.put(respuesta)
-        return respuesta.get()
+        return pedir_usuario("Captcha del RUNT (5 caracteres, mira la ventana del RUNT): ")
 
     trabajadores = {
         "procuraduria": Trabajador(consultar, headless=True),
@@ -539,9 +707,9 @@ def main():
         "simit": Trabajador(consultar_simit, headless=True),
         "ofac": Trabajador(consultar_ofac, headless=True),
         "govuk": Trabajador(consultar_govuk, headless=True),
-        "justicia": Trabajador(consultar_justicia, headless=True),
         "eumostwanted": Trabajador(consultar_eumostwanted, headless=True),
         "consolidado": Trabajador(consultar_documento, headless=True),
+        "consolium": Trabajador(consultar_eurlex, headless=True),
         # El headless nuevo (canal "chromium") incluye el visor de PDF que usa la libreta.
         "libreta": Trabajador(consultar_libreta, headless=True, canal="chromium"),
     }
@@ -560,21 +728,21 @@ def main():
                 continue
             log(f"Datos: {persona} | apellido RUNT: {primer_apellido(persona['nombre'])}")
             trabajadores["procuraduria"].entrada.put((persona,))
-            trabajadores["simit"].entrada.put((persona,))
+            trabajadores["simit"].entrada.put((persona, pedir_usuario))
             trabajadores["libreta"].entrada.put((persona,))
             trabajadores["ofac"].entrada.put((persona,))
             trabajadores["govuk"].entrada.put((persona,))
-            trabajadores["justicia"].entrada.put((persona,))
             trabajadores["eumostwanted"].entrada.put((persona,))
             trabajadores["consolidado"].entrada.put((persona,))
+            trabajadores["consolium"].entrada.put((persona,))
             trabajadores["runt"].entrada.put((persona, pedir_captcha))
 
             resultados = {}
             while len(resultados) < len(trabajadores):
                 try:
-                    respuesta = solicitudes_captcha.get(timeout=0.2)
+                    mensaje, respuesta = solicitudes_usuario.get(timeout=0.2)
                     enfocar_consola(consola)
-                    respuesta.put(input("Captcha del RUNT (5 caracteres, mira la ventana del RUNT): ").strip())
+                    respuesta.put(input(mensaje).strip())
                 except queue.Empty:
                     pass
                 for nombre, t in trabajadores.items():
@@ -592,7 +760,12 @@ def main():
                 else:
                     log(f"ERROR {nombre}: {valor}")
             # Van aparte: la verificación de Cloudflare la pasa una persona en su navegador.
-            for clave, consulta_manual in ("fbi", consultar_fbi), ("consilium", consultar_consilium):
+            for clave, consulta_manual in (
+                ("terroristas", consultar_terroristas),
+                ("justicia", consultar_justicia),
+                ("fbi", consultar_fbi),
+                ("consilium", consultar_consilium),
+            ):
                 try:
                     capturas[clave] = consulta_manual(persona)
                     log(f"Captura {clave}: {capturas[clave]}")

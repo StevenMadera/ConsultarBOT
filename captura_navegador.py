@@ -85,11 +85,27 @@ def _minimizar_consola() -> int | None:
     return None
 
 
-def capturar_navegador(url: str, titulo: str, nombre: str, prefijo: str, numero: str) -> Path:
+def capturar_navegador(
+    url: str,
+    titulo: str,
+    nombre: str,
+    prefijo: str,
+    numero: str,
+    paso_manual: str | None = None,
+) -> Path:
     """Abre `url` en el navegador por defecto y captura la página de la ventana cuyo título contiene `titulo`."""
     numero = re.sub(r"\D", "", numero)
     webbrowser.open(url, new=2)
     ventana = _esperar_pagina(titulo, nombre)
+
+    if paso_manual:
+        if ventana.isMinimized:
+            ventana.restore()
+        try:
+            ventana.activate()
+        except Exception:
+            pass
+        input(f"{nombre}: {paso_manual} Pulsa Enter cuando la lista esté visible... ")
 
     consola = _minimizar_consola()
     try:

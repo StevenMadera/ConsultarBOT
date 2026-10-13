@@ -10,7 +10,12 @@ URL_CONSILIUM = "https://www.consilium.europa.eu/es/search/?query={nombre}"
 
 def consultar_consilium(persona: dict) -> Path:
     return capturar_navegador(
-        URL_CONSILIUM.format(nombre=quote(persona["nombre"])), "Consilium", "Consilium", "consilium", persona["numero"]
+        URL_CONSILIUM.format(nombre=quote(persona["nombre"])),
+        "Consilium",
+        "Consilium",
+        "consilium",
+        persona["numero"],
+        paso_manual="Acepta solo las cookies necesarias y espera a que aparezca la lista.",
     )
 
 
