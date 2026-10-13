@@ -5,6 +5,7 @@ navegador normal; este módulo solo abre la página y toma la captura de pantall
 """
 import ctypes
 import re
+import threading
 import time
 import webbrowser
 from ctypes import wintypes
@@ -17,11 +18,17 @@ import pygetwindow as gw
 
 from comun import CAPTURAS, log
 
-ESPERA_MINIMA = 5
+ESPERA_MINIMA = 2
 ESPERA_ESTABLE_MAXIMA = 12
-ESPERA_MAXIMA = 30
+# La verificación automática de Consilium puede tardar más de 20 s antes de mostrar la página.
+ESPERA_MAXIMA = 60
 TITULOS_VERIFICACION = ("just a moment", "un momento", "verifying", "verificando")
 _ENUM_VENTANAS = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+# Pasos manuales ya hechos en esta sesión: Edge recuerda, por ejemplo, el consentimiento de cookies.
+_PASOS_HECHOS: set[str] = set()
+# Una captura necesita el foco y la pantalla: no puede coincidir con otra ni con una pregunta en la consola.
+# Quien lo tiene y pregunta al usuario debe hacerlo sin volver a pedirlo.
+PANTALLA = threading.Lock()
 
 
 def _hay_verificacion() -> bool:
@@ -36,7 +43,7 @@ def _buscar_ventana(titulo: str):
     return None
 
 
-def _esperar_pagina(titulo: str, nombre: str):
+def _esperar_pagina(titulo: str, nombre: str, preguntar):
     """Espera a que el título de la ventana sea el de la página; si sale la verificación, pide pasarla."""
     time.sleep(1)  # La pestaña nueva tarda un instante en tomar el foco.
     fin = time.time() + ESPERA_MAXIMA
@@ -45,7 +52,7 @@ def _esperar_pagina(titulo: str, nombre: str):
         if _hay_verificacion() and not avisado:
             avisado = True
             log(f"{nombre}: verificación de Cloudflare detectada")
-            input("Pasa la verificación en el navegador y pulsa Enter... ")
+            preguntar("Pasa la verificación en el navegador y pulsa Enter... ")
             fin = time.time() + ESPERA_MAXIMA
         ventana = _buscar_ventana(titulo)
         if ventana:
@@ -85,6 +92,16 @@ def _minimizar_consola() -> int | None:
     return None
 
 
+def _cerrar_pestana(ventana, titulo: str):
+    """Cierra con Ctrl+W la pestaña capturada, solo si el navegador sigue en primer plano mostrándola."""
+    user32 = ctypes.windll.user32
+    if user32.GetForegroundWindow() != ventana._hWnd or titulo not in ventana.title:
+        return
+    VK_CONTROL, VK_W, KEYEVENTF_KEYUP = 0x11, 0x57, 0x0002
+    for tecla, evento in ((VK_CONTROL, 0), (VK_W, 0), (VK_W, KEYEVENTF_KEYUP), (VK_CONTROL, KEYEVENTF_KEYUP)):
+        user32.keybd_event(tecla, 0, evento, 0)
+
+
 def capturar_navegador(
     url: str,
     titulo: str,
@@ -92,20 +109,28 @@ def capturar_navegador(
     prefijo: str,
     numero: str,
     paso_manual: str | None = None,
+    espera_minima: float = ESPERA_MINIMA,
+    preguntar=input,
 ) -> Path:
     """Abre `url` en el navegador por defecto y captura la página de la ventana cuyo título contiene `titulo`."""
+    with PANTALLA:
+        return _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, preguntar)
+
+
+def _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, preguntar) -> Path:
     numero = re.sub(r"\D", "", numero)
     webbrowser.open(url, new=2)
-    ventana = _esperar_pagina(titulo, nombre)
+    ventana = _esperar_pagina(titulo, nombre, preguntar)
 
-    if paso_manual:
+    if paso_manual and nombre not in _PASOS_HECHOS:
         if ventana.isMinimized:
             ventana.restore()
         try:
             ventana.activate()
         except Exception:
             pass
-        input(f"{nombre}: {paso_manual} Pulsa Enter cuando la lista esté visible... ")
+        preguntar(f"{nombre}: {paso_manual} Pulsa Enter cuando la lista esté visible... ")
+        _PASOS_HECHOS.add(nombre)
 
     consola = _minimizar_consola()
     try:
@@ -133,7 +158,7 @@ def capturar_navegador(
                 actual = sct.grab(region).rgb
                 iguales = iguales + 1 if actual == previo else 0
                 previo = actual
-                if time.time() - inicio >= ESPERA_MINIMA and iguales >= 2:
+                if time.time() - inicio >= espera_minima and iguales >= 2:
                     break
                 time.sleep(0.4)
             imagen = sct.grab(region)
@@ -141,6 +166,8 @@ def capturar_navegador(
         CAPTURAS.mkdir(exist_ok=True)
         ruta = CAPTURAS / f"{prefijo}_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
         mss.tools.to_png(imagen.rgb, imagen.size, output=str(ruta))
+        # Antes de restaurar la consola, que al activarse quitaría el foco al navegador.
+        _cerrar_pestana(ventana, titulo)
         return ruta
     finally:
         if consola:

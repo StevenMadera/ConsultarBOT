@@ -8,9 +8,11 @@ from captura_navegador import capturar_navegador
 URL_FBI = "https://www.fbi.gov/wanted/fugitives?SearchableText={nombre}"
 
 
-def consultar_fbi(persona: dict) -> Path:
+def consultar_fbi(persona: dict, preguntar=input) -> Path:
+    # El filtro de búsqueda se aplica con JavaScript después de cargar: necesita más margen.
     return capturar_navegador(
-        URL_FBI.format(nombre=quote(persona["nombre"])), "Fugitives", "FBI", "fbi", persona["numero"]
+        URL_FBI.format(nombre=quote(persona["nombre"])), "Fugitives", "FBI", "fbi", persona["numero"],
+        espera_minima=5, preguntar=preguntar,
     )
 
 

@@ -1,8 +1,8 @@
+import asyncio
 import functools
-import queue
+import os
 import re
 import sys
-import threading
 import time
 import unicodedata
 from datetime import datetime
@@ -11,9 +11,10 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 import pymupdf
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
+from captura_navegador import PANTALLA
 from comun import CAPTURAS, log
 from consulta_consilium import consultar_consilium
 from consulta_fbi import consultar_fbi
@@ -30,12 +31,26 @@ URL_EUMOSTWANTED = "https://eumostwanted.eu/search/node?keys={nombre}"
 URL_EURLEX = "https://eur-lex.europa.eu/legal-content/ES/TXT/HTML/?uri=OJ:L:2022:025:FULL&from=ES"
 ARCHIVO_CONSOLIDADO = Path(__file__).parent / "Plantilla" / "consolidatedLegacyByNAME.html"
 ANCHO_MAXIMO = 1600
+# Pantalla virtual de las páginas automáticas: más pequeña, menos trabajo de dibujo; el recuadro del PDF no necesita más.
+VIEWPORT = {"width": 1366, "height": 768}
+# La Procuraduría muestra el resultado dentro de un marco (iframe): más estrecha, el texto ocupa más alto
+# y podría quedar cortado dentro del marco. Se mantiene el ancho con el que se verificó.
+VIEWPORT_PROCURADURIA = {"width": 1920, "height": 1080}
 SALIDAS = Path(__file__).parent / "salidas"
 PLANTILLA = Path(__file__).parent / "Plantilla" / "Hombre.pdf"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 )
+# Analítica, publicidad y chats de terceros: no aportan a las capturas y gastan red y CPU.
+# No incluye google.com ni gstatic.com (captchas) ni awswaf.com (verificación de EUR-Lex).
+HOSTS_BLOQUEADOS = (
+    "google-analytics.com", "analytics.google.com", "googletagmanager.com", "doubleclick.net",
+    "googlesyndication.com", "googleadservices.com", "connect.facebook.net", "hotjar.com", "hotjar.io",
+    "clarity.ms", "tawk.to", "zdassets.com", "livechatinc.com", "intercom.io", "intercomcdn.com",
+    "crisp.chat", "jivosite.com", "hs-scripts.com", "botmaker.com", "cliengo.com", "freshchat.com",
+)
+REGLAS_BLOQUEO = ", ".join(f"MAP {host} ~NOTFOUND, MAP *.{host} ~NOTFOUND" for host in HOSTS_BLOQUEADOS)
 
 TIPOS = {
     "CC": "Cédula de ciudadanía",
@@ -179,7 +194,8 @@ def insertar_en_pdf(capturas: dict[str, Path], numero: str, nombre: str) -> Path
     while ruta.exists():
         ruta = SALIDAS / f"{base} ({contador}).pdf"
         contador += 1
-    doc.save(ruta)
+    # Sin compresión, las capturas PNG dejan el PDF en ~50 MB; deflate es sin pérdida.
+    doc.save(ruta, garbage=3, deflate=True)
     doc.close()
     return ruta
 
@@ -189,10 +205,10 @@ def primer_apellido(nombre: str) -> str:
     return partes[2] if len(partes) >= 4 else partes[1] if len(partes) >= 2 else partes[0]
 
 
-def esperar_sin_carga(page):
+async def esperar_sin_carga(page):
     """Espera a que no haya spinners ni texto 'Cargando' y a que el DOM deje de cambiar."""
     try:
-        page.wait_for_function(
+        await page.wait_for_function(
             """() => {
                 const visible = e => e.offsetParent !== null || getComputedStyle(e).position === 'fixed';
                 const spinners = [...document.querySelectorAll(
@@ -203,30 +219,30 @@ def esperar_sin_carga(page):
             timeout=15000,
             polling=300,
         )
-        page.wait_for_load_state("networkidle", timeout=5000)
+        await page.wait_for_load_state("networkidle", timeout=5000)
     except PlaywrightTimeoutError:
         pass
     # Deja terminar la animación del panel desplegable.
-    page.wait_for_timeout(700)
+    await page.wait_for_timeout(700)
 
 
-def consultar_runt(page, persona: dict, pedir_captcha) -> Path:
+async def consultar_runt(page, persona: dict, preguntar, captcha_listo: asyncio.Event) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
     apellido = re.sub(r"[^\w\sñÑáéíóúÁÉÍÓÚüÜ]", "", primer_apellido(persona["nombre"]))
     campo_captcha = page.locator("input[formcontrolname=captcha]")
     for intento in range(3):
-        page.goto(URL_RUNT, wait_until="domcontentloaded")
-        page.locator("mat-select[formcontrolname=tipoDocumento]").click()
-        page.get_by_role("option", name=TIPOS_RUNT[persona["tipo"].upper()], exact=True).click()
-        page.locator("input[formcontrolname=documento]").fill(numero)
-        page.locator("input[formcontrolname=primerApellido]").fill(apellido)
-        page.locator("img.img-fluid").first.scroll_into_view_if_needed()
-        page.bring_to_front()
+        await page.goto(URL_RUNT, wait_until="domcontentloaded")
+        await page.locator("mat-select[formcontrolname=tipoDocumento]").click()
+        await page.get_by_role("option", name=TIPOS_RUNT[persona["tipo"].upper()], exact=True).click()
+        await page.locator("input[formcontrolname=documento]").fill(numero)
+        await page.locator("input[formcontrolname=primerApellido]").fill(apellido)
+        await page.locator("img.img-fluid").first.scroll_into_view_if_needed()
+        await page.bring_to_front()
 
-        campo_captcha.fill(pedir_captcha())
-        page.get_by_role("button", name="Consultar Información").click()
+        await campo_captcha.fill(await preguntar("Captcha del RUNT (5 caracteres, mira la ventana del RUNT): "))
+        await page.get_by_role("button", name="Consultar Información").click()
         try:
-            page.wait_for_function(
+            await page.wait_for_function(
                 """() => {
                     const c = document.querySelector('input[formcontrolname=captcha]');
                     return !c || c.offsetParent === null || document.body.innerText.includes('captcha no es valido');
@@ -235,30 +251,32 @@ def consultar_runt(page, persona: dict, pedir_captcha) -> Path:
             )
         except PlaywrightTimeoutError:
             pass
-        if not campo_captcha.is_visible():
+        if not await campo_captcha.is_visible():
             break
         log(f"RUNT: captcha incorrecto o sin resultado, intento {intento + 1}/3")
     else:
         raise ValueError("RUNT: no se obtuvo resultado tras 3 intentos")
-    page.wait_for_load_state("networkidle")
-    esperar_sin_carga(page)
+    # Ya no hace falta mirar la ventana del RUNT: pueden empezar las capturas de Edge.
+    captcha_listo.set()
+    await page.wait_for_load_state("networkidle")
+    await esperar_sin_carga(page)
 
     # Desplegar "Licencia(s) de conducción" si está colapsada.
     licencias = page.locator("mat-expansion-panel-header", has_text=re.compile(r"licencia.*conducci", re.I)).first
     try:
-        if licencias.get_attribute("aria-expanded", timeout=8000) != "true":
-            licencias.click()
-            page.wait_for_load_state("networkidle")
+        if await licencias.get_attribute("aria-expanded", timeout=8000) != "true":
+            await licencias.click()
+            await page.wait_for_load_state("networkidle")
     except PlaywrightTimeoutError:
         log("RUNT: no se encontró el apartado de licencias de conducción")
 
-    esperar_sin_carga(page)
-    page.evaluate("document.querySelectorAll('*').forEach(e => { if (e.scrollTop) e.scrollTop = 0; }); window.scrollTo(0, 0)")
-    page.wait_for_timeout(300)
+    await esperar_sin_carga(page)
+    await page.evaluate("document.querySelectorAll('*').forEach(e => { if (e.scrollTop) e.scrollTop = 0; }); window.scrollTo(0, 0)")
+    await page.wait_for_timeout(300)
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"runt_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    page.screenshot(path=str(ruta), full_page=True)
+    await page.screenshot(path=str(ruta), full_page=True)
     return ruta
 
 
@@ -275,24 +293,25 @@ SIMIT_ESTADO_JS = """() => {
 }"""
 
 
-def esperar_simit(page) -> str:
+async def esperar_simit(page) -> str:
     try:
-        return page.wait_for_function(SIMIT_ESTADO_JS, timeout=120000, polling=500).json_value()
+        estado = await page.wait_for_function(SIMIT_ESTADO_JS, timeout=120000, polling=500)
     except PlaywrightTimeoutError:
         raise ValueError("SIMIT no mostró el resultado en 2 minutos; no se generó captura.") from None
+    return await estado.json_value()
 
 
-def seleccionar_persona_simit(page, persona: dict, pedir_seleccion):
+async def seleccionar_persona_simit(page, persona: dict, pedir_seleccion):
     dialogo = page.locator("#modal-multiples-personas")
     radios = dialogo.get_by_role("radio")
     etiquetas = []
     puntuaciones = []
     tokens_nombre = [sin_tildes(token).upper() for token in persona["nombre"].split()]
-    for indice in range(radios.count()):
+    for indice in range(await radios.count()):
         radio = radios.nth(indice)
-        etiqueta = radio.evaluate(
+        etiqueta = (await radio.evaluate(
             "e => e.labels?.[0]?.innerText || e.getAttribute('aria-label') || e.parentElement?.innerText || ''"
-        ).strip()
+        )).strip()
         etiquetas.append(etiqueta)
         prefijos = re.findall(r"([A-ZÁÉÍÓÚÜÑ]{2,})\*+", etiqueta.upper())
         coincidencias = sum(any(token.startswith(prefijo) for token in tokens_nombre) for prefijo in prefijos)
@@ -306,7 +325,7 @@ def seleccionar_persona_simit(page, persona: dict, pedir_seleccion):
         opciones = "\n".join(f"{i + 1}. {etiqueta}" for i, etiqueta in enumerate(etiquetas))
         if pedir_seleccion is None:
             raise ValueError(f"SIMIT requiere elegir una coincidencia:\n{opciones}")
-        valor = pedir_seleccion(
+        valor = await pedir_seleccion(
             "SIMIT encontró varias personas. Elige la que corresponde al nombre consultado:\n"
             f"{opciones}\nNúmero de opción: "
         )
@@ -318,130 +337,156 @@ def seleccionar_persona_simit(page, persona: dict, pedir_seleccion):
             raise ValueError("La opción de persona de SIMIT está fuera del rango mostrado.")
 
     radio = radios.nth(seleccion)
-    radio_id = radio.get_attribute("id")
+    radio_id = await radio.get_attribute("id")
     if radio_id:
-        dialogo.locator(f"label[for='{radio_id}']").click()
+        await dialogo.locator(f"label[for='{radio_id}']").click()
     else:
-        radio.click(force=True)
-    dialogo.get_by_role("button", name=re.compile(r"continuar", re.I)).click()
-    dialogo.wait_for(state="hidden", timeout=120000)
+        await radio.click(force=True)
+    await dialogo.get_by_role("button", name=re.compile(r"continuar", re.I)).click()
+    await dialogo.wait_for(state="hidden", timeout=120000)
 
 
-def consultar_simit(page, persona: dict, pedir_seleccion=None) -> Path:
+async def consultar_simit(page, persona: dict, pedir_seleccion=None) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
-    page.goto(URL_SIMIT, wait_until="domcontentloaded")
-    page.reload(wait_until="domcontentloaded")
+    # Una sola carga completa: si la página ya está en SIMIT, goto solo cambia el hash de la SPA y hay que recargar.
+    ya_abierto = page.url.startswith(URL_SIMIT.split("#")[0])
+    await page.goto(URL_SIMIT, wait_until="domcontentloaded")
+    if ya_abierto:
+        await page.reload(wait_until="domcontentloaded")
     validacion = page.locator("#whcModal")
     try:
-        validacion.wait_for(state="visible", timeout=5000)
+        await validacion.wait_for(state="visible", timeout=5000)
     except PlaywrightTimeoutError:
         pass
     try:
-        validacion.wait_for(state="hidden", timeout=120000)
+        await validacion.wait_for(state="hidden", timeout=120000)
     except PlaywrightTimeoutError:
         raise ValueError("SIMIT no terminó su validación de seguridad en 2 minutos; no se generó captura.") from None
     try:
-        page.locator("button.close:visible").first.click(timeout=5000)
+        await page.locator("button.close:visible").first.click(timeout=5000)
     except PlaywrightTimeoutError:
         pass
-    page.locator("#txtBusqueda").fill(numero)
-    page.locator("#consultar").click(timeout=120000)
-    page.wait_for_url("**/estado-cuenta", timeout=30000)
-    estado = esperar_simit(page)
+    await page.locator("#txtBusqueda").fill(numero)
+    await page.locator("#consultar").click(timeout=120000)
+    await page.wait_for_url("**/estado-cuenta", timeout=30000)
+    estado = await esperar_simit(page)
     if estado == "varios":
-        seleccionar_persona_simit(page, persona, pedir_seleccion)
-        estado = esperar_simit(page)
+        await seleccionar_persona_simit(page, persona, pedir_seleccion)
+        estado = await esperar_simit(page)
     if estado != "resultado":
         log("SIMIT: no apareció el resumen de comparendos; se captura el mensaje mostrado por el sitio.")
-    page.wait_for_timeout(500)
+    await page.wait_for_timeout(500)
 
     # Contrae la pestaña "Herramientas de accesibilidad" (el sitio recuerda su estado entre cargas).
     try:
-        page.locator("#x-insuit-tab-title").wait_for(state="attached", timeout=15000)
+        await page.locator("#x-insuit-tab-title").wait_for(state="attached", timeout=15000)
         # El widget vive en un shadow DOM: solo el locator lo alcanza.
-        desplegada = page.locator("#x-insuit-tab-title").evaluate("e => e.getBoundingClientRect().right > 40")
+        desplegada = await page.locator("#x-insuit-tab-title").evaluate("e => e.getBoundingClientRect().right > 40")
     except PlaywrightTimeoutError:
         desplegada = False
         log("SIMIT: no apareció la pestaña de accesibilidad")
     if desplegada:
-        page.locator("#x-insuit-tab-arrow").click()
-        page.wait_for_timeout(1200)
+        await page.locator("#x-insuit-tab-arrow").click()
+        await page.wait_for_timeout(1200)
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"simit_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    page.screenshot(path=str(ruta), full_page=True)
+    await captura_sin_pie(page, ruta)
     return ruta
 
 
-def ajustar_ventana_a_recuadro(page, clave: str) -> bool:
+# Borde superior del pie del sitio (el último, si no está fijo en pantalla y empieza en la mitad inferior).
+ALTO_HASTA_PIE_JS = """() => {
+    const pies = [...document.querySelectorAll('footer, [role=contentinfo]')].filter(e =>
+        !['fixed', 'sticky'].includes(getComputedStyle(e).position) && e.getBoundingClientRect().height > 0
+    );
+    if (!pies.length) return null;
+    const arriba = Math.round(pies.at(-1).getBoundingClientRect().top + window.scrollY);
+    return arriba > document.documentElement.scrollHeight / 2 ? arriba : null;
+}"""
+
+
+async def captura_sin_pie(page, ruta: Path):
+    """Página completa sin el pie del sitio, que no aporta al PDF; si no se reconoce el pie, la página completa."""
+    alto = await page.evaluate(ALTO_HASTA_PIE_JS)
+    recorte = {"x": 0, "y": 0, "width": page.viewport_size["width"], "height": alto} if alto else None
+    await page.screenshot(path=str(ruta), full_page=True, clip=recorte)
+
+
+async def ajustar_ventana_a_recuadro(page, clave: str) -> bool:
     """Ensancha la ventana hasta que la página completa tenga la proporción del recuadro del PDF.
 
     Devuelve False si la página es demasiado larga: entonces la ventana queda con esa proporción y solo se ve el inicio.
     """
     prop = proporcion_zona(clave)
-    page.set_viewport_size({"width": page.viewport_size["width"], "height": 600})
+    await page.set_viewport_size({"width": page.viewport_size["width"], "height": 600})
     for _ in range(3):
-        alto = page.evaluate("document.documentElement.scrollHeight")
+        alto = await page.evaluate("document.documentElement.scrollHeight")
         ancho = max(900, round(alto / prop))
         if ancho > ANCHO_MAXIMO:
-            page.set_viewport_size({"width": ANCHO_MAXIMO, "height": round(ANCHO_MAXIMO * prop)})
-            page.wait_for_timeout(400)
+            await page.set_viewport_size({"width": ANCHO_MAXIMO, "height": round(ANCHO_MAXIMO * prop)})
+            await page.wait_for_timeout(400)
             return False
-        page.set_viewport_size({"width": ancho, "height": 600})
-        page.wait_for_timeout(400)
+        await page.set_viewport_size({"width": ancho, "height": 600})
+        await page.wait_for_timeout(400)
     # Un visor de PDF solo pinta lo visible: la ventana debe abarcar toda la página.
-    page.set_viewport_size({"width": ancho, "height": alto})
+    await page.set_viewport_size({"width": ancho, "height": alto})
     return True
 
 
-def captura_ajustada(page, ruta: Path, clave: str, espera: int = 1000):
-    completa = ajustar_ventana_a_recuadro(page, clave)
-    page.wait_for_timeout(espera)
-    page.screenshot(path=str(ruta), full_page=completa)
+async def captura_ajustada(page, ruta: Path, clave: str, espera: int = 1000):
+    completa = await ajustar_ventana_a_recuadro(page, clave)
+    await page.wait_for_timeout(espera)
+    await page.screenshot(path=str(ruta), full_page=completa)
 
 
-def consultar_govuk(page, persona: dict) -> Path:
-    page.goto(URL_GOVUK, wait_until="domcontentloaded")
+async def consultar_govuk(page, persona: dict) -> Path:
+    await page.goto(URL_GOVUK, wait_until="domcontentloaded")
     try:
-        page.get_by_role("button", name="Reject additional cookies").click(timeout=5000)
-        page.get_by_role("button", name="Hide cookie message").click(timeout=3000)
+        await page.get_by_role("button", name="Reject additional cookies").click(timeout=5000)
+        await page.get_by_role("button", name="Hide cookie message").click(timeout=3000)
     except PlaywrightTimeoutError:
         pass
     campo = page.locator("input[name=keywords]:visible").first
-    campo.fill(persona["nombre"])
-    campo.press("Enter")
-    page.wait_for_url("**/search/all**", timeout=20000)
-    page.wait_for_load_state("load")
+    await campo.fill(persona["nombre"])
+    await campo.press("Enter")
+    await page.wait_for_url("**/search/all**", timeout=20000)
+    await page.wait_for_load_state("load")
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"govuk_{re.sub(r'\D', '', persona['numero'])}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    captura_ajustada(page, ruta, "govuk")
+    await captura_ajustada(page, ruta, "govuk")
     return ruta
 
 
-def consultar_eumostwanted(page, persona: dict) -> Path:
+async def consultar_eumostwanted(page, persona: dict) -> Path:
     nombre = " ".join(persona["nombre"].split())
     # El sitio a veces tarda más de 30 s en entregar el HTML completo.
-    page.goto(URL_EUMOSTWANTED.format(nombre=quote_plus(nombre)), wait_until="commit", timeout=60000)
-    page.get_by_role(
+    await page.goto(URL_EUMOSTWANTED.format(nombre=quote_plus(nombre)), wait_until="commit", timeout=60000)
+    await page.get_by_role(
         "heading", name=re.compile(r"search results|your search yielded no results", re.I)
     ).first.wait_for(timeout=60000)
     try:
-        page.get_by_text("I don't agree", exact=True).first.click(timeout=5000)
+        await page.get_by_text("I don't agree", exact=True).first.click(timeout=5000)
     except PlaywrightTimeoutError:
         pass
     try:
-        page.wait_for_load_state("load", timeout=30000)
+        await page.wait_for_load_state("load", timeout=30000)
     except PlaywrightTimeoutError:
         pass
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"eumostwanted_{re.sub(r'\D', '', persona['numero'])}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    captura_ajustada(page, ruta, "eumostwanted")
+    await captura_ajustada(page, ruta, "eumostwanted")
     return ruta
 
 
+# El documento queda cargado entre consultas: primero se quita la búsqueda anterior.
 BUSCAR_EN_DOCUMENTO_JS = """q => {
+    document.getElementById('barra-buscar-bot')?.remove();
+    document.getElementById('estilo-buscar-bot')?.remove();
+    CSS.highlights.clear();
+    window.scrollTo(0, 0);
     const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     const rangos = []; let n;
     while ((n = w.nextNode())) {
@@ -452,6 +497,7 @@ BUSCAR_EN_DOCUMENTO_JS = """q => {
         }
     }
     const estilo = document.createElement('style');
+    estilo.id = 'estilo-buscar-bot';
     estilo.textContent = '::highlight(buscar){background:#ffcf00;color:#000}::highlight(actual){background:#ff9632;color:#000}';
     document.head.append(estilo);
     if (rangos.length) {
@@ -460,6 +506,7 @@ BUSCAR_EN_DOCUMENTO_JS = """q => {
         rangos[0].startContainer.parentElement.scrollIntoView({block: 'center'});
     }
     const barra = document.createElement('div');
+    barra.id = 'barra-buscar-bot';
     barra.style.cssText = 'position:fixed;top:8px;right:24px;z-index:99999;display:flex;align-items:center;gap:10px;' +
         'padding:8px 14px;background:#fff;border:1px solid #bbb;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.35);' +
         'font:15px Segoe UI,Arial,sans-serif;color:#222';
@@ -475,73 +522,80 @@ BUSCAR_EN_DOCUMENTO_JS = """q => {
 }"""
 
 
-def consultar_documento(page, persona: dict) -> Path:
-    """Equivale a abrir el documento y buscar el número con Ctrl+F: resalta las coincidencias y muestra la barra de búsqueda."""
-    numero = re.sub(r"\D", "", persona["numero"])
-    page.goto(ARCHIVO_CONSOLIDADO.as_uri(), wait_until="load")
-    page.set_viewport_size({"width": 1600, "height": round(1600 * proporcion_zona("consolidado"))})
-    coincidencias = page.evaluate(BUSCAR_EN_DOCUMENTO_JS, numero)
-    log(f"Documento consolidado: {coincidencias} coincidencias para {numero}")
-    page.wait_for_timeout(500)
-
-    CAPTURAS.mkdir(exist_ok=True)
-    ruta = CAPTURAS / f"consolidado_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    page.screenshot(path=str(ruta))
-    return ruta
+async def cargar_consolidado(page):
+    await page.set_viewport_size({"width": 1600, "height": round(1600 * proporcion_zona("consolidado"))})
+    await page.goto(ARCHIVO_CONSOLIDADO.as_uri(), wait_until="load")
 
 
-def consultar_eurlex(page, persona: dict) -> Path:
-    """Busca el número en el Diario Oficial L 25/2022 como con Ctrl+F."""
-    numero = re.sub(r"\D", "", persona["numero"])
-    page.set_viewport_size({"width": 1600, "height": round(1600 * proporcion_zona("consolium"))})
-    page.goto(URL_EURLEX, wait_until="domcontentloaded", timeout=60000)
+async def cargar_eurlex(page):
+    """Diario Oficial L 25/2022, donde se busca el número como con Ctrl+F."""
+    await page.set_viewport_size({"width": 1600, "height": round(1600 * proporcion_zona("consolium"))})
+    await page.goto(URL_EURLEX, wait_until="domcontentloaded", timeout=60000)
     # La primera respuesta (HTTP 202) es una página intermedia que recarga sola el documento.
-    page.get_by_text("Diario Oficial").first.wait_for(timeout=60000)
-    page.wait_for_load_state("load", timeout=60000)
-    coincidencias = page.evaluate(BUSCAR_EN_DOCUMENTO_JS, numero)
-    log(f"EUR-Lex: {coincidencias} coincidencias para {numero}")
-    page.wait_for_timeout(500)
-
-    CAPTURAS.mkdir(exist_ok=True)
-    ruta = CAPTURAS / f"consolium_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    page.screenshot(path=str(ruta))
-    return ruta
+    await page.get_by_text("Diario Oficial").first.wait_for(timeout=60000)
+    await page.wait_for_load_state("load", timeout=60000)
 
 
-def consultar_ofac(page, persona: dict) -> Path:
+class Documento:
+    """Documento fijo que se carga al iniciar y queda abierto; en cada consulta solo se busca el número."""
+
+    def __init__(self, page, cargar, clave: str, nombre: str):
+        self.page, self.cargar, self.clave, self.nombre = page, cargar, clave, nombre
+        self.carga = asyncio.create_task(cargar(page))
+
+    async def buscar(self, persona: dict) -> Path:
+        """Equivale a buscar el número con Ctrl+F: resalta las coincidencias y muestra la barra de búsqueda."""
+        try:
+            await self.carga
+        except Exception as e:
+            log(f"{self.nombre}: falló la carga ({e}); se carga de nuevo.")
+            self.carga = asyncio.create_task(self.cargar(self.page))
+            await self.carga
+        numero = re.sub(r"\D", "", persona["numero"])
+        coincidencias = await self.page.evaluate(BUSCAR_EN_DOCUMENTO_JS, numero)
+        log(f"{self.nombre}: {coincidencias} coincidencias para {numero}")
+        await self.page.wait_for_timeout(500)
+
+        CAPTURAS.mkdir(exist_ok=True)
+        ruta = CAPTURAS / f"{self.clave}_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
+        await self.page.screenshot(path=str(ruta))
+        return ruta
+
+
+async def consultar_ofac(page, persona: dict) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
-    page.goto(URL_OFAC, wait_until="domcontentloaded")
-    page.locator("#ctl00_MainContent_ddlType").select_option(label="Individual")
-    page.locator("#ctl00_MainContent_ddlCountry").select_option(label="Colombia")
-    page.locator("#ctl00_MainContent_txtID").fill(numero)
-    with page.expect_navigation(wait_until="load", timeout=30000):
-        page.locator("#ctl00_MainContent_btnSearch").click()
-    page.wait_for_timeout(500)
+    await page.goto(URL_OFAC, wait_until="domcontentloaded")
+    await page.locator("#ctl00_MainContent_ddlType").select_option(label="Individual")
+    await page.locator("#ctl00_MainContent_ddlCountry").select_option(label="Colombia")
+    await page.locator("#ctl00_MainContent_txtID").fill(numero)
+    async with page.expect_navigation(wait_until="load", timeout=30000):
+        await page.locator("#ctl00_MainContent_btnSearch").click()
+    await page.wait_for_timeout(500)
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"ofac_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    captura_ajustada(page, ruta, "ofac")
+    await captura_ajustada(page, ruta, "ofac")
     return ruta
 
 
-def consultar_libreta(page, persona: dict) -> Path:
+async def consultar_libreta(page, persona: dict) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
-    page.goto(URL_LIBRETA, wait_until="domcontentloaded")
-    page.locator("#tipoDocumento").select_option(label=TIPOS_LIBRETA[persona["tipo"].upper()])
-    page.locator("#numeroDocumento").fill(numero)
-    page.get_by_role("button", name="Consultar", exact=True).click()
-    page.get_by_text("Aqui vera el estado consultado").wait_for(state="hidden", timeout=30000)
+    await page.goto(URL_LIBRETA, wait_until="domcontentloaded")
+    await page.locator("#tipoDocumento").select_option(label=TIPOS_LIBRETA[persona["tipo"].upper()])
+    await page.locator("#numeroDocumento").fill(numero)
+    await page.get_by_role("button", name="Consultar", exact=True).click()
+    await page.get_by_text("Aqui vera el estado consultado").wait_for(state="hidden", timeout=30000)
     # El certificado es un PDF embebido; necesita unos segundos para renderizar.
-    page.locator("embed").wait_for(state="attached", timeout=15000)
-    page.wait_for_timeout(2500)
+    await page.locator("embed").wait_for(state="attached", timeout=15000)
+    await page.wait_for_timeout(2500)
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"libreta_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    captura_ajustada(page, ruta, "libreta", espera=3000)
+    await captura_ajustada(page, ruta, "libreta", espera=3000)
     return ruta
 
 
-def consultar(page, persona: dict) -> Path:
+async def consultar(page, persona: dict) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
     form = page.frame_locator("iframe[src*='webcert']")
     pregunta_loc = form.locator("#lblPregunta")
@@ -555,47 +609,47 @@ def consultar(page, persona: dict) -> Path:
         re.compile(r"el n[uú]mero de identificaci[oó]n ingresado no se encuentra registrado", re.I)
     ).first
 
-    def cargar_formulario():
+    async def cargar_formulario():
         # El portal a veces tarda más de 30 s en cargar el formulario.
-        page.goto(URL, wait_until="domcontentloaded", timeout=90000)
-        form.locator("#ddlTipoID").select_option(label=TIPOS[persona["tipo"].upper()], timeout=90000)
-        form.locator("#txtNumID").fill(numero)
+        await page.goto(URL, wait_until="domcontentloaded", timeout=90000)
+        await form.locator("#ddlTipoID").select_option(label=TIPOS[persona["tipo"].upper()], timeout=90000)
+        await form.locator("#txtNumID").fill(numero)
         # La pregunta puede cambiar tras el postback del tipo de ID.
         try:
-            page.wait_for_load_state("networkidle", timeout=30000)
+            await page.wait_for_load_state("networkidle", timeout=30000)
         except PlaywrightTimeoutError:
             pass
 
-    cargar_formulario()
+    await cargar_formulario()
     for intento in range(3):
-        pregunta_loc.wait_for(state="visible", timeout=30000)
-        pregunta = pregunta_loc.inner_text().strip()
+        await pregunta_loc.wait_for(state="visible", timeout=30000)
+        pregunta = (await pregunta_loc.inner_text()).strip()
         respuesta = resolver_pregunta(pregunta, numero, persona["nombre"])
         log(f"Pregunta: {pregunta!r} -> {respuesta!r}")
-        respuesta_loc.fill(respuesta)
-        texto_inicial = cuerpo.inner_text(timeout=10000)
-        form.locator("#btnConsultar").click()
+        await respuesta_loc.fill(respuesta)
+        texto_inicial = await cuerpo.inner_text(timeout=10000)
+        await form.locator("#btnConsultar").click()
         limite = time.monotonic() + 60
         estado = None
         consultando = False
         texto_previo = texto_inicial
         texto_estable_desde = None
         while time.monotonic() < limite:
-            if datos_ciudadano.is_visible():
+            if await datos_ciudadano.is_visible():
                 estado = "resultado"
                 break
-            if no_registrado.is_visible():
+            if await no_registrado.is_visible():
                 estado = "sin_registro"
                 break
-            if error_respuesta.is_visible():
+            if await error_respuesta.is_visible():
                 estado = "respuesta_incorrecta"
                 break
-            texto_actual = cuerpo.inner_text(timeout=2000)
+            texto_actual = await cuerpo.inner_text(timeout=2000)
             consultando = bool(re.search(r"consultando\s*,?\s*por favor espere|cargando", texto_actual, re.I))
             if consultando:
                 texto_previo = texto_actual
                 texto_estable_desde = None
-                page.wait_for_timeout(300)
+                await page.wait_for_timeout(300)
                 continue
             if texto_actual != texto_inicial and texto_actual == texto_previo:
                 if texto_estable_desde is None:
@@ -606,7 +660,7 @@ def consultar(page, persona: dict) -> Path:
             else:
                 texto_previo = texto_actual
                 texto_estable_desde = None
-            page.wait_for_timeout(250)
+            await page.wait_for_timeout(250)
         if estado == "respuesta_incorrecta":
             if intento == 2:
                 raise ValueError("Procuraduría rechazó tres respuestas de verificación.")
@@ -617,19 +671,19 @@ def consultar(page, persona: dict) -> Path:
                 raise ValueError("Procuraduría no mostró un resultado en 3 intentos; no se generó captura.")
             motivo = "seguía consultando" if consultando else "la página no cambió"
             log(f"Procuraduría: sin resultado en 60 s ({motivo}); se repite la consulta ({intento + 2}/3).")
-            cargar_formulario()
+            await cargar_formulario()
             continue
         if estado == "resultado_estable":
             log("Procuraduría: contenido de resultado estable aunque cambió el rótulo del portal.")
         break
     try:
-        page.wait_for_load_state("networkidle", timeout=10000)
+        await page.wait_for_load_state("networkidle", timeout=10000)
     except PlaywrightTimeoutError:
         pass
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    page.screenshot(path=str(ruta), full_page=True)
+    await page.screenshot(path=str(ruta), full_page=True)
     return ruta
 
 
@@ -660,124 +714,194 @@ def enfocar_consola(hwnd: int | None):
         ctypes.windll.user32.SetForegroundWindow(hwnd)
 
 
-class Trabajador(threading.Thread):
-    """Navegador propio en un hilo; se abre al recibir la primera tarea."""
+def preguntar_en_consola(mensaje: str, consola: int | None, pantalla_tomada: bool = False) -> str:
+    """Pide un dato en la consola, sin coincidir con una captura de Edge (ambas necesitan el foco)."""
+    if not pantalla_tomada:
+        with PANTALLA:
+            return preguntar_en_consola(mensaje, consola, pantalla_tomada=True)
+    enfocar_consola(consola)
+    return input(mensaje).strip()
 
-    def __init__(self, funcion, headless: bool, canal: str | None = None):
-        super().__init__(daemon=True)
-        self.funcion = funcion
-        self.headless = headless
-        self.canal = canal
-        self.entrada = queue.Queue()
-        self.salida = queue.Queue()
 
-    def run(self):
-        with sync_playwright() as p:
-            browser = page = None
-            while (tarea := self.entrada.get()) is not None:
+def memoria_libre_mb() -> int | None:
+    if sys.platform != "win32":
+        return None
+    import ctypes
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + [
+            (campo, ctypes.c_ulonglong)
+            for campo in ("ullTotalPhys", "ullAvailPhys", "ullTotalPageFile", "ullAvailPageFile",
+                          "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")
+        ]
+
+    estado = MEMORYSTATUSEX(dwLength=ctypes.sizeof(MEMORYSTATUSEX))
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(estado)):
+        return None
+    return estado.ullAvailPhys // 2**20
+
+
+def limite_concurrencia() -> int:
+    """Páginas automáticas a la vez: hasta una por núcleo lógico y por cada ~300 MB de RAM libre (mínimo 2)."""
+    nucleos = os.cpu_count() or 2
+    libre = memoria_libre_mb()
+    return max(2, min(nucleos, libre // 300 if libre is not None else nucleos))
+
+
+async def abrir_navegadores(p) -> dict:
+    """Abre los navegadores y los documentos fijos mientras se escriben los datos.
+
+    Un solo navegador sin ventana con un contexto aislado por consulta; el RUNT va aparte con ventana para el captcha.
+    """
+    # El headless nuevo (canal "chromium") incluye el visor de PDF que usa la libreta.
+    automatico, visible = await asyncio.gather(
+        p.chromium.launch(headless=True, channel="chromium", args=[f"--host-resolver-rules={REGLAS_BLOQUEO}"]),
+        p.chromium.launch(headless=False, args=["--start-maximized"]),
+    )
+    # La Procuraduría bloquea el user agent "HeadlessChrome".
+    opciones = {"ignore_https_errors": True, "user_agent": USER_AGENT}
+    # Una pestaña por contexto: Chrome frena las pestañas en segundo plano de una misma ventana.
+    procuraduria, simit, libreta, grupo, onu, eurlex = await asyncio.gather(
+        automatico.new_context(viewport=VIEWPORT_PROCURADURIA, **opciones),
+        *(automatico.new_context(viewport=VIEWPORT, **opciones) for _ in range(5)),
+    )
+    r = {
+        "navegadores": (automatico, visible),
+        "procuraduria": await procuraduria.new_page(),
+        "simit": await simit.new_page(),
+        "libreta": await libreta.new_page(),
+        "grupo": grupo,
+        # La ventana del RUNT se abre al consultar, para no tapar la pantalla mientras se escriben los datos.
+        "contexto_runt": await visible.new_context(no_viewport=True, **opciones),
+        "runt": None,
+    }
+    r["consolidado"] = Documento(await onu.new_page(), cargar_consolidado, "consolidado", "Documento consolidado")
+    r["consolium"] = Documento(await eurlex.new_page(), cargar_eurlex, "consolium", "EUR-Lex")
+    return r
+
+
+async def en_pestana_nueva(contexto, consulta, persona: dict) -> Path:
+    page = await contexto.new_page()
+    try:
+        return await consulta(page, persona)
+    finally:
+        await page.close()
+
+
+def consultas_edge(persona: dict, preguntar) -> dict[str, Path]:
+    """Páginas con verificación de Cloudflare: la pasa una persona en su navegador; se capturan una tras otra."""
+    capturas = {}
+    for clave, consulta in (
+        ("terroristas", consultar_terroristas),
+        ("justicia", consultar_justicia),
+        ("fbi", consultar_fbi),
+        ("consilium", consultar_consilium),
+    ):
+        try:
+            capturas[clave] = consulta(persona, preguntar)
+            log(f"Captura {clave}: {capturas[clave]}")
+        except Exception as e:
+            log(f"ERROR {clave}: {e}")
+    return capturas
+
+
+async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -> dict[str, Path]:
+    capturas: dict[str, Path] = {}
+    limite = asyncio.Semaphore(limite_concurrencia())
+    captcha_listo = asyncio.Event()
+
+    async def registrar(clave: str, consulta):
+        try:
+            capturas[clave] = await consulta
+            log(f"Captura {clave}: {capturas[clave]}")
+        except Exception as e:
+            # SIMIT, Procuraduría y RUNT cortan las conexiones que llegan por VPN.
+            if re.search(r"ERR_CONNECTION_(CLOSED|RESET)", str(e)):
+                e = "el sitio cerró la conexión. Si estás con VPN, apágala: este sitio rechaza las conexiones por VPN."
+            log(f"ERROR {clave}: {e}")
+
+    async def automatica(clave: str, funcion, *args):
+        async with limite:
+            await registrar(clave, funcion(*args))
+
+    async def grupo_rapido():
+        # Cada una tarda pocos segundos: en serie terminan antes que SIMIT, Procuraduría y RUNT.
+        async with limite:
+            await registrar("consolidado", r["consolidado"].buscar(persona))
+            await registrar("consolium", r["consolium"].buscar(persona))
+            for clave, consulta in (("ofac", consultar_ofac), ("govuk", consultar_govuk), ("eumostwanted", consultar_eumostwanted)):
+                await registrar(clave, en_pestana_nueva(r["grupo"], consulta, persona))
+
+    async def runt():
+        async def consulta():
+            # Se vuelve a abrir si se cerró la ventana.
+            if r["runt"] is None or r["runt"].is_closed():
+                r["runt"] = await r["contexto_runt"].new_page()
+            return await consultar_runt(r["runt"], persona, preguntar, captcha_listo)
+
+        try:
+            await registrar("runt", consulta())
+        finally:
+            captcha_listo.set()
+
+    async def edge():
+        # Empieza tras el captcha del RUNT para no tapar su ventana; trabaja a la vez que las páginas automáticas.
+        await captcha_listo.wait()
+        capturas.update(await asyncio.to_thread(consultas_edge, persona, preguntar_edge))
+
+    # Las más largas primero: el límite deja esperando a las últimas en un equipo débil.
+    await asyncio.gather(
+        automatica("procuraduria", consultar, r["procuraduria"], persona),
+        automatica("simit", consultar_simit, r["simit"], persona, preguntar),
+        grupo_rapido(),
+        automatica("libreta", consultar_libreta, r["libreta"], persona),
+        runt(),
+        edge(),
+    )
+    return capturas
+
+
+async def principal():
+    consola = consola_siempre_visible()
+
+    async def preguntar(mensaje: str) -> str:
+        return await asyncio.to_thread(preguntar_en_consola, mensaje, consola)
+
+    # Las capturas de Edge ya tienen la pantalla cuando preguntan.
+    preguntar_edge = functools.partial(preguntar_en_consola, consola=consola, pantalla_tomada=True)
+
+    async with async_playwright() as p:
+        apertura = asyncio.create_task(abrir_navegadores(p))
+        try:
+            while True:
+                linea = await asyncio.to_thread(input, "\nPega los datos (TIPO NUMERO NOMBRE) o Enter para salir: ")
+                if not linea.strip():
+                    break
                 try:
-                    if page is None:
-                        browser = p.chromium.launch(headless=self.headless, channel=self.canal, args=["--start-maximized"])
-                        # La Procuraduría bloquea el user agent "HeadlessChrome".
-                        # Con ventana visible se usa el tamaño maximizado; en headless, Full HD.
-                        contexto = {"viewport": {"width": 1920, "height": 1080}} if self.headless else {"no_viewport": True}
-                        page = browser.new_page(ignore_https_errors=True, user_agent=USER_AGENT, **contexto)
-                    self.salida.put((True, self.funcion(page, *tarea)))
-                except Exception as e:
-                    self.salida.put((False, e))
-            if browser is not None:
-                browser.close()
+                    persona = parsear(linea)
+                except ValueError as e:
+                    log(f"ERROR: {e}")
+                    continue
+                log(f"Datos: {persona} | apellido RUNT: {primer_apellido(persona['nombre'])}")
+                capturas = await consultar_persona(persona, await apertura, preguntar, preguntar_edge)
+                if capturas:
+                    log(f"PDF: {insertar_en_pdf(capturas, persona['numero'], persona['nombre'])}")
+        finally:
+            apertura.cancel()
+            recursos = (await asyncio.gather(apertura, return_exceptions=True))[0]
+            if isinstance(recursos, dict):
+                for documento in (recursos["consolidado"], recursos["consolium"]):
+                    documento.carga.cancel()
+                    await asyncio.gather(documento.carga, return_exceptions=True)
+                for navegador in recursos["navegadores"]:
+                    await navegador.close()
 
 
 def main():
-    consola = consola_siempre_visible()
-    solicitudes_usuario = queue.Queue()
-
-    def pedir_usuario(mensaje: str) -> str:
-        respuesta = queue.Queue()
-        solicitudes_usuario.put((mensaje, respuesta))
-        return respuesta.get()
-
-    def pedir_captcha() -> str:
-        return pedir_usuario("Captcha del RUNT (5 caracteres, mira la ventana del RUNT): ")
-
-    trabajadores = {
-        "procuraduria": Trabajador(consultar, headless=True),
-        "runt": Trabajador(consultar_runt, headless=False),
-        "simit": Trabajador(consultar_simit, headless=True),
-        "ofac": Trabajador(consultar_ofac, headless=True),
-        "govuk": Trabajador(consultar_govuk, headless=True),
-        "eumostwanted": Trabajador(consultar_eumostwanted, headless=True),
-        "consolidado": Trabajador(consultar_documento, headless=True),
-        "consolium": Trabajador(consultar_eurlex, headless=True),
-        # El headless nuevo (canal "chromium") incluye el visor de PDF que usa la libreta.
-        "libreta": Trabajador(consultar_libreta, headless=True, canal="chromium"),
-    }
-    for t in trabajadores.values():
-        t.start()
-
     try:
-        while True:
-            linea = input("\nPega los datos (TIPO NUMERO NOMBRE) o Enter para salir: ")
-            if not linea.strip():
-                break
-            try:
-                persona = parsear(linea)
-            except ValueError as e:
-                log(f"ERROR: {e}")
-                continue
-            log(f"Datos: {persona} | apellido RUNT: {primer_apellido(persona['nombre'])}")
-            trabajadores["procuraduria"].entrada.put((persona,))
-            trabajadores["simit"].entrada.put((persona, pedir_usuario))
-            trabajadores["libreta"].entrada.put((persona,))
-            trabajadores["ofac"].entrada.put((persona,))
-            trabajadores["govuk"].entrada.put((persona,))
-            trabajadores["eumostwanted"].entrada.put((persona,))
-            trabajadores["consolidado"].entrada.put((persona,))
-            trabajadores["consolium"].entrada.put((persona,))
-            trabajadores["runt"].entrada.put((persona, pedir_captcha))
-
-            resultados = {}
-            while len(resultados) < len(trabajadores):
-                try:
-                    mensaje, respuesta = solicitudes_usuario.get(timeout=0.2)
-                    enfocar_consola(consola)
-                    respuesta.put(input(mensaje).strip())
-                except queue.Empty:
-                    pass
-                for nombre, t in trabajadores.items():
-                    if nombre not in resultados:
-                        try:
-                            resultados[nombre] = t.salida.get_nowait()
-                        except queue.Empty:
-                            pass
-
-            capturas = {}
-            for nombre, (ok, valor) in resultados.items():
-                if ok:
-                    capturas[nombre] = valor
-                    log(f"Captura {nombre}: {valor}")
-                else:
-                    log(f"ERROR {nombre}: {valor}")
-            # Van aparte: la verificación de Cloudflare la pasa una persona en su navegador.
-            for clave, consulta_manual in (
-                ("terroristas", consultar_terroristas),
-                ("justicia", consultar_justicia),
-                ("fbi", consultar_fbi),
-                ("consilium", consultar_consilium),
-            ):
-                try:
-                    capturas[clave] = consulta_manual(persona)
-                    log(f"Captura {clave}: {capturas[clave]}")
-                except Exception as e:
-                    log(f"ERROR {clave}: {e}")
-            if capturas:
-                log(f"PDF: {insertar_en_pdf(capturas, persona['numero'], persona['nombre'])}")
-    finally:
-        for t in trabajadores.values():
-            t.entrada.put(None)
-        for t in trabajadores.values():
-            t.join(timeout=10)
+        asyncio.run(principal())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

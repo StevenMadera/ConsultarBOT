@@ -10,7 +10,7 @@ URL_TERRORISTAS = (
 )
 
 
-def consultar_terroristas(persona: dict) -> Path:
+def consultar_terroristas(persona: dict, preguntar=input) -> Path:
     nombre = " ".join(persona["nombre"].split())
     return capturar_navegador(
         URL_TERRORISTAS.format(nombre=quote(nombre, safe="")),
@@ -18,4 +18,5 @@ def consultar_terroristas(persona: dict) -> Path:
         "Terrorist designations",
         "terroristas",
         persona["numero"],
+        preguntar=preguntar,
     )

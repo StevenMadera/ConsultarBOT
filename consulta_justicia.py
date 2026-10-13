@@ -10,7 +10,7 @@ URL_JUSTICIA = (
 )
 
 
-def consultar_justicia(persona: dict) -> Path:
+def consultar_justicia(persona: dict, preguntar=input) -> Path:
     nombre = " ".join(persona["nombre"].split())
     return capturar_navegador(
         URL_JUSTICIA.format(nombre=quote(nombre)),
@@ -18,4 +18,5 @@ def consultar_justicia(persona: dict) -> Path:
         "Justice.gov",
         "justicia",
         persona["numero"],
+        preguntar=preguntar,
     )

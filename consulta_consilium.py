@@ -8,14 +8,18 @@ from captura_navegador import capturar_navegador
 URL_CONSILIUM = "https://www.consilium.europa.eu/es/search/?query={nombre}"
 
 
-def consultar_consilium(persona: dict) -> Path:
+def consultar_consilium(persona: dict, preguntar=input) -> Path:
     return capturar_navegador(
         URL_CONSILIUM.format(nombre=quote(persona["nombre"])),
-        "Consilium",
+        # Título de la página de resultados: la verificación previa del sitio ("Checking your browser") no lo tiene.
+        "Search - Consilium",
         "Consilium",
         "consilium",
         persona["numero"],
         paso_manual="Acepta solo las cookies necesarias y espera a que aparezca la lista.",
+        # Sin el paso manual (desde la segunda consulta), la lista se carga con JavaScript.
+        espera_minima=5,
+        preguntar=preguntar,
     )
 
 
