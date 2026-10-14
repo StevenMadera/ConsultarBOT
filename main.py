@@ -5,23 +5,28 @@ import re
 import sys
 import time
 import unicodedata
-from datetime import datetime
+from datetime import date, datetime
 from difflib import get_close_matches
 from pathlib import Path
 from urllib.parse import quote_plus
 
 import pymupdf
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 from captura_navegador import PANTALLA
-from comun import CAPTURAS, log
+from comun import CAPTURAS, leer_respuesta, log
+import documentos
+from documentos import estado_ventana
 from consulta_consilium import consultar_consilium
 from consulta_fbi import consultar_fbi
 from consulta_justicia import consultar_justicia
 from consulta_terroristas import consultar_terroristas
 
 URL = "https://www.procuraduria.gov.co/Pages/Consulta-de-Antecedentes.aspx"
+# Tras enviar la consulta el portal puede tardar minutos; si se recarga, la consulta empieza de cero.
+ESPERA_PROCURADURIA = 300
 URL_RUNT = "https://portalpublico.runt.gov.co/#/consulta-ciudadano-documento/consulta/consulta-ciudadano-documento"
 URL_SIMIT = "https://www.fcm.org.co/simit/#/home-public"
 URL_LIBRETA = "https://definicion.libretamilitar.mil.co/consulta-estado-situacion-militar"
@@ -90,11 +95,56 @@ CAPITALES = {
 def sin_tildes(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
 
+
+CAMPOS = ("nombre", "documento", "empresa", "fecha consulta", "quien consulta", "fecha expedicion")
+FORMATO = (
+    "Copia la fila de Excel con: nombre, documento, empresa, fecha consulta, quien consulta, fecha expedicion "
+    "(ej. Santiago Flores Alonso | 1000858557 | FALABELLA CEDI | 16/09/2026 | STEVEN | 25/06/2020). "
+    "A mano, separa los datos con ;"
+)
+
+
+def leer_fecha(texto: str, campo: str) -> date:
+    for formato in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(texto, formato).date()
+        except ValueError:
+            pass
+    raise ValueError(f"{campo.capitalize()} no válida: {texto!r}. Usa dd/mm/aaaa.")
+
+
 def parsear(linea: str) -> dict:
-    m = re.match(r"^\s*(CC|CE|PEP|PPT|NIT|TI)\s+([\d.,\s]+?)\s+([^\d].*?)\s*$", linea, re.I)
-    if not m:
-        raise ValueError("Formato esperado: TIPO NUMERO NOMBRE (ej. CC 1000000000 Juan Perez Gomez)")
-    return {"tipo": m[1].upper(), "numero": re.sub(r"\D", "", m[2]), "nombre": m[3]}
+    """Fila copiada de Excel (separada por tabulaciones) o escrita a mano con ; o , entre los datos."""
+    separador = "\t" if "\t" in linea else ";" if ";" in linea else ","
+    campos = [" ".join(campo.split()) for campo in linea.split(separador)]
+    # Celdas vacías a los lados si se copió más de la fila.
+    while campos and not campos[0]:
+        campos.pop(0)
+    while campos and not campos[-1]:
+        campos.pop()
+    if len(campos) != len(CAMPOS):
+        raise ValueError(f"Llegaron {len(campos)} datos y se esperan {len(CAMPOS)}. {FORMATO}")
+    for campo, valor in zip(CAMPOS, campos):
+        if not valor:
+            raise ValueError(f"Falta el dato '{campo}'. {FORMATO}")
+    nombre, documento, empresa, fecha_consulta, consultor, fecha_expedicion = campos
+    if re.search(r"\d", nombre):
+        raise ValueError(f"El nombre no puede tener números: {nombre!r}. {FORMATO}")
+    # Si no se indica el tipo de documento, es cédula de ciudadanía.
+    m = re.fullmatch(r"(?:([A-Za-z.]+)\s*)?([\d.,\s]+)", documento)
+    tipo = (m[1] or "CC").replace(".", "").upper() if m else ""
+    numero = re.sub(r"\D", "", m[2]) if m else ""
+    if tipo not in ("CC", "CE", "PEP", "PPT", "NIT", "TI") or not numero:
+        raise ValueError(f"Documento no válido: {documento!r} (ej. 1000858557 o CE 123456; tipos: CC, CE, PEP, PPT, NIT, TI).")
+    return {
+        "nombre": nombre,
+        "tipo": tipo,
+        "numero": numero,
+        "empresa": empresa,
+        "fecha_consulta": leer_fecha(fecha_consulta, "fecha de consulta"),
+        "consultor": consultor,
+        "fecha_expedicion": leer_fecha(fecha_expedicion, "fecha de expedición"),
+    }
 
 
 def resolver_pregunta(texto: str, numero: str, nombre: str) -> str:
@@ -185,8 +235,16 @@ def pegar_captura(pagina, captura: Path, hueco: str):
 def insertar_en_pdf(capturas: dict[str, Path], numero: str, nombre: str) -> Path:
     doc = pymupdf.open(PLANTILLA)
     for clave, captura in capturas.items():
-        indice, hueco = UBICACION_PDF[clave]
-        pegar_captura(doc[indice], captura, hueco)
+        if clave in UBICACION_PDF:
+            indice, hueco = UBICACION_PDF[clave]
+            pegar_captura(doc[indice], captura, hueco)
+    # Páginas 14 a 19: los PDF de cada sitio van al final, en el orden de la portada.
+    for clave in documentos.ORDEN:
+        if clave in capturas:
+            with pymupdf.open(capturas[clave]) as anexo:
+                doc.insert_pdf(anexo)
+        else:
+            log(f"PDF: falta el documento de {clave}; se omite.")
     SALIDAS.mkdir(exist_ok=True)
     base = re.sub(r'[<>:"/\\|?*]', "", f"{numero} - {nombre}").strip()
     ruta = SALIDAS / f"{base}.pdf"
@@ -226,38 +284,105 @@ async def esperar_sin_carga(page):
     await page.wait_for_timeout(700)
 
 
-async def consultar_runt(page, persona: dict, preguntar, captcha_listo: asyncio.Event) -> Path:
+async def precargar_runt(page):
+    """El RUNT descarga ~12 MB al abrir: se carga minimizado mientras se escriben los datos y luego sale de la caché."""
+    await documentos.precargar(page, URL_RUNT)
+    await page.locator("img.img-fluid").first.wait_for(state="visible", timeout=90000)
+
+
+# Recuadro del aviso: el antecesor más grande del texto que no ocupa todo el ancho (el fondo gris sí lo ocupa).
+CAJA_AVISO_JS = """e => {
+    let caja = e;
+    while (caja.parentElement && caja.parentElement.getBoundingClientRect().width < innerWidth * 0.9) caja = caja.parentElement;
+    const r = caja.getBoundingClientRect();
+    return {alto: r.height, abajo: r.bottom};
+}"""
+
+
+async def captura_aviso_sobre_datos(page, ruta: Path, aviso):
+    """El aviso se centra en la pantalla y tapa los datos consultados: se captura en una pantalla virtual más alta
+    para que quede debajo de ellos."""
+    ancho, alto = await page.evaluate("[innerWidth, innerHeight]")
+    datos_abajo = await page.locator("input[formcontrolname=primerApellido]").evaluate("e => e.getBoundingClientRect().bottom")
+    caja = await aviso.evaluate(CAJA_AVISO_JS)
+    alto_necesario = max(alto, round(2 * (datos_abajo + 30) + caja["alto"]))
+    cdp = await page.context.new_cdp_session(page)
+    try:
+        await cdp.send(
+            "Emulation.setDeviceMetricsOverride",
+            {"width": ancho, "height": alto_necesario, "deviceScaleFactor": 0, "mobile": False},
+        )
+        await page.wait_for_timeout(500)
+        caja = await aviso.evaluate(CAJA_AVISO_JS)
+        recorte = {"x": 0, "y": 0, "width": ancho, "height": min(alto_necesario, round(caja["abajo"]) + 30)}
+        await page.screenshot(path=str(ruta), clip=recorte)
+    finally:
+        await cdp.send("Emulation.clearDeviceMetricsOverride")
+        await cdp.detach()
+
+
+async def consultar_runt(page, persona: dict, preguntar, turno: asyncio.Lock, listo: asyncio.Event) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
     apellido = re.sub(r"[^\w\sñÑáéíóúÁÉÍÓÚüÜ]", "", primer_apellido(persona["nombre"]))
     campo_captcha = page.locator("input[formcontrolname=captcha]")
-    for intento in range(3):
+    imagen_captcha = page.locator("img.img-fluid").first
+    # Respuesta válida para quien no tiene registro en el RUNT, no un captcha incorrecto.
+    sin_registro = page.get_by_text(re.compile(r"no se ha encontrado la persona", re.I)).first
+    lleno_en = 0.0
+
+    async def llenar():
+        nonlocal lleno_en
         await page.goto(URL_RUNT, wait_until="domcontentloaded")
         await page.locator("mat-select[formcontrolname=tipoDocumento]").click()
         await page.get_by_role("option", name=TIPOS_RUNT[persona["tipo"].upper()], exact=True).click()
         await page.locator("input[formcontrolname=documento]").fill(numero)
         await page.locator("input[formcontrolname=primerApellido]").fill(apellido)
-        await page.locator("img.img-fluid").first.scroll_into_view_if_needed()
-        await page.bring_to_front()
+        lleno_en = time.monotonic()
 
-        await campo_captcha.fill(await preguntar("Captcha del RUNT (5 caracteres, mira la ventana del RUNT): "))
-        await page.get_by_role("button", name="Consultar Información").click()
-        try:
-            await page.wait_for_function(
-                """() => {
-                    const c = document.querySelector('input[formcontrolname=captcha]');
-                    return !c || c.offsetParent === null || document.body.innerText.includes('captcha no es valido');
-                }""",
-                timeout=20000,
-            )
-        except PlaywrightTimeoutError:
-            pass
-        if not await campo_captcha.is_visible():
-            break
-        log(f"RUNT: captcha incorrecto o sin resultado, intento {intento + 1}/3")
-    else:
-        raise ValueError("RUNT: no se obtuvo resultado tras 3 intentos")
-    # Ya no hace falta mirar la ventana del RUNT: pueden empezar las capturas de Edge.
-    captcha_listo.set()
+    # Se llena minimizado; la ventana sale al frente cuando le toca el turno de captcha.
+    await llenar()
+    async with turno:
+        for intento in range(3):
+            # El captcha caduca y la página puede cambiar mientras espera su turno.
+            if intento or time.monotonic() - lleno_en > 60 or not await imagen_captcha.count():
+                await llenar()
+            await estado_ventana(page, "maximized")
+            await imagen_captcha.scroll_into_view_if_needed()
+            await page.bring_to_front()
+
+            respuesta = await preguntar("Captcha del RUNT: míralo en su ventana y escríbelo AQUÍ en la consola: ")
+            if not await campo_captcha.count():
+                log("RUNT: la página cambió mientras se escribía el captcha; se carga de nuevo.")
+                continue
+            await campo_captcha.fill(respuesta)
+            await page.get_by_role("button", name="Consultar Información").click()
+            try:
+                await page.wait_for_function(
+                    """() => {
+                        const c = document.querySelector('input[formcontrolname=captcha]');
+                        return !c || c.offsetParent === null
+                            || /captcha no es v[aá]lido|no se ha encontrado la persona/i.test(document.body.innerText);
+                    }""",
+                    timeout=20000,
+                )
+            except PlaywrightTimeoutError:
+                pass
+            if await sin_registro.is_visible() or not await campo_captcha.is_visible():
+                break
+            log(f"RUNT: captcha incorrecto o sin resultado, intento {intento + 1}/3")
+        else:
+            raise ValueError("RUNT: no se obtuvo resultado tras 3 intentos")
+    listo.set()
+    ir_arriba = "document.querySelectorAll('*').forEach(e => { if (e.scrollTop) e.scrollTop = 0; }); window.scrollTo(0, 0)"
+    CAPTURAS.mkdir(exist_ok=True)
+    ruta = CAPTURAS / f"runt_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
+    if await sin_registro.is_visible():
+        log("RUNT: la persona no está en estado ACTIVA o SIN REGISTRO; se captura el aviso como resultado.")
+        await page.evaluate(ir_arriba)
+        # Deja terminar la animación del aviso.
+        await page.wait_for_timeout(700)
+        await captura_aviso_sobre_datos(page, ruta, sin_registro)
+        return ruta
     await page.wait_for_load_state("networkidle")
     await esperar_sin_carga(page)
 
@@ -271,11 +396,8 @@ async def consultar_runt(page, persona: dict, preguntar, captcha_listo: asyncio.
         log("RUNT: no se encontró el apartado de licencias de conducción")
 
     await esperar_sin_carga(page)
-    await page.evaluate("document.querySelectorAll('*').forEach(e => { if (e.scrollTop) e.scrollTop = 0; }); window.scrollTo(0, 0)")
+    await page.evaluate(ir_arriba)
     await page.wait_for_timeout(300)
-
-    CAPTURAS.mkdir(exist_ok=True)
-    ruta = CAPTURAS / f"runt_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
     await page.screenshot(path=str(ruta), full_page=True)
     return ruta
 
@@ -585,9 +707,16 @@ async def consultar_libreta(page, persona: dict) -> Path:
     await page.locator("#numeroDocumento").fill(numero)
     await page.get_by_role("button", name="Consultar", exact=True).click()
     await page.get_by_text("Aqui vera el estado consultado").wait_for(state="hidden", timeout=30000)
-    # El certificado es un PDF embebido; necesita unos segundos para renderizar.
-    await page.locator("embed").wait_for(state="attached", timeout=15000)
-    await page.wait_for_timeout(2500)
+    certificado = page.locator("embed")
+    # Sin certificado el sitio explica el motivo en un recuadro ("El tipoDocumento no coincide..."): también es el resultado.
+    mensaje = page.locator("iframe[srcdoc]")
+    await certificado.or_(mensaje).first.wait_for(state="attached", timeout=15000)
+    if await certificado.count():
+        # El certificado es un PDF embebido; necesita unos segundos para renderizar.
+        await page.wait_for_timeout(2500)
+    else:
+        texto = await page.frame_locator("iframe[srcdoc]").locator("body").inner_text()
+        log(f"Libreta militar: sin certificado; el sitio respondió: {' '.join(texto.split())}")
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"libreta_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
@@ -608,20 +737,32 @@ async def consultar(page, persona: dict) -> Path:
     no_registrado = form.get_by_text(
         re.compile(r"el n[uú]mero de identificaci[oó]n ingresado no se encuentra registrado", re.I)
     ).first
+    # Página de "problema técnico" (formulario de incidentes): también es un resultado válido para la captura.
+    incidente = form.get_by_text(re.compile(r"se ha presentado un problema t[eé]cnico", re.I)).first
+    incidente_pagina = page.get_by_text(re.compile(r"se ha presentado un problema t[eé]cnico", re.I)).first
 
-    async def cargar_formulario():
+    async def cargar_formulario() -> bool:
+        """Carga el formulario; False si el portal muestra de entrada la página de problema técnico."""
         # El portal a veces tarda más de 30 s en cargar el formulario.
         await page.goto(URL, wait_until="domcontentloaded", timeout=90000)
-        await form.locator("#ddlTipoID").select_option(label=TIPOS[persona["tipo"].upper()], timeout=90000)
+        tipo_id = form.locator("#ddlTipoID")
+        await tipo_id.or_(incidente).first.wait_for(timeout=90000)
+        if await incidente.is_visible():
+            return False
+        await tipo_id.select_option(label=TIPOS[persona["tipo"].upper()], timeout=90000)
         await form.locator("#txtNumID").fill(numero)
         # La pregunta puede cambiar tras el postback del tipo de ID.
         try:
             await page.wait_for_load_state("networkidle", timeout=30000)
         except PlaywrightTimeoutError:
             pass
+        return True
 
-    await cargar_formulario()
+    estado = None if await cargar_formulario() else "incidente"
+    pregunta = None
     for intento in range(3):
+        if estado == "incidente":
+            break
         await pregunta_loc.wait_for(state="visible", timeout=30000)
         pregunta = (await pregunta_loc.inner_text()).strip()
         respuesta = resolver_pregunta(pregunta, numero, persona["nombre"])
@@ -629,24 +770,34 @@ async def consultar(page, persona: dict) -> Path:
         await respuesta_loc.fill(respuesta)
         texto_inicial = await cuerpo.inner_text(timeout=10000)
         await form.locator("#btnConsultar").click()
-        limite = time.monotonic() + 60
+        inicio = time.monotonic()
+        siguiente_aviso = inicio + 60
         estado = None
-        consultando = False
         texto_previo = texto_inicial
         texto_estable_desde = None
-        while time.monotonic() < limite:
-            if await datos_ciudadano.is_visible():
-                estado = "resultado"
-                break
-            if await no_registrado.is_visible():
-                estado = "sin_registro"
-                break
-            if await error_respuesta.is_visible():
-                estado = "respuesta_incorrecta"
-                break
-            texto_actual = await cuerpo.inner_text(timeout=2000)
-            consultando = bool(re.search(r"consultando\s*,?\s*por favor espere|cargando", texto_actual, re.I))
-            if consultando:
+        while time.monotonic() - inicio < ESPERA_PROCURADURIA:
+            if time.monotonic() >= siguiente_aviso:
+                log(f"Procuraduría: sigue consultando ({round((time.monotonic() - inicio) / 60)} min); se espera sin recargar.")
+                siguiente_aviso += 60
+            try:
+                if await datos_ciudadano.is_visible():
+                    estado = "resultado"
+                    break
+                if await no_registrado.is_visible():
+                    estado = "sin_registro"
+                    break
+                if await incidente.is_visible() or await incidente_pagina.is_visible():
+                    estado = "incidente"
+                    break
+                if await error_respuesta.is_visible():
+                    estado = "respuesta_incorrecta"
+                    break
+                texto_actual = await cuerpo.inner_text(timeout=2000)
+            except PlaywrightError:
+                # El marco se está recargando con la respuesta.
+                await page.wait_for_timeout(500)
+                continue
+            if re.search(r"consultando\s*,?\s*por favor espere|cargando", texto_actual, re.I):
                 texto_previo = texto_actual
                 texto_estable_desde = None
                 await page.wait_for_timeout(300)
@@ -667,19 +818,32 @@ async def consultar(page, persona: dict) -> Path:
             log("Procuraduría rechazó la respuesta; se resolverá el nuevo reto.")
             continue
         if estado is None:
-            if intento == 2:
-                raise ValueError("Procuraduría no mostró un resultado en 3 intentos; no se generó captura.")
-            motivo = "seguía consultando" if consultando else "la página no cambió"
-            log(f"Procuraduría: sin resultado en 60 s ({motivo}); se repite la consulta ({intento + 2}/3).")
-            await cargar_formulario()
-            continue
+            raise ValueError(
+                f"Procuraduría no mostró un resultado en {ESPERA_PROCURADURIA // 60} minutos; no se generó captura."
+            )
         if estado == "resultado_estable":
             log("Procuraduría: contenido de resultado estable aunque cambió el rótulo del portal.")
         break
+    if estado == "incidente":
+        log("Procuraduría: el portal mostró 'problema técnico' (formulario de incidentes); se captura como resultado.")
     try:
         await page.wait_for_load_state("networkidle", timeout=10000)
     except PlaywrightTimeoutError:
         pass
+    # Al dar el resultado, el portal cambia la pregunta y deja la respuesta anterior en la casilla:
+    # se escribe (sin enviar) la respuesta de la pregunta nueva para que la captura no las muestre cruzadas.
+    try:
+        nueva = pregunta if estado == "incidente" else (await pregunta_loc.inner_text(timeout=5000)).strip()
+    except PlaywrightTimeoutError:
+        nueva = pregunta
+    if nueva != pregunta:
+        try:
+            respuesta = resolver_pregunta(nueva, numero, persona["nombre"])
+        except ValueError:
+            respuesta = ""
+        log(f"Procuraduría: el portal cambió la pregunta a {nueva!r}; se escribe {respuesta!r} para la captura.")
+        await respuesta_loc.fill(respuesta)
+        await respuesta_loc.evaluate("e => e.blur()")
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
@@ -720,7 +884,7 @@ def preguntar_en_consola(mensaje: str, consola: int | None, pantalla_tomada: boo
         with PANTALLA:
             return preguntar_en_consola(mensaje, consola, pantalla_tomada=True)
     enfocar_consola(consola)
-    return input(mensaje).strip()
+    return leer_respuesta(mensaje).strip()
 
 
 def memoria_libre_mb() -> int | None:
@@ -761,9 +925,11 @@ async def abrir_navegadores(p) -> dict:
     # La Procuraduría bloquea el user agent "HeadlessChrome".
     opciones = {"ignore_https_errors": True, "user_agent": USER_AGENT}
     # Una pestaña por contexto: Chrome frena las pestañas en segundo plano de una misma ventana.
-    procuraduria, simit, libreta, grupo, onu, eurlex = await asyncio.gather(
+    procuraduria, simit, libreta, grupo, onu, eurlex, pdfs = await asyncio.gather(
         automatico.new_context(viewport=VIEWPORT_PROCURADURIA, **opciones),
         *(automatico.new_context(viewport=VIEWPORT, **opciones) for _ in range(5)),
+        # Más estrecha: estas páginas van a una hoja propia y así el texto queda más grande.
+        automatico.new_context(viewport={"width": 1024, "height": 768}, **opciones),
     )
     r = {
         "navegadores": (automatico, visible),
@@ -771,10 +937,28 @@ async def abrir_navegadores(p) -> dict:
         "simit": await simit.new_page(),
         "libreta": await libreta.new_page(),
         "grupo": grupo,
-        # La ventana del RUNT se abre al consultar, para no tapar la pantalla mientras se escriben los datos.
-        "contexto_runt": await visible.new_context(no_viewport=True, **opciones),
-        "runt": None,
+        "documentos": pdfs,
+        "ventanas": {},
+        "precargas": {},
     }
+    # Sitios con captcha: cada uno en su ventana, minimizada mientras se llena; sale al frente en su turno.
+    async def ventana_minimizada():
+        page = await (await visible.new_context(no_viewport=True, **opciones)).new_page()
+        await estado_ventana(page, "minimized")
+        return page
+
+    claves = ("runt", "antecedentes", "registraduria", "inhabilidades")
+    r["ventanas"] = dict(zip(claves, await asyncio.gather(*(ventana_minimizada() for _ in claves))))
+
+    async def precargar_despues_del_runt(page, url):
+        # El RUNT es el primer captcha y su página es la más pesada: las demás cargan cuando termina.
+        await asyncio.gather(r["precargas"]["runt"], return_exceptions=True)
+        await documentos.precargar(page, url)
+
+    r["precargas"]["runt"] = asyncio.create_task(precargar_runt(r["ventanas"]["runt"]))
+    for clave, url in (("antecedentes", documentos.URL_ANTECEDENTES), ("registraduria", documentos.URL_REGISTRADURIA),
+                       ("inhabilidades", documentos.URL_INHABILIDADES)):
+        r["precargas"][clave] = asyncio.create_task(precargar_despues_del_runt(r["ventanas"][clave], url))
     r["consolidado"] = Documento(await onu.new_page(), cargar_consolidado, "consolidado", "Documento consolidado")
     r["consolium"] = Documento(await eurlex.new_page(), cargar_eurlex, "consolium", "EUR-Lex")
     return r
@@ -808,7 +992,9 @@ def consultas_edge(persona: dict, preguntar) -> dict[str, Path]:
 async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -> dict[str, Path]:
     capturas: dict[str, Path] = {}
     limite = asyncio.Semaphore(limite_concurrencia())
-    captcha_listo = asyncio.Event()
+    # Un captcha a la vez: mientras se resuelve uno, los demás sitios ya se están llenando.
+    turno = asyncio.Lock()
+    listos = {clave: asyncio.Event() for clave in r["ventanas"]}
 
     async def registrar(clave: str, consulta):
         try:
@@ -832,21 +1018,47 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
             for clave, consulta in (("ofac", consultar_ofac), ("govuk", consultar_govuk), ("eumostwanted", consultar_eumostwanted)):
                 await registrar(clave, en_pestana_nueva(r["grupo"], consulta, persona))
 
-    async def runt():
-        async def consulta():
-            # Se vuelve a abrir si se cerró la ventana.
-            if r["runt"] is None or r["runt"].is_closed():
-                r["runt"] = await r["contexto_runt"].new_page()
-            return await consultar_runt(r["runt"], persona, preguntar, captcha_listo)
+    async def grupo_documentos():
+        # Sitios sin captcha que entregan un PDF (páginas 14, 15 y 18).
+        async with limite:
+            for clave, consulta in (("bdme", documentos.consultar_bdme), ("contraloria", documentos.consultar_contraloria),
+                                    ("rnmc", documentos.consultar_rnmc)):
+                await registrar(clave, en_pestana_nueva(r["documentos"], consulta, persona))
+
+    async def con_captcha(clave: str, consulta, *args):
+        async def ejecutar():
+            # Si la precarga sigue en curso se espera; si falló, la consulta vuelve a cargar la página.
+            await asyncio.gather(r["precargas"][clave], return_exceptions=True)
+            page = r["ventanas"][clave]
+            if page.is_closed():
+                # Se cerró la ventana: se abre otra en el mismo contexto.
+                page = r["ventanas"][clave] = await page.context.new_page()
+            try:
+                return await consulta(page, persona, *args, turno, listos[clave])
+            except Exception:
+                # Lo que mostraba la ventana al fallar, para poder ver la causa.
+                ruta = CAPTURAS / f"error_{clave}_{datetime.now():%Y%m%d_%H%M%S}.png"
+                try:
+                    await page.screenshot(path=str(ruta), timeout=10000)
+                    log(f"{clave}: pantalla del error guardada en {ruta.name}")
+                except PlaywrightError:
+                    pass
+                raise
 
         try:
-            await registrar("runt", consulta())
+            await registrar(clave, ejecutar())
         finally:
-            captcha_listo.set()
+            listos[clave].set()
+            # Se minimiza al terminar para que las ventanas no se acumulen en pantalla.
+            if not r["ventanas"][clave].is_closed():
+                try:
+                    await estado_ventana(r["ventanas"][clave], "minimized")
+                except PlaywrightError:
+                    pass
 
     async def edge():
-        # Empieza tras el captcha del RUNT para no tapar su ventana; trabaja a la vez que las páginas automáticas.
-        await captcha_listo.wait()
+        # Empieza cuando ya se resolvieron todos los captchas, para no robarles el foco a sus ventanas.
+        await asyncio.gather(*(evento.wait() for evento in listos.values()))
         capturas.update(await asyncio.to_thread(consultas_edge, persona, preguntar_edge))
 
     # Las más largas primero: el límite deja esperando a las últimas en un equipo débil.
@@ -855,7 +1067,11 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
         automatica("simit", consultar_simit, r["simit"], persona, preguntar),
         grupo_rapido(),
         automatica("libreta", consultar_libreta, r["libreta"], persona),
-        runt(),
+        grupo_documentos(),
+        con_captcha("runt", consultar_runt, preguntar),
+        con_captcha("antecedentes", documentos.consultar_antecedentes),
+        con_captcha("registraduria", documentos.consultar_registraduria, preguntar),
+        con_captcha("inhabilidades", documentos.consultar_inhabilidades),
         edge(),
     )
     return capturas
@@ -874,7 +1090,11 @@ async def principal():
         apertura = asyncio.create_task(abrir_navegadores(p))
         try:
             while True:
-                linea = await asyncio.to_thread(input, "\nPega los datos (TIPO NUMERO NOMBRE) o Enter para salir: ")
+                linea = await asyncio.to_thread(
+                    leer_respuesta,
+                    "\nPega la fila de Excel (nombre, documento, empresa, fecha consulta, quien consulta, "
+                    "fecha expedicion) o Enter para salir: ",
+                )
                 if not linea.strip():
                     break
                 try:
@@ -882,7 +1102,11 @@ async def principal():
                 except ValueError as e:
                     log(f"ERROR: {e}")
                     continue
-                log(f"Datos: {persona} | apellido RUNT: {primer_apellido(persona['nombre'])}")
+                log(
+                    f"Datos: {persona['nombre']} | {persona['tipo']} {persona['numero']} | {persona['empresa']} | "
+                    f"consulta {persona['fecha_consulta']:%d/%m/%Y} por {persona['consultor']} | "
+                    f"expedición {persona['fecha_expedicion']:%d/%m/%Y} | apellido RUNT: {primer_apellido(persona['nombre'])}"
+                )
                 capturas = await consultar_persona(persona, await apertura, preguntar, preguntar_edge)
                 if capturas:
                     log(f"PDF: {insertar_en_pdf(capturas, persona['numero'], persona['nombre'])}")
@@ -890,9 +1114,9 @@ async def principal():
             apertura.cancel()
             recursos = (await asyncio.gather(apertura, return_exceptions=True))[0]
             if isinstance(recursos, dict):
-                for documento in (recursos["consolidado"], recursos["consolium"]):
-                    documento.carga.cancel()
-                    await asyncio.gather(documento.carga, return_exceptions=True)
+                for tarea in (recursos["consolidado"].carga, recursos["consolium"].carga, *recursos["precargas"].values()):
+                    tarea.cancel()
+                    await asyncio.gather(tarea, return_exceptions=True)
                 for navegador in recursos["navegadores"]:
                     await navegador.close()
 

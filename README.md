@@ -19,8 +19,10 @@ py -m playwright install chromium
 ```
 py main.py
 ```
-1. Pega los datos: `TIPO NUMERO NOMBRE COMPLETO` (ej. `CC 1000000000 Juan Perez Gomez`). Tipos: CC, CE, PEP, PPT, NIT, TI.
-2. Escribe el captcha del RUNT cuando lo pida (se ve en la ventana del RUNT).
+1. Pega la fila de Excel con: nombre, documento, empresa, fecha consulta, quien consulta, fecha expedicion (ej. `Santiago Flores Alonso | 1000858557 | FALABELLA CEDI | 16/09/2026 | STEVEN | 25/06/2020`). Si el documento no indica tipo, es CC; tipos: CC, CE, PEP, PPT, NIT, TI (ej. `CE 123456`). A mano, separa los datos con `;` o `,`.
+2. Resuelve los captchas cuando la ventana de cada sitio quede al frente, uno tras otro:
+   - RUNT y Registraduría: escribe en la consola el código que ves en la ventana.
+   - Antecedentes e Inhabilidades (Policía): marca "No soy un robot" en la ventana; el bot sigue solo.
 3. Si el FBI o Consilium muestran la verificación de Cloudflare, pásala en el navegador y pulsa Enter.
 4. El PDF queda en `salidas/` y las capturas en `capturas/`.
 5. Enter sin texto para salir.

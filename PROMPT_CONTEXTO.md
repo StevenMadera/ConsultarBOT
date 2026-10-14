@@ -7,7 +7,7 @@ Copia todo lo que sigue y pégalo como primer mensaje del nuevo chat.
 Estás continuando un proyecto llamado **ConsultarBot** (Python, Windows). Responde siempre en español, de forma breve e impersonal. No crees archivos de documentación salvo que te lo pida. Antes de editar, lee el archivo. Verifica tus cambios con una prueba real y borra después los scripts de prueba.
 
 ## Objetivo
-Dado `TIPO NUMERO NOMBRE COMPLETO` (ej. `CC 1000000000 Juan Perez Gomez`), el bot consulta la persona en varias páginas públicas, toma una captura de cada resultado y las pega en una plantilla PDF (`Plantilla/Hombre.pdf`), generando `salidas/<numero> - <nombre>.pdf`. Cada captura debe mostrar tres cosas: el logo de la entidad, los datos de consulta y el resultado. La captura debe llenar el ancho del recuadro del PDF, mantener la proporción y quedar centrada.
+Dada una fila de Excel con `nombre, documento, empresa, fecha consulta, quien consulta, fecha expedicion` (ej. `Santiago Flores Alonso | 1000858557 | FALABELLA CEDI | 16/09/2026 | STEVEN | 25/06/2020`; sin tipo de documento es CC), el bot consulta la persona en varias páginas públicas, toma una captura de cada resultado y las pega en una plantilla PDF (`Plantilla/Hombre.pdf`), generando `salidas/<numero> - <nombre>.pdf`. Cada captura debe mostrar tres cosas: el logo de la entidad, los datos de consulta y el resultado. La captura debe llenar el ancho del recuadro del PDF, mantener la proporción y quedar centrada.
 
 ## Estructura
 - `main.py`: entrada (`py main.py`). Pide los datos por consola, lanza las consultas en paralelo, arma el PDF.

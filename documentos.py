@@ -1,0 +1,439 @@
+"""Páginas 14 a 19 del informe: cada una entrega un PDF que se añade al final, en el orden de la portada."""
+import asyncio
+import base64
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+
+import pymupdf
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+from comun import CAPTURAS, log
+
+ORDEN = ("bdme", "contraloria", "antecedentes", "registraduria", "rnmc", "inhabilidades")
+
+URL_BDME = "https://cobrocoactivo.ramajudicial.gov.co/HOME/bdme"
+# Formulario que la página de la Contraloría muestra dentro de un marco.
+URL_CONTRALORIA = "https://cfiscal.contraloria.gov.co/Certificados/CertificadoPersonaNatural.aspx"
+URL_ANTECEDENTES = "https://antecedentes.policia.gov.co:7005/WebJudicial/antecedentes.xhtml"
+URL_REGISTRADURIA = "https://certvigenciacedula.registraduria.gov.co/Datos.aspx?AspxAutoDetectCookieSupport=1"
+URL_RNMC = "https://srvcnpc.policia.gov.co/PSC/frm_cnp_consulta.aspx"
+URL_INHABILIDADES = "https://inhabilidades.policia.gov.co:8080/consulta"
+EMPRESA_INHABILIDADES = "Secap"
+NIT_INHABILIDADES = "8301340838"
+
+TIPOS_CONTRALORIA = {"CC": "CC", "CE": "CE", "TI": "TI", "PEP": "PEP", "PPT": "PPT"}
+TIPOS_ANTECEDENTES = {"CC": "cc", "CE": "cx"}
+TIPOS_RNMC = {"CC": "55", "CE": "57", "TI": "56", "NIT": "1"}
+TIPOS_INHABILIDADES = {"CC": "CC", "CE": "CX"}
+
+RECAPTCHA_RESUELTO_JS = """() => [...document.querySelectorAll('textarea[name=g-recaptcha-response]')]
+    .some(t => t.value.length > 0)"""
+ESPERA_CAPTCHA = 180000
+# Un recuadro "No soy un robot" cargado hace más tiempo puede responder "La verificación ha caducado" al marcarlo.
+VIGENCIA_RECAPTCHA = 60
+
+
+async def estado_ventana(page, estado: str):
+    """Minimiza o maximiza la ventana de una página del navegador visible."""
+    cdp = await page.context.new_cdp_session(page)
+    try:
+        ventana = (await cdp.send("Browser.getWindowForTarget"))["windowId"]
+        actual = (await cdp.send("Browser.getWindowBounds", {"windowId": ventana}))["bounds"]["windowState"]
+        if actual == "minimized" and estado != "minimized":
+            # Chrome no pasa de minimizada a maximizada sin restaurarla antes.
+            await cdp.send("Browser.setWindowBounds", {"windowId": ventana, "bounds": {"windowState": "normal"}})
+        await cdp.send("Browser.setWindowBounds", {"windowId": ventana, "bounds": {"windowState": estado}})
+    finally:
+        await cdp.detach()
+
+
+async def al_frente(page):
+    await estado_ventana(page, "maximized")
+    await page.bring_to_front()
+
+
+async def precargar(page, url: str):
+    """Abre la página minimizada al iniciar: en la consulta carga desde la caché."""
+    await estado_ventana(page, "minimized")
+    await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+
+
+def tipo_para(tabla: dict, persona: dict, sitio: str) -> str:
+    if persona["tipo"] not in tabla:
+        raise ValueError(f"{sitio} no consulta el tipo de documento {persona['tipo']}; no aplica.")
+    return tabla[persona["tipo"]]
+
+
+def ruta_documento(clave: str, persona: dict) -> Path:
+    CAPTURAS.mkdir(exist_ok=True)
+    return CAPTURAS / f"{clave}_{persona['numero']}_{datetime.now():%Y%m%d_%H%M%S}.pdf"
+
+
+def validar_pdf(ruta: Path):
+    try:
+        with pymupdf.open(ruta) as doc:
+            if doc.page_count:
+                return
+    except Exception:
+        pass
+    raise ValueError(f"El archivo descargado no es un PDF válido: {ruta.name}")
+
+
+def imagen_a_pdf(png: bytes, ruta: Path) -> Path:
+    """Hoja A4 con la captura arriba, al ancho de la hoja (como la última página de la plantilla)."""
+    margen = 28
+    doc = pymupdf.open()
+    pagina = doc.new_page(width=595, height=842)
+    zona = pymupdf.Rect(margen, margen, 595 - margen, 842 - margen)
+    with pymupdf.open(stream=png, filetype="png") as imagen:
+        alto = zona.width * imagen[0].rect.height / imagen[0].rect.width
+    zona.y1 = min(zona.y1, zona.y0 + alto)
+    pagina.insert_image(zona, stream=png, keep_proportion=True)
+    doc.save(ruta, garbage=3, deflate=True)
+    doc.close()
+    return ruta
+
+
+# Borde inferior del contenido visible: debajo solo queda fondo vacío.
+ALTO_CONTENIDO_JS = """() => {
+    let abajo = 0;
+    for (const e of document.body.querySelectorAll('*')) {
+        const r = e.getBoundingClientRect();
+        const conTexto = [...e.childNodes].some(n => n.nodeType === 3 && n.textContent.trim());
+        if (r.width && r.height && (conTexto || ['IMG', 'INPUT', 'SELECT', 'BUTTON', 'IFRAME', 'CANVAS'].includes(e.tagName)))
+            abajo = Math.max(abajo, r.bottom + window.scrollY);
+    }
+    return Math.ceil(abajo);
+}"""
+
+
+# Ancho que necesita el contenido, incluidas las tablas que se salen de su recuadro.
+ANCHO_CONTENIDO_JS = """() => {
+    let ancho = document.documentElement.scrollWidth;
+    for (const e of document.body.querySelectorAll('*')) {
+        if (e.scrollWidth > e.clientWidth + 1 && e.clientWidth)
+            ancho = Math.max(ancho, e.getBoundingClientRect().left + e.scrollWidth);
+    }
+    return Math.ceil(ancho);
+}"""
+
+# Ancho útil de una hoja A4 con los márgenes de Chrome al imprimir (1 cm por lado), en píxeles CSS.
+ANCHO_IMPRIMIBLE = round((8.27 - 2 / 2.54) * 96)
+
+# Chrome ya reduce solo una página más ancha que la hoja, pero un recuadro con barra de desplazamiento corta lo que
+# no le cabe (la tabla de 15 columnas del RNMC): solo ese recuadro se reduce hasta que su contenido quepa.
+REDUCIR_RECORTADOS_JS = """() => {
+    for (const e of document.body.querySelectorAll('*')) {
+        if (e.clientWidth && e.scrollWidth > e.clientWidth + 1 && /auto|scroll/.test(getComputedStyle(e).overflowX))
+            e.style.zoom = Math.floor(e.clientWidth / e.scrollWidth * 100) / 100;
+    }
+}"""
+
+
+async def pagina_a_pdf(page, ruta: Path) -> Path:
+    if page.viewport_size:
+        ancho = await page.evaluate(ANCHO_CONTENIDO_JS)
+        if ancho > page.viewport_size["width"]:
+            # Si no, lo que se sale por la derecha (columnas de tablas, logos) queda cortado.
+            await page.set_viewport_size({"width": min(ancho + 20, 1600), "height": page.viewport_size["height"]})
+            await page.wait_for_timeout(500)
+    alto_total = await page.evaluate("document.documentElement.scrollHeight")
+    alto = min(alto_total, await page.evaluate(ALTO_CONTENIDO_JS) + 30)
+    ancho = await page.evaluate("document.documentElement.clientWidth")
+    recorte = {"x": 0, "y": 0, "width": ancho, "height": alto} if alto > 200 else None
+    return imagen_a_pdf(await page.screenshot(full_page=True, clip=recorte), ruta)
+
+
+async def reducir_recortados(cdp, page):
+    # Se mide como queda en la hoja: con el estilo de impresión y el ancho útil de la hoja.
+    await cdp.send("Emulation.setEmulatedMedia", {"media": "print"})
+    await cdp.send("Emulation.setDeviceMetricsOverride",
+                   {"width": ANCHO_IMPRIMIBLE, "height": 1000, "deviceScaleFactor": 1, "mobile": False})
+    try:
+        await page.evaluate(REDUCIR_RECORTADOS_JS)
+    finally:
+        await cdp.send("Emulation.clearDeviceMetricsOverride")
+        await cdp.send("Emulation.setEmulatedMedia", {"media": ""})
+
+
+async def imprimir_pdf(page, ruta: Path, fondos: bool = False) -> Path:
+    """Lo mismo que Imprimir > Guardar como PDF en Chrome: hoja A4 como la plantilla, con las hojas que necesite."""
+    cdp = await page.context.new_cdp_session(page)
+    try:
+        await reducir_recortados(cdp, page)
+        datos = await cdp.send("Page.printToPDF", {"paperWidth": 8.27, "paperHeight": 11.69, "printBackground": fondos})
+    finally:
+        await cdp.detach()
+    ruta.write_bytes(base64.b64decode(datos["data"]))
+    return ruta
+
+
+async def descargar(page, accion, ruta: Path, espera: int = 60000) -> Path:
+    async with page.expect_download(timeout=espera) as info:
+        await accion()
+    await (await info.value).save_as(ruta)
+    validar_pdf(ruta)
+    return ruta
+
+
+async def pdf_del_sitio_o_captura(page, boton, ruta: Path) -> Path:
+    """El PDF que entrega el sitio al pulsar `boton`; si no entrega ninguno, la página capturada como PDF."""
+    if await boton.count() and await boton.first.is_visible():
+        try:
+            return await descargar(page, boton.first.click, ruta, espera=30000)
+        except (PlaywrightTimeoutError, ValueError) as e:
+            log(f"{ruta.stem}: el sitio no entregó un PDF ({str(e).splitlines()[0]}); se guarda la página.")
+    return await pagina_a_pdf(page, ruta)
+
+
+async def esperar_recaptcha(page, sitio: str, recuadro) -> bool:
+    """True cuando la casilla queda marcada; False si Google la da por caducada."""
+    caducada = recuadro.content_frame.locator(".rc-anchor-error-msg-container")
+    limite = time.monotonic() + ESPERA_CAPTCHA / 1000
+    while time.monotonic() < limite:
+        if await page.evaluate(RECAPTCHA_RESUELTO_JS):
+            return True
+        if await caducada.is_visible():
+            return False
+        await asyncio.sleep(0.5)
+    raise ValueError(f"{sitio}: no se resolvió el captcha en {ESPERA_CAPTCHA // 60000} minutos.")
+
+
+async def esperar_cambio(page, texto_antes: str, espera: int = 60000):
+    """Espera a que el contenido cambie tras enviar el formulario y se quede quieto 2 s."""
+    limite = time.monotonic() + espera / 1000
+    while time.monotonic() < limite:
+        try:
+            await page.wait_for_function(
+                """antes => {
+                    const ahora = document.body.innerText;
+                    if (ahora === antes) return false;
+                    if (window.__previoBot !== ahora) { window.__previoBot = ahora; window.__desdeBot = Date.now(); return false; }
+                    return Date.now() - window.__desdeBot > 2000;
+                }""",
+                arg=texto_antes,
+                timeout=max(1, (limite - time.monotonic()) * 1000),
+                polling=500,
+            )
+            return
+        except PlaywrightTimeoutError:
+            return
+        except PlaywrightError:
+            # El envío recargó la página entera: se sigue esperando en la nueva.
+            try:
+                await page.wait_for_load_state("load", timeout=max(1, (limite - time.monotonic()) * 1000))
+            except PlaywrightError:
+                return
+
+
+async def consultar_bdme(page, persona: dict) -> Path:
+    await page.goto(URL_BDME, wait_until="domcontentloaded", timeout=60000)
+    await page.locator("#Documento").fill(persona["numero"])
+    antes = await page.evaluate("document.body.innerText")
+    await page.locator("#button").click()
+    await esperar_cambio(page, antes)
+    return await pagina_a_pdf(page, ruta_documento("bdme", persona))
+
+
+async def consultar_contraloria(page, persona: dict) -> Path:
+    tipo = tipo_para(TIPOS_CONTRALORIA, persona, "La Contraloría")
+    await page.goto(URL_CONTRALORIA, wait_until="domcontentloaded", timeout=60000)
+    await page.locator("#ddlTipoDocumento").select_option(tipo)
+    await page.locator("#txtNumeroDocumento").fill(persona["numero"])
+    # El captcha del sitio no se toca: el certificado se descarga sin él.
+    return await descargar(page, page.locator("#btnBuscar").click, ruta_documento("contraloria", persona))
+
+
+async def consultar_rnmc(page, persona: dict) -> Path:
+    tipo = tipo_para(TIPOS_RNMC, persona, "El RNMC")
+    await page.goto(URL_RNMC, wait_until="domcontentloaded", timeout=60000)
+    await page.locator("#ctl00_ContentPlaceHolder3_ddlTipoDoc").select_option(tipo)
+    fecha = page.locator("#txtFechaexp")
+    try:
+        await fecha.wait_for(state="visible", timeout=15000)
+        await fecha.fill(f"{persona['fecha_expedicion']:%d/%m/%Y}")
+        buscar = page.locator("#ctl00_ContentPlaceHolder3_btnConsultar2")
+    except PlaywrightTimeoutError:
+        # El NIT no pide fecha de expedición.
+        buscar = page.locator("#ctl00_ContentPlaceHolder3_btnConsultar")
+    await page.locator("#ctl00_ContentPlaceHolder3_txtExpediente").fill(persona["numero"])
+    antes = await page.evaluate("document.body.innerText")
+    await buscar.click()
+    await esperar_cambio(page, antes)
+    error = page.locator("#ctl00_ContentPlaceHolder3_btn_salir_modal")
+    if await error.is_visible():
+        mensaje = await page.locator(".modal.in .modal-body, .modal.show .modal-body").first.inner_text()
+        raise ValueError(f"RNMC: {' '.join(mensaje.split())}")
+    # El botón Imprimir del sitio solo abre la impresión del navegador: se imprime la página igual, con sus franjas azules.
+    return await imprimir_pdf(page, ruta_documento("rnmc", persona), fondos=True)
+
+
+async def consultar_antecedentes(page, persona: dict, turno, listo) -> Path:
+    tipo = tipo_para(TIPOS_ANTECEDENTES, persona, "Antecedentes (Policía)")
+    acepto = page.locator("[id='aceptaOption:0']")
+    cedula = page.locator("#cedulaInput")
+    recuadro = page.locator("#captchaAntecedentes iframe").first
+    lleno_en = 0.0
+
+    async def llenar():
+        nonlocal lleno_en
+        await page.goto(URL_ANTECEDENTES, wait_until="domcontentloaded", timeout=60000)
+        await acepto.or_(cedula).first.wait_for(timeout=60000)
+        if await acepto.is_visible():
+            await acepto.check()
+            await page.locator("#continuarBtn").click()
+        await cedula.wait_for(state="visible", timeout=60000)
+        await page.locator("#cedulaTipo").select_option(tipo)
+        await cedula.fill(persona["numero"])
+        # Google dibuja el recuadro un momento después del formulario.
+        await recuadro.wait_for(state="visible", timeout=60000)
+        lleno_en = time.monotonic()
+
+    await llenar()
+    async with turno:
+        for intento in range(3):
+            # La página pudo cambiar mientras esperaba su turno.
+            if intento or not await recuadro.count() or not await cedula.count() \
+                    or time.monotonic() - lleno_en > VIGENCIA_RECAPTCHA:
+                await llenar()
+            await al_frente(page)
+            # Al centro de la ventana, por encima de la consola, que ocupa la parte baja de la pantalla.
+            await page.locator("#captchaAntecedentes").evaluate("e => e.scrollIntoView({block: 'center'})")
+            log("Antecedentes (Policía): marca 'No soy un robot' en la ventana que quedó al frente.")
+            if not await esperar_recaptcha(page, "Antecedentes (Policía)", recuadro):
+                log("Antecedentes (Policía): Google dio la casilla por caducada; se carga de nuevo la página.")
+                continue
+            try:
+                # El resultado llega en una página nueva; si el sitio rechaza la casilla, vuelve el formulario con un aviso.
+                async with page.expect_navigation(timeout=60000):
+                    await page.locator("#j_idt17").click()
+            except PlaywrightTimeoutError:
+                log(f"Antecedentes (Policía): el sitio no respondió en 1 minuto, intento {intento + 1}/3.")
+                continue
+            if not await cedula.count():
+                break
+            aviso = " ".join(" ".join(await page.locator(".ui-messages").all_inner_texts()).split())
+            log(f"Antecedentes (Policía): el sitio no mostró el resultado ({aviso or 'volvió el formulario'}), "
+                f"intento {intento + 1}/3.")
+        else:
+            raise ValueError("Antecedentes (Policía): no se obtuvo el resultado tras 3 intentos.")
+    listo.set()
+    return await imprimir_pdf(page, ruta_documento("antecedentes", persona))
+
+
+async def consultar_registraduria(page, persona: dict, preguntar, turno, listo) -> Path:
+    if persona["tipo"] != "CC":
+        raise ValueError("La Registraduría solo certifica cédulas de ciudadanía; no aplica.")
+    fecha = persona["fecha_expedicion"]
+    codigo = page.locator("#ContentPlaceHolder1_TextBox2")
+    imagen = page.locator("#datos_contentplaceholder1_captcha1_CaptchaImage")
+    lleno_en = 0.0
+
+    async def llenar():
+        nonlocal lleno_en
+        await page.goto(URL_REGISTRADURIA, wait_until="domcontentloaded", timeout=60000)
+        await page.locator("#ContentPlaceHolder1_TextBox1").fill(persona["numero"])
+        await page.locator("#ContentPlaceHolder1_DropDownList1").select_option(f"{fecha.day:02d}")
+        await page.locator("#ContentPlaceHolder1_DropDownList2").select_option(f"{fecha.month:02d}")
+        await page.locator("#ContentPlaceHolder1_DropDownList3").select_option(str(fecha.year))
+        lleno_en = time.monotonic()
+
+    await llenar()
+    async with turno:
+        for intento in range(3):
+            # El código caduca y la página puede cambiar mientras espera su turno.
+            if intento or time.monotonic() - lleno_en > 60 or not await codigo.count():
+                await llenar()
+            await al_frente(page)
+            # La imagen del código queda al centro, por encima de la consola.
+            await imagen.evaluate("e => e.scrollIntoView({block: 'center'})")
+            respuesta = await preguntar("Código de la Registraduría: míralo en su ventana y escríbelo AQUÍ en la consola: ")
+            if not await codigo.count():
+                log("Registraduría: la página cambió mientras se escribía el código; se carga de nuevo.")
+                continue
+            await codigo.fill(respuesta)
+            antes = await page.evaluate("document.body.innerText")
+            await page.locator("#ContentPlaceHolder1_Button1").click()
+            await esperar_cambio(page, antes, espera=30000)
+            if not await codigo.is_visible():
+                break
+            log(f"Registraduría: código incorrecto o sin resultado, intento {intento + 1}/3")
+        else:
+            raise ValueError("Registraduría: no se obtuvo resultado tras 3 intentos.")
+    listo.set()
+    boton = page.get_by_role("button", name=re.compile(r"descargar|imprimir|generar|certificado", re.I)).or_(
+        page.locator("input[type=submit][value*='escargar' i], input[type=submit][value*='mprimir' i]")
+    )
+    return await pdf_del_sitio_o_captura(page, boton, ruta_documento("registraduria", persona))
+
+
+async def consultar_inhabilidades(page, persona: dict, turno, listo) -> Path:
+    tipo = tipo_para(TIPOS_INHABILIDADES, persona, "Inhabilidades (Policía)")
+    terminos = page.locator("#cbCondiciones")
+    recaptcha = page.locator("iframe[title='reCAPTCHA']").first
+    lleno_en = 0.0
+
+    async def llenar():
+        nonlocal lleno_en
+        await page.goto(URL_INHABILIDADES, wait_until="domcontentloaded", timeout=60000)
+        await page.locator("#tipo").select_option(tipo)
+        await page.locator("#nuip").fill(persona["numero"])
+        await page.locator("#fechaExpNuip").fill(f"{persona['fecha_expedicion']:%d/%m/%Y}")
+        await page.locator("#nombreEmpresa").fill(EMPRESA_INHABILIDADES)
+        await page.locator("#nitEmpresa").fill(NIT_INHABILIDADES)
+        # La casilla real está oculta: se pulsa el cuadro dibujado al inicio de la etiqueta, lejos del enlace a los términos.
+        await page.locator("label[for=cbCondiciones]").click(position={"x": 4, "y": 8})
+        if not await terminos.is_checked():
+            await terminos.evaluate("e => e.click()")
+        if not await terminos.is_checked():
+            raise ValueError("Inhabilidades (Policía): no se pudo marcar la casilla de términos de uso.")
+        await recaptcha.wait_for(state="visible", timeout=60000)
+        lleno_en = time.monotonic()
+
+    resultado = page.locator("#res")
+    avisos = []
+
+    async def aviso(dialogo):
+        # Sin esto Playwright cierra solo los mensajes emergentes del sitio y no se sabe qué dijeron.
+        avisos.append(dialogo.message)
+        await dialogo.dismiss()
+
+    await llenar()
+    page.on("dialog", aviso)
+    try:
+        async with turno:
+            for intento in range(3):
+                # La página pudo cambiar mientras esperaba su turno.
+                if intento or not await recaptcha.count() or not await terminos.count() \
+                        or time.monotonic() - lleno_en > VIGENCIA_RECAPTCHA:
+                    await llenar()
+                avisos.clear()
+                await al_frente(page)
+                await recaptcha.evaluate("e => e.scrollIntoView({block: 'center'})")
+                log("Inhabilidades (Policía): marca 'No soy un robot' en la ventana que quedó al frente.")
+                if not await esperar_recaptcha(page, "Inhabilidades (Policía)", recaptcha):
+                    log("Inhabilidades (Policía): Google dio la casilla por caducada; se carga de nuevo la página.")
+                    continue
+                try:
+                    # El sitio responde con una página nueva que trae el resultado en la sección #res.
+                    async with page.expect_navigation(timeout=30000):
+                        await page.locator("#btnConsultar").click()
+                except PlaywrightTimeoutError:
+                    pass
+                if await resultado.count():
+                    break
+                motivo = avisos + await page.locator(".text-validation").all_inner_texts()
+                log(f"Inhabilidades (Policía): el sitio no mostró el resultado "
+                    f"({'; '.join(motivo) or 'devolvió el formulario vacío'}), intento {intento + 1}/3.")
+            else:
+                raise ValueError("Inhabilidades (Policía): el sitio no mostró el resultado tras 3 intentos.")
+    finally:
+        page.remove_listener("dialog", aviso)
+    listo.set()
+    # Al cargar, el sitio tapa la página casi un segundo con su animación de carga (fondo blanco y un círculo).
+    await page.add_style_tag(content="#pb_loader { display: none !important; }")
+    # La página entera con gráficos de fondo, como al guardarla desde Chrome: el pie lleva su línea azul y los logos.
+    return await imprimir_pdf(page, ruta_documento("inhabilidades", persona), fondos=True)

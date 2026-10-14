@@ -35,6 +35,12 @@ def _hay_verificacion() -> bool:
     return any(t in titulo.lower() for titulo in gw.getAllTitles() for t in TITULOS_VERIFICACION)
 
 
+def _en_blanco(rgb: bytes) -> bool:
+    # Sin la franja de arriba (el aviso del FBI se dibuja antes que el resto), todo blanco puro.
+    resto = rgb[len(rgb) // 10:]
+    return resto.count(255) > len(resto) * 0.995
+
+
 def _buscar_ventana(titulo: str):
     # El editor puede tener abierto un archivo cuyo nombre contenga el mismo texto.
     for ventana in gw.getWindowsWithTitle(titulo):
@@ -154,11 +160,17 @@ def _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, 
 
             # Los resultados se aplican después de cargar: se captura cuando la página deja de cambiar.
             inicio, previo, iguales = time.time(), None, 0
-            while time.time() - inicio < ESPERA_ESTABLE_MAXIMA:
+            while True:
                 actual = sct.grab(region).rgb
                 iguales = iguales + 1 if actual == previo else 0
                 previo = actual
-                if time.time() - inicio >= espera_minima and iguales >= 2:
+                transcurrido = time.time() - inicio
+                if _en_blanco(actual):
+                    # A veces la página tarda en dibujar el contenido (el FBI): en blanco no se captura.
+                    if transcurrido >= ESPERA_MAXIMA:
+                        log(f"{nombre}: la página siguió en blanco {ESPERA_MAXIMA} s; se captura así.")
+                        break
+                elif transcurrido >= ESPERA_ESTABLE_MAXIMA or (transcurrido >= espera_minima and iguales >= 2):
                     break
                 time.sleep(0.4)
             imagen = sct.grab(region)
