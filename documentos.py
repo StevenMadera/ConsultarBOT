@@ -1,6 +1,7 @@
 """Páginas 14 a 19 del informe: cada una entrega un PDF que se añade al final, en el orden de la portada."""
 import asyncio
 import base64
+import contextlib
 import re
 import time
 from datetime import datetime
@@ -32,8 +33,10 @@ TIPOS_INHABILIDADES = {"CC": "CC", "CE": "CX"}
 RECAPTCHA_RESUELTO_JS = """() => [...document.querySelectorAll('textarea[name=g-recaptcha-response]')]
     .some(t => t.value.length > 0)"""
 ESPERA_CAPTCHA = 180000
-# Un recuadro "No soy un robot" cargado hace más tiempo puede responder "La verificación ha caducado" al marcarlo.
-VIGENCIA_RECAPTCHA = 60
+# Segundos que un captcha aguanta cargado: después el código cambia o Google da la casilla por caducada.
+VIGENCIA_CAPTCHA = 60
+# Mientras espera su turno, la página se recarga cuando le quedan estos segundos de vigencia.
+MARGEN_RECARGA = 15
 
 
 async def estado_ventana(page, estado: str):
@@ -59,6 +62,31 @@ async def precargar(page, url: str):
     """Abre la página minimizada al iniciar: en la consulta carga desde la caché."""
     await estado_ventana(page, "minimized")
     await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+
+
+@contextlib.asynccontextmanager
+async def turno_al_dia(turno: asyncio.Lock, lleno_en, llenar):
+    """El turno de captcha; mientras se espera, la página se recarga antes de caducar para que, cuando llegue el
+    turno, esté lista y no haya que esperar la recarga."""
+    adquirir = asyncio.ensure_future(turno.acquire())
+    recargar = True
+    try:
+        while not adquirir.done():
+            restante = VIGENCIA_CAPTCHA - MARGEN_RECARGA - (time.monotonic() - lleno_en())
+            if recargar and restante <= 0:
+                try:
+                    await llenar()
+                except (PlaywrightError, ValueError):
+                    # Se vuelve a intentar al llegar el turno.
+                    recargar = False
+            else:
+                await asyncio.wait({adquirir}, timeout=restante if recargar else None)
+        yield
+    finally:
+        if adquirir.done() and not adquirir.cancelled() and adquirir.exception() is None:
+            turno.release()
+        else:
+            adquirir.cancel()
 
 
 def tipo_para(tabla: dict, persona: dict, sitio: str) -> str:
@@ -293,11 +321,11 @@ async def consultar_antecedentes(page, persona: dict, turno, listo) -> Path:
         lleno_en = time.monotonic()
 
     await llenar()
-    async with turno:
+    async with turno_al_dia(turno, lambda: lleno_en, llenar):
         for intento in range(3):
             # La página pudo cambiar mientras esperaba su turno.
             if intento or not await recuadro.count() or not await cedula.count() \
-                    or time.monotonic() - lleno_en > VIGENCIA_RECAPTCHA:
+                    or time.monotonic() - lleno_en > VIGENCIA_CAPTCHA:
                 await llenar()
             await al_frente(page)
             # Al centro de la ventana, por encima de la consola, que ocupa la parte baja de la pantalla.
@@ -342,10 +370,10 @@ async def consultar_registraduria(page, persona: dict, preguntar, turno, listo) 
         lleno_en = time.monotonic()
 
     await llenar()
-    async with turno:
+    async with turno_al_dia(turno, lambda: lleno_en, llenar):
         for intento in range(3):
             # El código caduca y la página puede cambiar mientras espera su turno.
-            if intento or time.monotonic() - lleno_en > 60 or not await codigo.count():
+            if intento or time.monotonic() - lleno_en > VIGENCIA_CAPTCHA or not await codigo.count():
                 await llenar()
             await al_frente(page)
             # La imagen del código queda al centro, por encima de la consola.
@@ -404,11 +432,11 @@ async def consultar_inhabilidades(page, persona: dict, turno, listo) -> Path:
     await llenar()
     page.on("dialog", aviso)
     try:
-        async with turno:
+        async with turno_al_dia(turno, lambda: lleno_en, llenar):
             for intento in range(3):
                 # La página pudo cambiar mientras esperaba su turno.
                 if intento or not await recaptcha.count() or not await terminos.count() \
-                        or time.monotonic() - lleno_en > VIGENCIA_RECAPTCHA:
+                        or time.monotonic() - lleno_en > VIGENCIA_CAPTCHA:
                     await llenar()
                 avisos.clear()
                 await al_frente(page)

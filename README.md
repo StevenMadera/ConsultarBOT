@@ -23,6 +23,8 @@ py main.py
 2. Resuelve los captchas cuando la ventana de cada sitio quede al frente, uno tras otro:
    - RUNT y Registraduría: escribe en la consola el código que ves en la ventana.
    - Antecedentes e Inhabilidades (Policía): marca "No soy un robot" en la ventana; el bot sigue solo.
+
+   Al empezar se abren minimizadas dos ventanas de Chrome (FBI y Consilium): no las cierres, el bot las captura y las cierra al final.
 3. Si el FBI o Consilium muestran la verificación de Cloudflare, pásala en el navegador y pulsa Enter.
 4. El PDF queda en `salidas/` y las capturas en `capturas/`.
 5. Enter sin texto para salir.

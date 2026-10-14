@@ -8,15 +8,20 @@ URL_TERRORISTAS = (
     "https://findit.state.gov/search?affiliate=dos_stategov&sort_by="
     "&query={nombre}&commit=Search"
 )
+TITULO_TERRORISTAS = "U.S. Department of State Search Results"
 
 
-def consultar_terroristas(persona: dict, preguntar=input) -> Path:
-    nombre = " ".join(persona["nombre"].split())
+def url_terroristas(persona: dict) -> str:
+    return URL_TERRORISTAS.format(nombre=quote(" ".join(persona["nombre"].split()), safe=""))
+
+
+def consultar_terroristas(persona: dict, preguntar=input, ventana=None) -> Path:
     return capturar_navegador(
-        URL_TERRORISTAS.format(nombre=quote(nombre, safe="")),
-        "U.S. Department of State Search Results",
+        url_terroristas(persona),
+        TITULO_TERRORISTAS,
         "Terrorist designations",
         "terroristas",
         persona["numero"],
         preguntar=preguntar,
+        ventana=ventana,
     )

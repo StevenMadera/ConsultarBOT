@@ -15,18 +15,20 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
-from captura_navegador import PANTALLA
+from captura_navegador import PANTALLA, abrir_en_ventana
 from comun import CAPTURAS, leer_respuesta, log
 import documentos
 from documentos import estado_ventana
-from consulta_consilium import consultar_consilium
-from consulta_fbi import consultar_fbi
-from consulta_justicia import consultar_justicia
-from consulta_terroristas import consultar_terroristas
+from consulta_consilium import consultar_consilium, url_consilium
+from consulta_fbi import consultar_fbi, url_fbi
+from consulta_justicia import TITULO_JUSTICIA, consultar_justicia, url_justicia
+from consulta_terroristas import TITULO_TERRORISTAS, consultar_terroristas, url_terroristas
 
 URL = "https://www.procuraduria.gov.co/Pages/Consulta-de-Antecedentes.aspx"
 # Tras enviar la consulta el portal puede tardar minutos; si se recarga, la consulta empieza de cero.
-ESPERA_PROCURADURIA = 300
+ESPERA_PROCURADURIA = 240
+# Sin respuesta en este tiempo, se lanza una segunda consulta en paralelo sin recargar la primera.
+SEGUNDA_PROCURADURIA = 90
 URL_RUNT = "https://portalpublico.runt.gov.co/#/consulta-ciudadano-documento/consulta/consulta-ciudadano-documento"
 URL_SIMIT = "https://www.fcm.org.co/simit/#/home-public"
 URL_LIBRETA = "https://definicion.libretamilitar.mil.co/consulta-estado-situacion-militar"
@@ -341,10 +343,10 @@ async def consultar_runt(page, persona: dict, preguntar, turno: asyncio.Lock, li
 
     # Se llena minimizado; la ventana sale al frente cuando le toca el turno de captcha.
     await llenar()
-    async with turno:
+    async with documentos.turno_al_dia(turno, lambda: lleno_en, llenar):
         for intento in range(3):
             # El captcha caduca y la página puede cambiar mientras espera su turno.
-            if intento or time.monotonic() - lleno_en > 60 or not await imagen_captcha.count():
+            if intento or time.monotonic() - lleno_en > documentos.VIGENCIA_CAPTCHA or not await imagen_captcha.count():
                 await llenar()
             await estado_ventana(page, "maximized")
             await imagen_captcha.scroll_into_view_if_needed()
@@ -603,6 +605,30 @@ async def consultar_eumostwanted(page, persona: dict) -> Path:
     return ruta
 
 
+async def capturar_sin_ventana(page, persona: dict, clave: str, url: str, titulo: str) -> Path:
+    """State.gov y Justice: antes solo cargaban en Chrome; hoy cargan aquí y van en paralelo con los captchas."""
+    respuesta = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    if respuesta and respuesta.status >= 400:
+        raise ValueError(f"el sitio respondió {respuesta.status}")
+    # State.gov responde primero con una verificación de AWS (HTTP 202) que recarga sola la página.
+    limite = time.monotonic() + 60
+    while True:
+        try:
+            if titulo in await page.title():
+                break
+        except PlaywrightError:
+            pass
+        if time.monotonic() > limite:
+            raise ValueError("la página no cargó")
+        await page.wait_for_timeout(500)
+    await page.wait_for_load_state("load", timeout=60000)
+
+    CAPTURAS.mkdir(exist_ok=True)
+    ruta = CAPTURAS / f"{clave}_{re.sub(r'\D', '', persona['numero'])}_{datetime.now():%Y%m%d_%H%M%S}.png"
+    await captura_ajustada(page, ruta, clave)
+    return ruta
+
+
 # El documento queda cargado entre consultas: primero se quita la búsqueda anterior.
 BUSCAR_EN_DOCUMENTO_JS = """q => {
     document.getElementById('barra-buscar-bot')?.remove();
@@ -724,7 +750,7 @@ async def consultar_libreta(page, persona: dict) -> Path:
     return ruta
 
 
-async def consultar(page, persona: dict) -> Path:
+async def consultar(page, persona: dict, nombre: str = "Procuraduría") -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
     form = page.frame_locator("iframe[src*='webcert']")
     pregunta_loc = form.locator("#lblPregunta")
@@ -766,7 +792,7 @@ async def consultar(page, persona: dict) -> Path:
         await pregunta_loc.wait_for(state="visible", timeout=30000)
         pregunta = (await pregunta_loc.inner_text()).strip()
         respuesta = resolver_pregunta(pregunta, numero, persona["nombre"])
-        log(f"Pregunta: {pregunta!r} -> {respuesta!r}")
+        log(f"{nombre}, pregunta: {pregunta!r} -> {respuesta!r}")
         await respuesta_loc.fill(respuesta)
         texto_inicial = await cuerpo.inner_text(timeout=10000)
         await form.locator("#btnConsultar").click()
@@ -777,7 +803,7 @@ async def consultar(page, persona: dict) -> Path:
         texto_estable_desde = None
         while time.monotonic() - inicio < ESPERA_PROCURADURIA:
             if time.monotonic() >= siguiente_aviso:
-                log(f"Procuraduría: sigue consultando ({round((time.monotonic() - inicio) / 60)} min); se espera sin recargar.")
+                log(f"{nombre}: sigue consultando ({round((time.monotonic() - inicio) / 60)} min); se espera sin recargar.")
                 siguiente_aviso += 60
             try:
                 if await datos_ciudadano.is_visible():
@@ -814,18 +840,18 @@ async def consultar(page, persona: dict) -> Path:
             await page.wait_for_timeout(250)
         if estado == "respuesta_incorrecta":
             if intento == 2:
-                raise ValueError("Procuraduría rechazó tres respuestas de verificación.")
-            log("Procuraduría rechazó la respuesta; se resolverá el nuevo reto.")
+                raise ValueError(f"{nombre} rechazó tres respuestas de verificación.")
+            log(f"{nombre} rechazó la respuesta; se resolverá el nuevo reto.")
             continue
         if estado is None:
             raise ValueError(
-                f"Procuraduría no mostró un resultado en {ESPERA_PROCURADURIA // 60} minutos; no se generó captura."
+                f"{nombre} no mostró un resultado en {ESPERA_PROCURADURIA // 60} minutos; no se generó captura."
             )
         if estado == "resultado_estable":
-            log("Procuraduría: contenido de resultado estable aunque cambió el rótulo del portal.")
+            log(f"{nombre}: contenido de resultado estable aunque cambió el rótulo del portal.")
         break
     if estado == "incidente":
-        log("Procuraduría: el portal mostró 'problema técnico' (formulario de incidentes); se captura como resultado.")
+        log(f"{nombre}: el portal mostró 'problema técnico' (formulario de incidentes); se captura como resultado.")
     try:
         await page.wait_for_load_state("networkidle", timeout=10000)
     except PlaywrightTimeoutError:
@@ -841,7 +867,7 @@ async def consultar(page, persona: dict) -> Path:
             respuesta = resolver_pregunta(nueva, numero, persona["nombre"])
         except ValueError:
             respuesta = ""
-        log(f"Procuraduría: el portal cambió la pregunta a {nueva!r}; se escribe {respuesta!r} para la captura.")
+        log(f"{nombre}: el portal cambió la pregunta a {nueva!r}; se escribe {respuesta!r} para la captura.")
         await respuesta_loc.fill(respuesta)
         await respuesta_loc.evaluate("e => e.blur()")
 
@@ -851,23 +877,53 @@ async def consultar(page, persona: dict) -> Path:
     return ruta
 
 
-def consola_siempre_visible() -> int | None:
-    """Fija la consola encima de todo, en una franja inferior de la pantalla; devuelve su handle."""
+async def consultar_procuraduria(page, persona: dict) -> Path:
+    """Si el portal se queda consultando, una segunda consulta en otra pestaña; vale la primera que responda."""
+    inicio = time.monotonic()
+    primera = asyncio.create_task(consultar(page, persona))
+    await asyncio.wait({primera}, timeout=SEGUNDA_PROCURADURIA)
+    if primera.done():
+        return primera.result()
+    log(f"Procuraduría: no respondió en {SEGUNDA_PROCURADURIA} s; se lanza una segunda consulta sin recargar la primera.")
+    contexto = await page.context.browser.new_context(viewport=VIEWPORT_PROCURADURIA, ignore_https_errors=True,
+                                                      user_agent=USER_AGENT)
+    segunda = asyncio.create_task(consultar(await contexto.new_page(), persona, "Procuraduría (2.ª consulta)"))
+    pendientes, error = {primera, segunda}, None
+    try:
+        while pendientes:
+            restante = ESPERA_PROCURADURIA - (time.monotonic() - inicio)
+            hechas, pendientes = await asyncio.wait(pendientes, timeout=max(0, restante),
+                                                    return_when=asyncio.FIRST_COMPLETED)
+            if not hechas:
+                break
+            for tarea in hechas:
+                if tarea.exception() is None:
+                    return tarea.result()
+                error = error or tarea.exception()
+        if error and not pendientes:
+            raise error
+        raise ValueError(f"Procuraduría no mostró un resultado en {ESPERA_PROCURADURIA // 60} minutos; no se generó captura.")
+    finally:
+        for tarea in (primera, segunda):
+            tarea.cancel()
+        await asyncio.gather(primera, segunda, return_exceptions=True)
+        await contexto.close()
+
+
+def ventana_consola() -> int | None:
+    """Ventana de la consola, para darle el foco al preguntar; None si la terminal no tiene una propia."""
     if sys.platform != "win32":
         return None
     import ctypes
+    from ctypes import wintypes
 
     hwnd = ctypes.windll.kernel32.GetConsoleWindow()
     # Windows Terminal y la terminal de VS Code no exponen una ventana propia.
     if not hwnd or not ctypes.windll.user32.IsWindowVisible(hwnd):
         return None
-    ancho = ctypes.windll.user32.GetSystemMetrics(0)
-    alto = ctypes.windll.user32.GetSystemMetrics(1)
-    alto_ventana = 240
-    HWND_TOPMOST, SWP_NOACTIVATE = -1, 0x0010
-    ctypes.windll.user32.SetWindowPos(
-        hwnd, HWND_TOPMOST, 0, alto - alto_ventana - 48, min(ancho, 900), alto_ventana, SWP_NOACTIVATE
-    )
+    # Si quedó fija encima de todo por la versión anterior (bloqueaba la parte baja de la pantalla), se suelta.
+    HWND_NOTOPMOST, SWP_NOSIZE_NOMOVE_NOACTIVATE = wintypes.HWND(-2), 0x0013
+    ctypes.windll.user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOSIZE_NOMOVE_NOACTIVATE)
     return hwnd
 
 
@@ -925,9 +981,9 @@ async def abrir_navegadores(p) -> dict:
     # La Procuraduría bloquea el user agent "HeadlessChrome".
     opciones = {"ignore_https_errors": True, "user_agent": USER_AGENT}
     # Una pestaña por contexto: Chrome frena las pestañas en segundo plano de una misma ventana.
-    procuraduria, simit, libreta, grupo, onu, eurlex, pdfs = await asyncio.gather(
+    procuraduria, simit, libreta, grupo, eeuu, onu, eurlex, pdfs = await asyncio.gather(
         automatico.new_context(viewport=VIEWPORT_PROCURADURIA, **opciones),
-        *(automatico.new_context(viewport=VIEWPORT, **opciones) for _ in range(5)),
+        *(automatico.new_context(viewport=VIEWPORT, **opciones) for _ in range(6)),
         # Más estrecha: estas páginas van a una hoja propia y así el texto queda más grande.
         automatico.new_context(viewport={"width": 1024, "height": 768}, **opciones),
     )
@@ -937,6 +993,7 @@ async def abrir_navegadores(p) -> dict:
         "simit": await simit.new_page(),
         "libreta": await libreta.new_page(),
         "grupo": grupo,
+        "eeuu": eeuu,
         "documentos": pdfs,
         "ventanas": {},
         "precargas": {},
@@ -972,29 +1029,61 @@ async def en_pestana_nueva(contexto, consulta, persona: dict) -> Path:
         await page.close()
 
 
-def consultas_edge(persona: dict, preguntar) -> dict[str, Path]:
-    """Páginas con verificación de Cloudflare: la pasa una persona en su navegador; se capturan una tras otra."""
+CONSULTAS_CHROME = {
+    "fbi": consultar_fbi,
+    "consilium": consultar_consilium,
+    "terroristas": consultar_terroristas,
+    "justicia": consultar_justicia,
+}
+
+
+def abrir_paginas_chrome(persona: dict) -> dict:
+    """FBI y Consilium solo cargan en Chrome: se abren al empezar, cada una en su ventana minimizada, y cargan
+    mientras se resuelven los captchas; al final solo queda capturarlas."""
+    with PANTALLA:
+        ventanas = {clave: abrir_en_ventana(url) for clave, url in (("fbi", url_fbi(persona)),
+                                                                     ("consilium", url_consilium(persona)))}
+    for clave, ventana in ventanas.items():
+        if not ventana:
+            log(f"{clave}: no se pudo abrir de antemano en Chrome; se abrirá al capturarla.")
+    return {clave: ventana for clave, ventana in ventanas.items() if ventana}
+
+
+def consultas_edge(persona: dict, preguntar, claves: list[str], abiertas: dict) -> dict[str, Path]:
+    """Páginas que bloquean el navegador automático: se capturan en el navegador del usuario, una tras otra."""
     capturas = {}
-    for clave, consulta in (
-        ("terroristas", consultar_terroristas),
-        ("justicia", consultar_justicia),
-        ("fbi", consultar_fbi),
-        ("consilium", consultar_consilium),
-    ):
+    for clave in claves:
         try:
-            capturas[clave] = consulta(persona, preguntar)
+            capturas[clave] = CONSULTAS_CHROME[clave](persona, preguntar, abiertas.get(clave))
             log(f"Captura {clave}: {capturas[clave]}")
         except Exception as e:
             log(f"ERROR {clave}: {e}")
     return capturas
 
 
+def minutos(segundos: float) -> str:
+    segundos = round(segundos)
+    return f"{segundos // 60}:{segundos % 60:02d}"
+
+
 async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -> dict[str, Path]:
+    inicio = time.monotonic()
     capturas: dict[str, Path] = {}
     limite = asyncio.Semaphore(limite_concurrencia())
     # Un captcha a la vez: mientras se resuelve uno, los demás sitios ya se están llenando.
     turno = asyncio.Lock()
     listos = {clave: asyncio.Event() for clave in r["ventanas"]}
+    abiertas = {}
+    # Si el navegador automático no puede con State.gov o Justice, se capturan en Chrome como antes.
+    a_chrome = []
+
+    async def abrir_en_chrome():
+        try:
+            abiertas.update(await asyncio.to_thread(abrir_paginas_chrome, persona))
+        except Exception as e:
+            log(f"Chrome: no se pudieron abrir de antemano FBI y Consilium ({e}); se abrirán al capturarlas.")
+
+    apertura_chrome = asyncio.create_task(abrir_en_chrome())
 
     async def registrar(clave: str, consulta):
         try:
@@ -1025,25 +1114,46 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
                                     ("rnmc", documentos.consultar_rnmc)):
                 await registrar(clave, en_pestana_nueva(r["documentos"], consulta, persona))
 
+    async def grupo_eeuu():
+        async with limite:
+            for clave, url, titulo in (("terroristas", url_terroristas(persona), TITULO_TERRORISTAS),
+                                       ("justicia", url_justicia(persona), TITULO_JUSTICIA)):
+                page = await r["eeuu"].new_page()
+                try:
+                    capturas[clave] = await capturar_sin_ventana(page, persona, clave, url, titulo)
+                    log(f"Captura {clave}: {capturas[clave]}")
+                except Exception as e:
+                    log(f"{clave}: no cargó en el navegador automático ({str(e).splitlines()[0]}); se capturará en Chrome.")
+                    a_chrome.append(clave)
+                finally:
+                    await page.close()
+
+    eeuu = asyncio.create_task(grupo_eeuu())
+
     async def con_captcha(clave: str, consulta, *args):
         async def ejecutar():
             # Si la precarga sigue en curso se espera; si falló, la consulta vuelve a cargar la página.
             await asyncio.gather(r["precargas"][clave], return_exceptions=True)
-            page = r["ventanas"][clave]
-            if page.is_closed():
-                # Se cerró la ventana: se abre otra en el mismo contexto.
-                page = r["ventanas"][clave] = await page.context.new_page()
-            try:
-                return await consulta(page, persona, *args, turno, listos[clave])
-            except Exception:
-                # Lo que mostraba la ventana al fallar, para poder ver la causa.
-                ruta = CAPTURAS / f"error_{clave}_{datetime.now():%Y%m%d_%H%M%S}.png"
+            for intento in range(2):
+                page = r["ventanas"][clave]
+                if page.is_closed():
+                    # Se cerró la ventana: se abre otra en el mismo contexto.
+                    page = r["ventanas"][clave] = await page.context.new_page()
+                    await estado_ventana(page, "minimized")
                 try:
-                    await page.screenshot(path=str(ruta), timeout=10000)
-                    log(f"{clave}: pantalla del error guardada en {ruta.name}")
-                except PlaywrightError:
-                    pass
-                raise
+                    return await consulta(page, persona, *args, turno, listos[clave])
+                except Exception:
+                    if page.is_closed() and not intento:
+                        log(f"{clave}: se cerró su ventana durante la consulta; se abre otra y se repite.")
+                        continue
+                    # Lo que mostraba la ventana al fallar, para poder ver la causa.
+                    ruta = CAPTURAS / f"error_{clave}_{datetime.now():%Y%m%d_%H%M%S}.png"
+                    try:
+                        await page.screenshot(path=str(ruta), timeout=10000)
+                        log(f"{clave}: pantalla del error guardada en {ruta.name}")
+                    except PlaywrightError:
+                        pass
+                    raise
 
         try:
             await registrar(clave, ejecutar())
@@ -1059,15 +1169,29 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
     async def edge():
         # Empieza cuando ya se resolvieron todos los captchas, para no robarles el foco a sus ventanas.
         await asyncio.gather(*(evento.wait() for evento in listos.values()))
-        capturas.update(await asyncio.to_thread(consultas_edge, persona, preguntar_edge))
+        log(f"Tiempo: captchas listos a los {minutos(time.monotonic() - inicio)}")
+        await asyncio.gather(apertura_chrome, eeuu, return_exceptions=True)
+        desde = time.monotonic()
+        # Las que no se pudieron abrir de antemano se abren al capturarlas, como antes.
+        capturas.update(await asyncio.to_thread(
+            consultas_edge, persona, preguntar_edge, ["fbi", "consilium", *a_chrome], abiertas))
+        log(f"Tiempo: capturas en Chrome {minutos(time.monotonic() - desde)}")
+
+    async def fase(nombre: str, *tareas):
+        await asyncio.gather(*tareas)
+        log(f"Tiempo: {nombre} a los {minutos(time.monotonic() - inicio)}")
 
     # Las más largas primero: el límite deja esperando a las últimas en un equipo débil.
     await asyncio.gather(
-        automatica("procuraduria", consultar, r["procuraduria"], persona),
-        automatica("simit", consultar_simit, r["simit"], persona, preguntar),
-        grupo_rapido(),
-        automatica("libreta", consultar_libreta, r["libreta"], persona),
-        grupo_documentos(),
+        fase(
+            "consultas automáticas listas",
+            automatica("procuraduria", consultar_procuraduria, r["procuraduria"], persona),
+            automatica("simit", consultar_simit, r["simit"], persona, preguntar),
+            grupo_rapido(),
+            automatica("libreta", consultar_libreta, r["libreta"], persona),
+            eeuu,
+            grupo_documentos(),
+        ),
         con_captcha("runt", consultar_runt, preguntar),
         con_captcha("antecedentes", documentos.consultar_antecedentes),
         con_captcha("registraduria", documentos.consultar_registraduria, preguntar),
@@ -1078,7 +1202,7 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
 
 
 async def principal():
-    consola = consola_siempre_visible()
+    consola = ventana_consola()
 
     async def preguntar(mensaje: str) -> str:
         return await asyncio.to_thread(preguntar_en_consola, mensaje, consola)
@@ -1102,6 +1226,7 @@ async def principal():
                 except ValueError as e:
                     log(f"ERROR: {e}")
                     continue
+                inicio = time.monotonic()
                 log(
                     f"Datos: {persona['nombre']} | {persona['tipo']} {persona['numero']} | {persona['empresa']} | "
                     f"consulta {persona['fecha_consulta']:%d/%m/%Y} por {persona['consultor']} | "
@@ -1110,6 +1235,7 @@ async def principal():
                 capturas = await consultar_persona(persona, await apertura, preguntar, preguntar_edge)
                 if capturas:
                     log(f"PDF: {insertar_en_pdf(capturas, persona['numero'], persona['nombre'])}")
+                log(f"Tiempo total: {minutos(time.monotonic() - inicio)}")
         finally:
             apertura.cancel()
             recursos = (await asyncio.gather(apertura, return_exceptions=True))[0]

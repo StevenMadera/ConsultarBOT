@@ -8,15 +8,20 @@ URL_JUSTICIA = (
     "https://www.justice.gov/information-victims-large-cases"
     "?search_api_fulltext={nombre}&sort_by=field_date"
 )
+TITULO_JUSTICIA = "Information for Victims in Large Cases"
 
 
-def consultar_justicia(persona: dict, preguntar=input) -> Path:
-    nombre = " ".join(persona["nombre"].split())
+def url_justicia(persona: dict) -> str:
+    return URL_JUSTICIA.format(nombre=quote(" ".join(persona["nombre"].split())))
+
+
+def consultar_justicia(persona: dict, preguntar=input, ventana=None) -> Path:
     return capturar_navegador(
-        URL_JUSTICIA.format(nombre=quote(nombre)),
-        "Information for Victims in Large Cases",
+        url_justicia(persona),
+        TITULO_JUSTICIA,
         "Justice.gov",
         "justicia",
         persona["numero"],
         preguntar=preguntar,
+        ventana=ventana,
     )

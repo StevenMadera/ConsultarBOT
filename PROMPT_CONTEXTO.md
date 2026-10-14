@@ -12,8 +12,8 @@ Dada una fila de Excel con `nombre, documento, empresa, fecha consulta, quien co
 ## Estructura
 - `main.py`: entrada (`py main.py`). Pide los datos por consola, lanza las consultas en paralelo, arma el PDF.
 - `comun.py`: `CAPTURAS` y `log()` (escribe en consola y en `log.txt`).
-- `captura_navegador.py`: abre una URL en el navegador por defecto del usuario (sin controlarlo), detecta la ventana por título, recorta solo el área de la página (subventana `Chrome_RenderWidgetHostHWND`), espera a que deje de cambiar y captura con `mss`. Pide pasar la verificación de Cloudflare si el título de alguna ventana la indica.
-- `consulta_fbi.py` y `consulta_consilium.py`: envoltorios de `captura_navegador` con su URL y título de ventana.
+- `captura_navegador.py`: abre una URL en el navegador por defecto del usuario (sin controlarlo), detecta la ventana por título, recorta solo el área de la página (subventana `Chrome_RenderWidgetHostHWND`), espera a que deje de cambiar y captura con `mss`. Pide pasar la verificación de Cloudflare si el título de alguna ventana la indica. `abrir_en_ventana` abre la página de antemano en una ventana propia minimizada, para capturarla después ya cargada.
+- `consulta_fbi.py`, `consulta_consilium.py`, `consulta_terroristas.py` y `consulta_justicia.py`: URL y título de cada página y su captura en el navegador del usuario.
 - `Plantilla/`: `Hombre.pdf` (8 páginas) y `consolidatedLegacyByNAME.html` (lista consolidada de la ONU).
 - `capturas/`, `salidas/`, `log.txt`: generados por el bot, no se suben a Git.
 - `requirements.txt`: playwright, pymupdf, mss, pygetwindow. Además hay que ejecutar `py -m playwright install chromium`.
@@ -21,8 +21,8 @@ Dada una fila de Excel con `nombre, documento, empresa, fecha consulta, quien co
 ## Cómo está hecho `main.py`
 - Una clase `Trabajador` (hilo con su propio navegador Playwright, que se abre con la primera tarea y se reutiliza; solo se recarga la página antes de cada consulta). Cada página es una función `consultar_*(page, persona) -> Path` y un trabajador en el diccionario `trabajadores`.
 - El captcha del RUNT lo escribe el usuario en la consola (cola `solicitudes_captcha`). No se resuelve automáticamente: es una decisión tomada, no se debe automatizar.
-- La consola se fija encima de las demás ventanas (`consola_siempre_visible`) y toma el foco al pedir el captcha.
-- El FBI y Consilium se ejecutan después de las demás, en el hilo principal, porque pueden pedir la verificación manual.
+- La consola toma el foco al pedir el captcha (`enfocar_consola`). No se fija encima de las demás ventanas: así tapaba y bloqueaba la parte baja de la pantalla.
+- El FBI y Consilium se abren en Chrome al empezar la consulta (ventanas minimizadas que cargan mientras se resuelven los captchas) y se capturan al final, porque necesitan la pantalla y pueden pedir la verificación manual. State.gov y Justice van en el navegador automático; solo si este falla se capturan en Chrome.
 - `UBICACION_PDF` indica dónde va cada captura: `(página 0-based, hueco)`. Huecos: `arriba` (entre los dos cuadros de título), `abajo` (desde el segundo cuadro hasta el pie), `unico` (página con un solo cuadro). Las zonas se calculan leyendo los cuadros grises de la plantilla (`zona_pdf`), nunca con coordenadas fijas.
 - `captura_ajustada` / `ajustar_ventana_a_recuadro`: ensanchan la ventana del navegador hasta que la página completa tenga la proporción del recuadro; si la página es muy larga (ancho > `ANCHO_MAXIMO`), captura solo el inicio.
 - Nombre del PDF: `<numero> - <nombre>.pdf`; si existe, se añade ` (2)`, ` (3)`...
@@ -38,7 +38,7 @@ Dada una fila de Excel con `nombre, documento, empresa, fecha consulta, quien co
 | 6 ONU | `consolidatedLegacyByNAME.html` local | Se busca el número en el documento; se dibuja una barra tipo Ctrl+F con el conteo real y se resaltan coincidencias | pág. 4, abajo |
 | 7 GOV.UK | gov.uk | Rechaza cookies, busca el nombre | pág. 5, arriba |
 | 8 FBI | fbi.gov/wanted/fugitives?SearchableText=<nombre> | Navegador del usuario + captura de pantalla (Cloudflare bloquea la automatización; no se debe evadir) | pág. 5, abajo |
-| 9 Dpto. de Justicia | justice.gov | Playwright headless; busca el nombre | pág. 6, arriba |
+| 9 Dpto. de Justicia | justice.gov | Playwright headless (si falla, navegador del usuario); busca el nombre | pág. 6, arriba |
 | 12 EUMOSTWANTED | eumostwanted.eu | Playwright; rechaza cookies y busca el nombre | pág. 7, abajo |
 | 13 Lista UE terroristas | consilium.europa.eu/es/search/?query=<nombre> | Igual que el FBI (Cloudflare) | pág. 8, único |
 
