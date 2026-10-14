@@ -44,7 +44,11 @@ VIEWPORT = {"width": 1366, "height": 768}
 # y podría quedar cortado dentro del marco. Se mantiene el ancho con el que se verificó.
 VIEWPORT_PROCURADURIA = {"width": 1920, "height": 1080}
 SALIDAS = Path(__file__).parent / "salidas"
-PLANTILLA = Path(__file__).parent / "Plantilla" / "Hombre.pdf"
+PLANTILLAS = {
+    "Hombre": Path(__file__).parent / "Plantilla" / "Hombre.pdf",
+    # Igual a la de hombre, sin la página de la libreta militar.
+    "Mujer": Path(__file__).parent / "Plantilla" / "Mujer.pdf",
+}
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -98,12 +102,13 @@ def sin_tildes(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
 
 
-CAMPOS = ("nombre", "documento", "empresa", "fecha consulta", "quien consulta", "fecha expedicion")
+CAMPOS = ("nombre", "documento", "empresa", "fecha consulta", "quien consulta", "fecha expedicion", "sexo")
 FORMATO = (
-    "Copia la fila de Excel con: nombre, documento, empresa, fecha consulta, quien consulta, fecha expedicion "
-    "(ej. Santiago Flores Alonso | 1000858557 | FALABELLA CEDI | 16/09/2026 | STEVEN | 25/06/2020). "
-    "A mano, separa los datos con ;"
+    "Copia la fila de Excel con: nombre, documento, empresa, fecha consulta, quien consulta, fecha expedicion, sexo "
+    "(ej. Santiago Flores Alonso | 1000858557 | FALABELLA CEDI | 16/09/2026 | STEVEN | 25/06/2020 | H). "
+    "Sexo: H (hombre) o M (mujer). A mano, separa los datos con ;"
 )
+SEXOS = {"H": "Hombre", "HOMBRE": "Hombre", "M": "Mujer", "MUJER": "Mujer"}
 
 
 def leer_fecha(texto: str, campo: str) -> date:
@@ -129,9 +134,11 @@ def parsear(linea: str) -> dict:
     for campo, valor in zip(CAMPOS, campos):
         if not valor:
             raise ValueError(f"Falta el dato '{campo}'. {FORMATO}")
-    nombre, documento, empresa, fecha_consulta, consultor, fecha_expedicion = campos
+    nombre, documento, empresa, fecha_consulta, consultor, fecha_expedicion, sexo = campos
     if re.search(r"\d", nombre):
         raise ValueError(f"El nombre no puede tener números: {nombre!r}. {FORMATO}")
+    if sexo.upper() not in SEXOS:
+        raise ValueError(f"Sexo no válido: {sexo!r}; usa H (hombre) o M (mujer). {FORMATO}")
     # Si no se indica el tipo de documento, es cédula de ciudadanía.
     m = re.fullmatch(r"(?:([A-Za-z.]+)\s*)?([\d.,\s]+)", documento)
     tipo = (m[1] or "CC").replace(".", "").upper() if m else ""
@@ -146,6 +153,7 @@ def parsear(linea: str) -> dict:
         "fecha_consulta": leer_fecha(fecha_consulta, "fecha de consulta"),
         "consultor": consultor,
         "fecha_expedicion": leer_fecha(fecha_expedicion, "fecha de expedición"),
+        "sexo": SEXOS[sexo.upper()],
     }
 
 
@@ -184,19 +192,36 @@ def resolver_pregunta(texto: str, numero: str, nombre: str) -> str:
 # Página de la plantilla (0-based) y hueco: "arriba" = entre los dos cuadros de título, "abajo" = desde el segundo hasta el pie,
 # "unico" = desde el único cuadro de la página hasta el pie.
 UBICACION_PDF = {
-    "procuraduria": (1, "arriba"),
-    "runt": (1, "abajo"),
-    "simit": (2, "arriba"),
-    "libreta": (2, "abajo"),
-    "ofac": (3, "arriba"),
-    "govuk": (4, "arriba"),
-    "fbi": (4, "abajo"),
-    "justicia": (5, "arriba"),
-    "terroristas": (5, "abajo"),
-    "consolium": (6, "arriba"),
-    "eumostwanted": (6, "abajo"),
-    "consilium": (7, "unico"),
-    "consolidado": (3, "abajo"),
+    "Hombre": {
+        "procuraduria": (1, "arriba"),
+        "runt": (1, "abajo"),
+        "simit": (2, "arriba"),
+        "libreta": (2, "abajo"),
+        "ofac": (3, "arriba"),
+        "govuk": (4, "arriba"),
+        "fbi": (4, "abajo"),
+        "justicia": (5, "arriba"),
+        "terroristas": (5, "abajo"),
+        "consolium": (6, "arriba"),
+        "eumostwanted": (6, "abajo"),
+        "consilium": (7, "unico"),
+        "consolidado": (3, "abajo"),
+    },
+    # Sin la libreta militar, desde OFAC cada sitio sube medio espacio y la Lista UE comparte la última página.
+    "Mujer": {
+        "procuraduria": (1, "arriba"),
+        "runt": (1, "abajo"),
+        "simit": (2, "arriba"),
+        "ofac": (2, "abajo"),
+        "consolidado": (3, "arriba"),
+        "govuk": (3, "abajo"),
+        "fbi": (4, "arriba"),
+        "justicia": (4, "abajo"),
+        "terroristas": (5, "arriba"),
+        "consolium": (5, "abajo"),
+        "eumostwanted": (6, "arriba"),
+        "consilium": (6, "abajo"),
+    },
 }
 
 
@@ -217,10 +242,10 @@ def zona_pdf(pagina, hueco: str) -> pymupdf.Rect:
 
 
 @functools.cache
-def proporcion_zona(clave: str) -> float:
+def proporcion_zona(clave: str, sexo: str) -> float:
     """Alto/ancho del recuadro de la plantilla donde va la captura."""
-    indice, hueco = UBICACION_PDF[clave]
-    with pymupdf.open(PLANTILLA) as doc:
+    indice, hueco = UBICACION_PDF[sexo][clave]
+    with pymupdf.open(PLANTILLAS[sexo]) as doc:
         zona = zona_pdf(doc[indice], hueco)
     return zona.height / zona.width
 
@@ -234,13 +259,36 @@ def pegar_captura(pagina, captura: Path, hueco: str):
     pagina.insert_image(zona, filename=str(captura), keep_proportion=True)
 
 
-def insertar_en_pdf(capturas: dict[str, Path], numero: str, nombre: str) -> Path:
-    doc = pymupdf.open(PLANTILLA)
+def rellenar_portada(pagina, persona: dict):
+    """Cambia las "xxxx" de Nombre, Identificación y Fecha Consulta por los datos, con la letra de la plantilla."""
+    valores = (persona["nombre"], persona["numero"], f"{persona['fecha_consulta']:%d/%m/%Y}")
+    campos = []
+    for bloque in pagina.get_text("rawdict")["blocks"]:
+        for linea in bloque.get("lines", []):
+            for span in linea["spans"]:
+                letras = [c for c in span["chars"] if c["c"].strip()]
+                if letras and all(c["c"] == "x" for c in letras):
+                    campos.append((pymupdf.Rect(letras[0]["bbox"]) | letras[-1]["bbox"], letras[0]["origin"], span))
+    campos.sort(key=lambda campo: campo[0].y0)
+    for rect, _, _ in campos:
+        pagina.add_redact_annot(rect, fill=False)
+    # Solo se borra el texto: los recuadros y las imágenes de la portada se quedan.
+    pagina.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
+    for (_, origen, span), valor in zip(campos, valores):
+        pagina.insert_text(origen, valor, fontname="helv", fontsize=span["size"], color=pymupdf.sRGB_to_pdf(span["color"]))
+
+
+def insertar_en_pdf(capturas: dict[str, Path], persona: dict) -> Path:
+    # Mujer.pdf trae un objeto interno mal ubicado: si la reparación automática llega al guardar, descarta los cambios.
+    with pymupdf.open(PLANTILLAS[persona["sexo"]]) as plantilla:
+        doc = pymupdf.open("pdf", plantilla.tobytes(garbage=3))
+    rellenar_portada(doc[0], persona)
+    ubicaciones = UBICACION_PDF[persona["sexo"]]
     for clave, captura in capturas.items():
-        if clave in UBICACION_PDF:
-            indice, hueco = UBICACION_PDF[clave]
+        if clave in ubicaciones:
+            indice, hueco = ubicaciones[clave]
             pegar_captura(doc[indice], captura, hueco)
-    # Páginas 14 a 19: los PDF de cada sitio van al final, en el orden de la portada.
+    # Los PDF de cada sitio van al final, en el orden de la portada (páginas 14 a 19; 13 a 18 en la de mujer).
     for clave in documentos.ORDEN:
         if clave in capturas:
             with pymupdf.open(capturas[clave]) as anexo:
@@ -248,7 +296,7 @@ def insertar_en_pdf(capturas: dict[str, Path], numero: str, nombre: str) -> Path
         else:
             log(f"PDF: falta el documento de {clave}; se omite.")
     SALIDAS.mkdir(exist_ok=True)
-    base = re.sub(r'[<>:"/\\|?*]', "", f"{numero} - {nombre}").strip()
+    base = re.sub(r'[<>:"/\\|?*]', "", f"{persona['numero']} - {persona['nombre']}").strip()
     ruta = SALIDAS / f"{base}.pdf"
     contador = 2
     while ruta.exists():
@@ -537,12 +585,12 @@ async def captura_sin_pie(page, ruta: Path):
     await page.screenshot(path=str(ruta), full_page=True, clip=recorte)
 
 
-async def ajustar_ventana_a_recuadro(page, clave: str) -> bool:
+async def ajustar_ventana_a_recuadro(page, clave: str, sexo: str) -> bool:
     """Ensancha la ventana hasta que la página completa tenga la proporción del recuadro del PDF.
 
     Devuelve False si la página es demasiado larga: entonces la ventana queda con esa proporción y solo se ve el inicio.
     """
-    prop = proporcion_zona(clave)
+    prop = proporcion_zona(clave, sexo)
     await page.set_viewport_size({"width": page.viewport_size["width"], "height": 600})
     for _ in range(3):
         alto = await page.evaluate("document.documentElement.scrollHeight")
@@ -558,8 +606,8 @@ async def ajustar_ventana_a_recuadro(page, clave: str) -> bool:
     return True
 
 
-async def captura_ajustada(page, ruta: Path, clave: str, espera: int = 1000):
-    completa = await ajustar_ventana_a_recuadro(page, clave)
+async def captura_ajustada(page, ruta: Path, clave: str, sexo: str, espera: int = 1000):
+    completa = await ajustar_ventana_a_recuadro(page, clave, sexo)
     await page.wait_for_timeout(espera)
     await page.screenshot(path=str(ruta), full_page=completa)
 
@@ -579,7 +627,7 @@ async def consultar_govuk(page, persona: dict) -> Path:
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"govuk_{re.sub(r'\D', '', persona['numero'])}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    await captura_ajustada(page, ruta, "govuk")
+    await captura_ajustada(page, ruta, "govuk", persona["sexo"])
     return ruta
 
 
@@ -601,7 +649,7 @@ async def consultar_eumostwanted(page, persona: dict) -> Path:
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"eumostwanted_{re.sub(r'\D', '', persona['numero'])}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    await captura_ajustada(page, ruta, "eumostwanted")
+    await captura_ajustada(page, ruta, "eumostwanted", persona["sexo"])
     return ruta
 
 
@@ -625,7 +673,7 @@ async def capturar_sin_ventana(page, persona: dict, clave: str, url: str, titulo
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"{clave}_{re.sub(r'\D', '', persona['numero'])}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    await captura_ajustada(page, ruta, clave)
+    await captura_ajustada(page, ruta, clave, persona["sexo"])
     return ruta
 
 
@@ -671,13 +719,13 @@ BUSCAR_EN_DOCUMENTO_JS = """q => {
 
 
 async def cargar_consolidado(page):
-    await page.set_viewport_size({"width": 1600, "height": round(1600 * proporcion_zona("consolidado"))})
+    await page.set_viewport_size({"width": 1600, "height": round(1600 * proporcion_zona("consolidado", "Hombre"))})
     await page.goto(ARCHIVO_CONSOLIDADO.as_uri(), wait_until="load")
 
 
 async def cargar_eurlex(page):
     """Diario Oficial L 25/2022, donde se busca el número como con Ctrl+F."""
-    await page.set_viewport_size({"width": 1600, "height": round(1600 * proporcion_zona("consolium"))})
+    await page.set_viewport_size({"width": 1600, "height": round(1600 * proporcion_zona("consolium", "Hombre"))})
     await page.goto(URL_EURLEX, wait_until="domcontentloaded", timeout=60000)
     # La primera respuesta (HTTP 202) es una página intermedia que recarga sola el documento.
     await page.get_by_text("Diario Oficial").first.wait_for(timeout=60000)
@@ -700,6 +748,9 @@ class Documento:
             self.carga = asyncio.create_task(self.cargar(self.page))
             await self.carga
         numero = re.sub(r"\D", "", persona["numero"])
+        # El recuadro cambia de alto según la plantilla; el ancho se mantiene para no reacomodar el documento.
+        alto = round(1600 * proporcion_zona(self.clave, persona["sexo"]))
+        await self.page.set_viewport_size({"width": 1600, "height": alto})
         coincidencias = await self.page.evaluate(BUSCAR_EN_DOCUMENTO_JS, numero)
         log(f"{self.nombre}: {coincidencias} coincidencias para {numero}")
         await self.page.wait_for_timeout(500)
@@ -722,7 +773,7 @@ async def consultar_ofac(page, persona: dict) -> Path:
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"ofac_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    await captura_ajustada(page, ruta, "ofac")
+    await captura_ajustada(page, ruta, "ofac", persona["sexo"])
     return ruta
 
 
@@ -746,7 +797,7 @@ async def consultar_libreta(page, persona: dict) -> Path:
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"libreta_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    await captura_ajustada(page, ruta, "libreta", espera=3000)
+    await captura_ajustada(page, ruta, "libreta", persona["sexo"], espera=3000)
     return ruta
 
 
@@ -1188,7 +1239,8 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
             automatica("procuraduria", consultar_procuraduria, r["procuraduria"], persona),
             automatica("simit", consultar_simit, r["simit"], persona, preguntar),
             grupo_rapido(),
-            automatica("libreta", consultar_libreta, r["libreta"], persona),
+            # La plantilla de mujer no tiene la página de la libreta militar: no se consulta.
+            *([automatica("libreta", consultar_libreta, r["libreta"], persona)] if persona["sexo"] == "Hombre" else []),
             eeuu,
             grupo_documentos(),
         ),
@@ -1217,7 +1269,7 @@ async def principal():
                 linea = await asyncio.to_thread(
                     leer_respuesta,
                     "\nPega la fila de Excel (nombre, documento, empresa, fecha consulta, quien consulta, "
-                    "fecha expedicion) o Enter para salir: ",
+                    "fecha expedicion, sexo H/M) o Enter para salir: ",
                 )
                 if not linea.strip():
                     break
@@ -1230,11 +1282,12 @@ async def principal():
                 log(
                     f"Datos: {persona['nombre']} | {persona['tipo']} {persona['numero']} | {persona['empresa']} | "
                     f"consulta {persona['fecha_consulta']:%d/%m/%Y} por {persona['consultor']} | "
-                    f"expedición {persona['fecha_expedicion']:%d/%m/%Y} | apellido RUNT: {primer_apellido(persona['nombre'])}"
+                    f"expedición {persona['fecha_expedicion']:%d/%m/%Y} | {persona['sexo']} | "
+                    f"apellido RUNT: {primer_apellido(persona['nombre'])}"
                 )
                 capturas = await consultar_persona(persona, await apertura, preguntar, preguntar_edge)
                 if capturas:
-                    log(f"PDF: {insertar_en_pdf(capturas, persona['numero'], persona['nombre'])}")
+                    log(f"PDF: {insertar_en_pdf(capturas, persona)}")
                 log(f"Tiempo total: {minutos(time.monotonic() - inicio)}")
         finally:
             apertura.cancel()

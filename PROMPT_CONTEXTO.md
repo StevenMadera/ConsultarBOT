@@ -7,14 +7,14 @@ Copia todo lo que sigue y pégalo como primer mensaje del nuevo chat.
 Estás continuando un proyecto llamado **ConsultarBot** (Python, Windows). Responde siempre en español, de forma breve e impersonal. No crees archivos de documentación salvo que te lo pida. Antes de editar, lee el archivo. Verifica tus cambios con una prueba real y borra después los scripts de prueba.
 
 ## Objetivo
-Dada una fila de Excel con `nombre, documento, empresa, fecha consulta, quien consulta, fecha expedicion` (ej. `Santiago Flores Alonso | 1000858557 | FALABELLA CEDI | 16/09/2026 | STEVEN | 25/06/2020`; sin tipo de documento es CC), el bot consulta la persona en varias páginas públicas, toma una captura de cada resultado y las pega en una plantilla PDF (`Plantilla/Hombre.pdf`), generando `salidas/<numero> - <nombre>.pdf`. Cada captura debe mostrar tres cosas: el logo de la entidad, los datos de consulta y el resultado. La captura debe llenar el ancho del recuadro del PDF, mantener la proporción y quedar centrada.
+Dada una fila de Excel con `nombre, documento, empresa, fecha consulta, quien consulta, fecha expedicion, sexo` (ej. `Santiago Flores Alonso | 1000858557 | FALABELLA CEDI | 16/09/2026 | STEVEN | 25/06/2020 | H`; sin tipo de documento es CC; sexo `H` o `M`), el bot consulta la persona en varias páginas públicas, toma una captura de cada resultado y las pega en una plantilla PDF (`Plantilla/Hombre.pdf` o `Plantilla/Mujer.pdf` según el sexo), generando `salidas/<numero> - <nombre>.pdf`. En la portada cambia las "xxxx" por nombre, número de documento y fecha de consulta (`rellenar_portada`). Cada captura debe mostrar tres cosas: el logo de la entidad, los datos de consulta y el resultado. La captura debe llenar el ancho del recuadro del PDF, mantener la proporción y quedar centrada.
 
 ## Estructura
 - `main.py`: entrada (`py main.py`). Pide los datos por consola, lanza las consultas en paralelo, arma el PDF.
 - `comun.py`: `CAPTURAS` y `log()` (escribe en consola y en `log.txt`).
 - `captura_navegador.py`: abre una URL en el navegador por defecto del usuario (sin controlarlo), detecta la ventana por título, recorta solo el área de la página (subventana `Chrome_RenderWidgetHostHWND`), espera a que deje de cambiar y captura con `mss`. Pide pasar la verificación de Cloudflare si el título de alguna ventana la indica. `abrir_en_ventana` abre la página de antemano en una ventana propia minimizada, para capturarla después ya cargada.
 - `consulta_fbi.py`, `consulta_consilium.py`, `consulta_terroristas.py` y `consulta_justicia.py`: URL y título de cada página y su captura en el navegador del usuario.
-- `Plantilla/`: `Hombre.pdf` (8 páginas) y `consolidatedLegacyByNAME.html` (lista consolidada de la ONU).
+- `Plantilla/`: `Hombre.pdf` (8 páginas), `Mujer.pdf` (7 páginas: sin la libreta militar, desde OFAC cada sitio sube medio espacio) y `consolidatedLegacyByNAME.html` (lista consolidada de la ONU). `Mujer.pdf` trae un objeto interno dañado: se trabaja sobre una copia reparada en memoria, o al guardar se pierden los cambios.
 - `capturas/`, `salidas/`, `log.txt`: generados por el bot, no se suben a Git.
 - `requirements.txt`: playwright, pymupdf, mss, pygetwindow. Además hay que ejecutar `py -m playwright install chromium`.
 
@@ -23,12 +23,12 @@ Dada una fila de Excel con `nombre, documento, empresa, fecha consulta, quien co
 - El captcha del RUNT lo escribe el usuario en la consola (cola `solicitudes_captcha`). No se resuelve automáticamente: es una decisión tomada, no se debe automatizar.
 - La consola toma el foco al pedir el captcha (`enfocar_consola`). No se fija encima de las demás ventanas: así tapaba y bloqueaba la parte baja de la pantalla.
 - El FBI y Consilium se abren en Chrome al empezar la consulta (ventanas minimizadas que cargan mientras se resuelven los captchas) y se capturan al final, porque necesitan la pantalla y pueden pedir la verificación manual. State.gov y Justice van en el navegador automático; solo si este falla se capturan en Chrome.
-- `UBICACION_PDF` indica dónde va cada captura: `(página 0-based, hueco)`. Huecos: `arriba` (entre los dos cuadros de título), `abajo` (desde el segundo cuadro hasta el pie), `unico` (página con un solo cuadro). Las zonas se calculan leyendo los cuadros grises de la plantilla (`zona_pdf`), nunca con coordenadas fijas.
+- `UBICACION_PDF[sexo]` indica dónde va cada captura en cada plantilla: `(página 0-based, hueco)`. Huecos: `arriba` (entre los dos cuadros de título), `abajo` (desde el segundo cuadro hasta el pie), `unico` (página con un solo cuadro). Las zonas se calculan leyendo los cuadros grises de la plantilla (`zona_pdf`), nunca con coordenadas fijas; las capturas se toman con la proporción del recuadro de la plantilla de la persona (`proporcion_zona(clave, sexo)`).
 - `captura_ajustada` / `ajustar_ventana_a_recuadro`: ensanchan la ventana del navegador hasta que la página completa tenga la proporción del recuadro; si la página es muy larga (ancho > `ANCHO_MAXIMO`), captura solo el inicio.
 - Nombre del PDF: `<numero> - <nombre>.pdf`; si existe, se añade ` (2)`, ` (3)`...
 
 ## Páginas implementadas y su ubicación en el PDF
-| Página de plantilla | Sitio | Método | Ubicación |
+| Página de plantilla | Sitio | Método | Ubicación (plantilla de hombre) |
 |---|---|---|---|
 | 1 Procuraduría | procuraduria.gov.co (formulario en iframe) | Playwright headless con user agent de Chrome; responde la pregunta de verificación (aritmética, letras/dígitos del documento o nombre, capitales de departamentos) | pág. 2, arriba |
 | 2 RUNT | portalpublico.runt.gov.co | Playwright visible y maximizado; el usuario escribe el captcha; 3 reintentos; usa primer apellido (heurística) | pág. 2, abajo |
@@ -42,7 +42,7 @@ Dada una fila de Excel con `nombre, documento, empresa, fecha consulta, quien co
 | 12 EUMOSTWANTED | eumostwanted.eu | Playwright; rechaza cookies y busca el nombre | pág. 7, abajo |
 | 13 Lista UE terroristas | consilium.europa.eu/es/search/?query=<nombre> | Igual que el FBI (Cloudflare) | pág. 8, único |
 
-Pendientes que el usuario pidió saltar por ahora (su espacio ya existe en la plantilla): **Página 10** (TERRORIST DESIGNATIONS AND STATE SPONSORS OF TERRORISM, pág. 6 abajo) y **Página 11** (CONSOLIUM EUROPA, pág. 7 arriba). La página 1 de la plantilla lista además las páginas 14 a 19 (Boletín de deudores morosos, Contraloría, Registraduría, Sistema Registro Nacional, Inhabilidades Policía), que aún no existen en el PDF de 8 páginas. Los campos de la portada (nombre, identificación, fecha de consulta) siguen con "xxxx" sin rellenar.
+También están la página 10 (TERRORIST DESIGNATIONS, State.gov), la 11 (CONSOLIUM EUROPA: búsqueda del número en el Diario Oficial L 25/2022 de EUR-Lex) y, al final, los PDF de las páginas 14 a 19 (`documentos.py`: Boletín de deudores morosos, Contraloría, Antecedentes, Registraduría, RNMC, Inhabilidades). En la plantilla de mujer la numeración baja uno desde OFAC (página 4) y los PDF son las páginas 13 a 18.
 
 ## Decisiones y hallazgos importantes
 - **No saltarse controles anti-bot.** Cloudflare (FBI, Consilium) y el captcha del RUNT los pasa una persona. Con Playwright el FBI devuelve 403 "Just a moment..." y la verificación entra en bucle.

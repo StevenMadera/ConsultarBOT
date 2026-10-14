@@ -19,7 +19,7 @@ py -m playwright install chromium
 ```
 py main.py
 ```
-1. Pega la fila de Excel con: nombre, documento, empresa, fecha consulta, quien consulta, fecha expedicion (ej. `Santiago Flores Alonso | 1000858557 | FALABELLA CEDI | 16/09/2026 | STEVEN | 25/06/2020`). Si el documento no indica tipo, es CC; tipos: CC, CE, PEP, PPT, NIT, TI (ej. `CE 123456`). A mano, separa los datos con `;` o `,`.
+1. Pega la fila de Excel con: nombre, documento, empresa, fecha consulta, quien consulta, fecha expedicion, sexo (ej. `Santiago Flores Alonso | 1000858557 | FALABELLA CEDI | 16/09/2026 | STEVEN | 25/06/2020 | H`). Sexo: `H` (hombre) o `M` (mujer); a las mujeres no se les consulta la libreta militar y su informe usa `Plantilla/Mujer.pdf`. Si el documento no indica tipo, es CC; tipos: CC, CE, PEP, PPT, NIT, TI (ej. `CE 123456`). A mano, separa los datos con `;` o `,`.
 2. Resuelve los captchas cuando la ventana de cada sitio quede al frente, uno tras otro:
    - RUNT y Registraduría: escribe en la consola el código que ves en la ventana.
    - Antecedentes e Inhabilidades (Policía): marca "No soy un robot" en la ventana; el bot sigue solo.
