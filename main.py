@@ -382,7 +382,20 @@ async def consultar_runt(page, persona: dict, preguntar, turno: asyncio.Lock, li
 
     async def llenar():
         nonlocal lleno_en
-        await page.goto(URL_RUNT, wait_until="domcontentloaded")
+        for carga in range(2):
+            # Ya en el RUNT, goto solo cambia el hash y no recarga: quedarían el captcha viejo y el aviso anterior encima.
+            ya_abierto = page.url.startswith(URL_RUNT.split("#")[0])
+            await page.goto(URL_RUNT, wait_until="domcontentloaded")
+            if ya_abierto:
+                await page.reload(wait_until="domcontentloaded")
+            try:
+                # Sin caché tarda de 15 s a más de 1 min (unos 25 módulos) y a veces se queda en blanco.
+                await imagen_captcha.wait_for(state="visible", timeout=60000)
+                break
+            except PlaywrightTimeoutError:
+                if carga:
+                    raise ValueError("RUNT: la página no cargó tras recargarla; el sitio está lento o caído.") from None
+                log("RUNT: la página no cargó en 60 s; se recarga.")
         await page.locator("mat-select[formcontrolname=tipoDocumento]").click()
         await page.get_by_role("option", name=TIPOS_RUNT[persona["tipo"].upper()], exact=True).click()
         await page.locator("input[formcontrolname=documento]").fill(numero)
