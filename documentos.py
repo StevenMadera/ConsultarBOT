@@ -4,7 +4,7 @@ import base64
 import contextlib
 import re
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import pymupdf
@@ -95,6 +95,17 @@ def tipo_para(tabla: dict, persona: dict, sitio: str) -> str:
     return tabla[persona["tipo"]]
 
 
+def fecha_informe(persona: dict) -> str:
+    """La fecha de consulta (dd-mm-aaaa) que lleva el informe: `persona["fecha_consulta"]` si existe, ya sea una
+    fecha o un texto; si no, la de hoy."""
+    valor = persona.get("fecha_consulta")
+    if not valor:
+        return f"{datetime.now():%d/%m/%Y}"
+    if isinstance(valor, (date, datetime)):
+        return f"{valor:%d/%m/%Y}"
+    return str(valor).replace("-", "/")
+
+
 def ruta_documento(clave: str, persona: dict) -> Path:
     CAPTURAS.mkdir(exist_ok=True)
     return CAPTURAS / f"{clave}_{persona['numero']}_{datetime.now():%Y%m%d_%H%M%S}.pdf"
@@ -159,7 +170,15 @@ REDUCIR_RECORTADOS_JS = """() => {
             e.style.zoom = Math.floor(e.clientWidth / e.scrollWidth * 100) / 100;
     }
 }"""
-
+# Antecedentes, RNMC e Inhabilidades escriben las fechas como dd/mm/aaaa: cada una se sustituye por la fecha de
+# consulta del informe (dd-mm-aaaa), que llega como argumento.
+FECHA_CONSULTA_JS = r"""(fechaConsulta) => {
+    const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    for (let n; (n = w.nextNode());) {
+        const nuevo = n.nodeValue.replace(/\b\d{2}\/\d{2}\/\d{4}\b/g, fechaConsulta);
+        if (nuevo !== n.nodeValue) n.nodeValue = nuevo;
+    }
+}"""
 
 async def pagina_a_pdf(page, ruta: Path) -> Path:
     if page.viewport_size:
@@ -187,8 +206,10 @@ async def reducir_recortados(cdp, page):
         await cdp.send("Emulation.setEmulatedMedia", {"media": ""})
 
 
-async def imprimir_pdf(page, ruta: Path, fondos: bool = False) -> Path:
-    """Lo mismo que Imprimir > Guardar como PDF en Chrome: hoja A4 como la plantilla, con las hojas que necesite."""
+async def imprimir_pdf(page, ruta: Path, fecha_consulta: str, fondos: bool = False) -> Path:
+    """Lo mismo que Imprimir > Guardar como PDF en Chrome: hoja A4 como la plantilla, con las hojas que necesite.
+    Toda fecha dd/mm/aaaa de la página queda como `fecha_consulta`."""
+    await page.evaluate(FECHA_CONSULTA_JS, fecha_consulta)
     cdp = await page.context.new_cdp_session(page)
     try:
         await reducir_recortados(cdp, page)
@@ -296,7 +317,7 @@ async def consultar_rnmc(page, persona: dict) -> Path:
         mensaje = await page.locator(".modal.in .modal-body, .modal.show .modal-body").first.inner_text()
         raise ValueError(f"RNMC: {' '.join(mensaje.split())}")
     # El botón Imprimir del sitio solo abre la impresión del navegador: se imprime la página igual, con sus franjas azules.
-    return await imprimir_pdf(page, ruta_documento("rnmc", persona), fondos=True)
+    return await imprimir_pdf(page, ruta_documento("rnmc", persona), fecha_informe(persona), fondos=True)
 
 
 async def consultar_antecedentes(page, persona: dict, turno, listo) -> Path:
@@ -349,7 +370,7 @@ async def consultar_antecedentes(page, persona: dict, turno, listo) -> Path:
         else:
             raise ValueError("Antecedentes (Policía): no se obtuvo el resultado tras 3 intentos.")
     listo.set()
-    return await imprimir_pdf(page, ruta_documento("antecedentes", persona))
+    return await imprimir_pdf(page, ruta_documento("antecedentes", persona), fecha_informe(persona))
 
 
 async def consultar_registraduria(page, persona: dict, preguntar, turno, listo) -> Path:
@@ -464,4 +485,4 @@ async def consultar_inhabilidades(page, persona: dict, turno, listo) -> Path:
     # Al cargar, el sitio tapa la página casi un segundo con su animación de carga (fondo blanco y un círculo).
     await page.add_style_tag(content="#pb_loader { display: none !important; }")
     # La página entera con gráficos de fondo, como al guardarla desde Chrome: el pie lleva su línea azul y los logos.
-    return await imprimir_pdf(page, ruta_documento("inhabilidades", persona), fondos=True)
+    return await imprimir_pdf(page, ruta_documento("inhabilidades", persona), fecha_informe(persona), fondos=True)

@@ -5,7 +5,7 @@ import re
 import sys
 import time
 import unicodedata
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from difflib import get_close_matches
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -96,6 +96,16 @@ CAPITALES = {
     "tolima": "ibague", "valle del cauca": "cali", "valle": "cali",
     "vaupes": "mitu", "vichada": "puerto carreno", "colombia": "bogota",
 }
+
+DIAS = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
+MESES = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre",
+         "noviembre", "diciembre")
+# Cada palabra de la frase es un grupo, así se puede cambiar una por una aunque la frase quede partida en dos renglones.
+# Contraloría: "hoy miércoles 14 de octubre de 2026" (el año es opcional).
+HOY_RE = re.compile(r"\b(hoy)\s+(\S+)\s+(\d{1,2})\s+(de)\s+([^\W\d_]+)(?:\s+(de)\s+(\d{4}))?", re.IGNORECASE)
+# Registraduría: "Expedida el 15 de octubre de 2026" y "hasta el 14 de Noviembre de 2026".
+EXPEDIDA_RE = re.compile(r"\b(expedida)\s+(el)\s+(\d{1,2})\s+(de)\s+([^\W\d_]+)\s+(de)\s+(\d{4})", re.IGNORECASE)
+VALIDEZ_RE = re.compile(r"\b(hasta)\s+(el)\s+(\d{1,2})\s+(de)\s+([^\W\d_]+)\s+(de)\s+(\d{4})", re.IGNORECASE)
 
 
 def sin_tildes(s: str) -> str:
@@ -278,6 +288,125 @@ def rellenar_portada(pagina, persona: dict):
         pagina.insert_text(origen, valor, fontname="helv", fontsize=span["size"], color=pymupdf.sRGB_to_pdf(span["color"]))
 
 
+def fuente_de(span) -> str:
+    """Fuente base de PyMuPDF más parecida a la del documento (Times o Helvetica, normal o negrita)."""
+    nombre = span["font"].lower()
+    negrita = bool(span["flags"] & 16) or "bold" in nombre
+    if "times" in nombre:
+        return "tibo" if negrita else "tiro"
+    return "hebo" if negrita else "helv"
+
+
+def igualar_mayusculas(original: str, nuevo: str) -> str:
+    """El texto nuevo conserva la forma del original: MAYÚSCULAS, Capitalizado o minúsculas."""
+    if len(original) > 1 and original.isupper():
+        return nuevo.upper()
+    if original[:1].isupper():
+        return nuevo[:1].upper() + nuevo[1:]
+    return nuevo
+
+
+def reescribir_frases(pagina, patron, cambiar) -> int:
+    """Busca `patron` en la página y cambia las palabras que indique `cambiar(hallado)` ({grupo: texto nuevo}).
+
+    En cada renglón se reescribe desde la primera palabra cambiada hasta el final del renglón, con la letra original
+    y terminando donde terminaba. Lo anterior a esa palabra no se toca. Devuelve cuántas frases cambió."""
+    cambios, frases = [], 0
+    for bloque in pagina.get_text("rawdict")["blocks"]:
+        # Todas las letras del párrafo seguidas; entre renglones se intercala un espacio.
+        letras = []
+        for n, linea in enumerate(bloque.get("lines", [])):
+            if letras:
+                letras.append((None, n, None))
+            letras += [(c, n, span) for span in linea["spans"] for c in span["chars"]]
+        texto = "".join(c["c"] if c else " " for c, _, _ in letras)
+        for hallado in patron.finditer(texto):
+            nuevos = cambiar(hallado)
+            frases += 1
+            # Cada palabra de la frase, en el renglón donde está.
+            por_renglon = {}
+            for i in range(1, patron.groups + 1):
+                if hallado.group(i) is not None:
+                    por_renglon.setdefault(letras[hallado.start(i)][1], []).append(i)
+            for n, grupos in por_renglon.items():
+                cambiados = [i for i in grupos if i in nuevos]
+                if not cambiados:
+                    continue
+                grupos = grupos[grupos.index(cambiados[0]):]
+                inicio, fin = hallado.start(grupos[0]), hallado.end(grupos[-1])
+                palabras = [(igualar_mayusculas(hallado.group(i), nuevos[i]) if i in nuevos else hallado.group(i),
+                             letras[hallado.start(i)][2]) for i in grupos]
+                # Las palabras que siguen a la frase en el mismo renglón.
+                resto, actual = [], None
+                for c, ln, span in letras[fin:]:
+                    if ln != n:
+                        break
+                    if c["c"].isspace():
+                        actual = None
+                    elif actual is None:
+                        actual = [c["c"], span]
+                        resto.append(actual)
+                    else:
+                        actual[0] += c["c"]
+                # Una coma o punto pegado a la fecha ("2026,") sigue pegado a la palabra nueva.
+                if resto and fin < len(letras) and letras[fin][1] == n and not letras[fin][0]["c"].isspace():
+                    pegado, span_pegado = palabras.pop()
+                    palabras.append((pegado + resto.pop(0)[0], span_pegado))
+                palabras += [(t, s) for t, s in resto]
+                segmento = [c for c, ln, _ in letras[inicio:] if c and ln == n]
+                rect = pymupdf.Rect(segmento[0]["bbox"])
+                for c in segmento:
+                    rect |= pymupdf.Rect(c["bbox"])
+                cambios.append((rect, segmento[0]["origin"], palabras))
+    if not cambios:
+        return 0
+    for rect, _, _ in cambios:
+        pagina.add_redact_annot(rect, fill=False)
+    # Solo se borra el texto: los recuadros y las imágenes se quedan.
+    pagina.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
+    for rect, origen, palabras in cambios:
+        medidas = []
+        for texto, span in palabras:
+            fuente = fuente_de(span)
+            medidas.append((texto, span, fuente, pymupdf.Font(fuente).text_length(texto, fontsize=span["size"])))
+        espacio = pymupdf.Font(medidas[0][2]).text_length(" ", fontsize=medidas[0][1]["size"])
+        # El espacio sobrante (o faltante) se reparte entre los huecos, para que el renglón termine donde terminaba.
+        sobrante = rect.x1 - origen[0] - sum(m[3] for m in medidas)
+        hueco = max(espacio * 0.5, sobrante / (len(medidas) - 1)) if len(medidas) > 1 else 0
+        x = origen[0]
+        for texto, span, fuente, ancho in medidas:
+            pagina.insert_text((x, origen[1]), texto, fontname=fuente, fontsize=span["size"],
+                               color=pymupdf.sRGB_to_pdf(span["color"]))
+            x += ancho + hueco
+    return frases
+
+
+def fecha_en_frase(fecha):
+    """Cambia día, mes y año de una frase "el 15 de octubre de 2026" (grupos 3, 5 y 7)."""
+    return lambda hallado: {3: str(fecha.day), 5: MESES[fecha.month - 1], 7: str(fecha.year)}
+
+
+def rellenar_hoy(pagina, persona: dict) -> int:
+    """Contraloría: "hoy miércoles 14 de octubre de 2026" -> fecha de consulta. Devuelve cuántas frases cambió."""
+    fecha = persona["fecha_consulta"]
+
+    def cambiar(hallado):
+        nuevos = {2: DIAS[fecha.weekday()], 3: str(fecha.day), 5: MESES[fecha.month - 1]}
+        if hallado.group(7):
+            nuevos[7] = str(fecha.year)
+        return nuevos
+
+    return reescribir_frases(pagina, HOY_RE, cambiar)
+
+
+def rellenar_registraduria(pagina, persona: dict) -> int:
+    """Registraduría: "Expedida el ..." -> fecha de consulta; "hasta el ..." -> fecha de consulta + 30 días.
+    Devuelve cuántas frases cambió (2 si encontró las dos)."""
+    fecha = persona["fecha_consulta"]
+    return (reescribir_frases(pagina, EXPEDIDA_RE, fecha_en_frase(fecha))
+            + reescribir_frases(pagina, VALIDEZ_RE, fecha_en_frase(fecha + timedelta(days=30))))
+
+
 def insertar_en_pdf(capturas: dict[str, Path], persona: dict) -> Path:
     # Mujer.pdf trae un objeto interno mal ubicado: si la reparación automática llega al guardar, descarta los cambios.
     with pymupdf.open(PLANTILLAS[persona["sexo"]]) as plantilla:
@@ -292,6 +421,12 @@ def insertar_en_pdf(capturas: dict[str, Path], persona: dict) -> Path:
     for clave in documentos.ORDEN:
         if clave in capturas:
             with pymupdf.open(capturas[clave]) as anexo:
+                if clave == "contraloria":
+                    if not sum(rellenar_hoy(pagina, persona) for pagina in anexo):
+                        log("PDF: no se encontró 'hoy <día> <n> de <mes>' en el documento de la Contraloría; esa fecha no se cambió.")
+                elif clave == "registraduria":
+                    if sum(rellenar_registraduria(pagina, persona) for pagina in anexo) < 2:
+                        log("PDF: no se encontraron las dos fechas ('Expedida el…' y 'hasta el…') en el documento de la Registraduría.")
                 doc.insert_pdf(anexo)
         else:
             log(f"PDF: falta el documento de {clave}; se omite.")
