@@ -70,7 +70,7 @@ def _esperar_pagina(titulo: str, nombre: str, preguntar, ventana=None):
         if verificando and not avisado:
             avisado = True
             log(f"{nombre}: verificación de Cloudflare detectada")
-            preguntar("Pasa la verificación en el navegador y pulsa Enter... ")
+            preguntar(f"{nombre}: pasa la verificación en el navegador y pulsa Enter... ")
             fin = time.time() + ESPERA_MAXIMA
         if ventana is None:
             encontrada = _buscar_ventana(titulo)

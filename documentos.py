@@ -11,7 +11,7 @@ import pymupdf
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from comun import CAPTURAS, log
+from comun import CAPTURAS, avisar, log
 
 ORDEN = ("bdme", "contraloria", "antecedentes", "registraduria", "rnmc", "inhabilidades")
 
@@ -242,13 +242,17 @@ async def esperar_recaptcha(page, sitio: str, recuadro) -> bool:
     """True cuando la casilla queda marcada; False si Google la da por caducada."""
     caducada = recuadro.content_frame.locator(".rc-anchor-error-msg-container")
     limite = time.monotonic() + ESPERA_CAPTCHA / 1000
-    while time.monotonic() < limite:
-        if await page.evaluate(RECAPTCHA_RESUELTO_JS):
-            return True
-        if await caducada.is_visible():
-            return False
-        await asyncio.sleep(0.5)
-    raise ValueError(f"{sitio}: no se resolvió el captcha en {ESPERA_CAPTCHA // 60000} minutos.")
+    avisar("accion", titulo=sitio, texto="Marca «No soy un robot» en la ventana del navegador. Sigue solo al marcarla.")
+    try:
+        while time.monotonic() < limite:
+            if await page.evaluate(RECAPTCHA_RESUELTO_JS):
+                return True
+            if await caducada.is_visible():
+                return False
+            await asyncio.sleep(0.5)
+        raise ValueError(f"{sitio}: no se resolvió el captcha en {ESPERA_CAPTCHA // 60000} minutos.")
+    finally:
+        avisar("accion_fin")
 
 
 async def esperar_cambio(page, texto_antes: str, espera: int = 60000):
@@ -399,7 +403,12 @@ async def consultar_registraduria(page, persona: dict, preguntar, turno, listo) 
             await al_frente(page)
             # La imagen del código queda al centro, por encima de la consola.
             await imagen.evaluate("e => e.scrollIntoView({block: 'center'})")
-            respuesta = await preguntar("Código de la Registraduría: míralo en su ventana y escríbelo AQUÍ en la consola: ")
+            try:
+                png = await imagen.screenshot(timeout=5000)
+            except PlaywrightError:
+                png = None
+            respuesta = await preguntar("Código de la Registraduría: míralo en su ventana y escríbelo AQUÍ en la consola: ",
+                                        titulo="Código de la Registraduría", imagen=png, intento=intento + 1)
             if not await codigo.count():
                 log("Registraduría: la página cambió mientras se escribía el código; se carga de nuevo.")
                 continue

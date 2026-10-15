@@ -16,7 +16,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 from captura_navegador import PANTALLA, abrir_en_ventana
-from comun import CAPTURAS, leer_respuesta, log
+from comun import CAPTURAS, avisar, leer_respuesta, log
 import documentos
 from documentos import estado_ventana
 from consulta_consilium import consultar_consilium, url_consilium
@@ -130,7 +130,7 @@ def leer_fecha(texto: str, campo: str) -> date:
     raise ValueError(f"{campo.capitalize()} no válida: {texto!r}. Usa dd/mm/aaaa.")
 
 
-def parsear(linea: str) -> dict:
+def partir_fila(linea: str) -> list[str]:
     """Fila copiada de Excel (separada por tabulaciones) o escrita a mano con ; o , entre los datos."""
     separador = "\t" if "\t" in linea else ";" if ";" in linea else ","
     campos = [" ".join(campo.split()) for campo in linea.split(separador)]
@@ -139,6 +139,15 @@ def parsear(linea: str) -> dict:
         campos.pop(0)
     while campos and not campos[-1]:
         campos.pop()
+    return campos
+
+
+def parsear(linea: str) -> dict:
+    return validar(partir_fila(linea))
+
+
+def validar(campos: list[str]) -> dict:
+    """Los datos de la persona a partir de los campos, en el orden de CAMPOS."""
     if len(campos) != len(CAMPOS):
         raise ValueError(f"Llegaron {len(campos)} datos y se esperan {len(CAMPOS)}. {FORMATO}")
     for campo, valor in zip(CAMPOS, campos):
@@ -547,8 +556,13 @@ async def consultar_runt(page, persona: dict, preguntar, turno: asyncio.Lock, li
             await estado_ventana(page, "maximized")
             await imagen_captcha.scroll_into_view_if_needed()
             await page.bring_to_front()
+            try:
+                imagen = await imagen_captcha.screenshot(timeout=5000)
+            except PlaywrightError:
+                imagen = None
 
-            respuesta = await preguntar("Captcha del RUNT: míralo en su ventana y escríbelo AQUÍ en la consola: ")
+            respuesta = await preguntar("Captcha del RUNT: míralo en su ventana y escríbelo AQUÍ en la consola: ",
+                                        titulo="Captcha del RUNT", imagen=imagen, intento=intento + 1)
             if not await campo_captcha.count():
                 log("RUNT: la página cambió mientras se escribía el captcha; se carga de nuevo.")
                 continue
@@ -647,7 +661,8 @@ async def seleccionar_persona_simit(page, persona: dict, pedir_seleccion):
             raise ValueError(f"SIMIT requiere elegir una coincidencia:\n{opciones}")
         valor = await pedir_seleccion(
             "SIMIT encontró varias personas. Elige la que corresponde al nombre consultado:\n"
-            f"{opciones}\nNúmero de opción: "
+            f"{opciones}\nNúmero de opción: ",
+            titulo="SIMIT encontró varias personas", opciones=etiquetas,
         )
         try:
             seleccion = int(valor) - 1
@@ -1252,11 +1267,14 @@ def consultas_edge(persona: dict, preguntar, claves: list[str], abiertas: dict) 
     """Páginas que bloquean el navegador automático: se capturan en el navegador del usuario, una tras otra."""
     capturas = {}
     for clave in claves:
+        avisar("sitio", clave=clave, estado="en_curso")
         try:
             capturas[clave] = CONSULTAS_CHROME[clave](persona, preguntar, abiertas.get(clave))
             log(f"Captura {clave}: {capturas[clave]}")
+            avisar("sitio", clave=clave, estado="listo")
         except Exception as e:
             log(f"ERROR {clave}: {e}")
+            avisar("sitio", clave=clave, estado="error", detalle=str(e))
     return capturas
 
 
@@ -1285,14 +1303,17 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
     apertura_chrome = asyncio.create_task(abrir_en_chrome())
 
     async def registrar(clave: str, consulta):
+        avisar("sitio", clave=clave, estado="en_curso")
         try:
             capturas[clave] = await consulta
             log(f"Captura {clave}: {capturas[clave]}")
+            avisar("sitio", clave=clave, estado="listo")
         except Exception as e:
             # SIMIT, Procuraduría y RUNT cortan las conexiones que llegan por VPN.
             if re.search(r"ERR_CONNECTION_(CLOSED|RESET)", str(e)):
                 e = "el sitio cerró la conexión. Si estás con VPN, apágala: este sitio rechaza las conexiones por VPN."
             log(f"ERROR {clave}: {e}")
+            avisar("sitio", clave=clave, estado="no_aplica" if "no aplica" in str(e) else "error", detalle=str(e))
 
     async def automatica(clave: str, funcion, *args):
         async with limite:
@@ -1317,10 +1338,12 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
         async with limite:
             for clave, url, titulo in (("terroristas", url_terroristas(persona), TITULO_TERRORISTAS),
                                        ("justicia", url_justicia(persona), TITULO_JUSTICIA)):
+                avisar("sitio", clave=clave, estado="en_curso")
                 page = await r["eeuu"].new_page()
                 try:
                     capturas[clave] = await capturar_sin_ventana(page, persona, clave, url, titulo)
                     log(f"Captura {clave}: {capturas[clave]}")
+                    avisar("sitio", clave=clave, estado="listo")
                 except Exception as e:
                     log(f"{clave}: no cargó en el navegador automático ({str(e).splitlines()[0]}); se capturará en Chrome.")
                     a_chrome.append(clave)
@@ -1371,9 +1394,13 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
         log(f"Tiempo: captchas listos a los {minutos(time.monotonic() - inicio)}")
         await asyncio.gather(apertura_chrome, eeuu, return_exceptions=True)
         desde = time.monotonic()
-        # Las que no se pudieron abrir de antemano se abren al capturarlas, como antes.
-        capturas.update(await asyncio.to_thread(
-            consultas_edge, persona, preguntar_edge, ["fbi", "consilium", *a_chrome], abiertas))
+        claves = ["fbi", "consilium", *a_chrome]
+        avisar("capturando", claves=claves)
+        try:
+            # Las que no se pudieron abrir de antemano se abren al capturarlas, como antes.
+            capturas.update(await asyncio.to_thread(consultas_edge, persona, preguntar_edge, claves, abiertas))
+        finally:
+            avisar("capturando", claves=[])
         log(f"Tiempo: capturas en Chrome {minutos(time.monotonic() - desde)}")
 
     async def fase(nombre: str, *tareas):
@@ -1401,10 +1428,39 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
     return capturas
 
 
+async def procesar(persona: dict, apertura: asyncio.Task, preguntar, preguntar_edge) -> Path | None:
+    """Consulta a la persona en todos los sitios y arma su informe; devuelve el PDF (None si no hubo capturas)."""
+    inicio = time.monotonic()
+    log(
+        f"Datos: {persona['nombre']} | {persona['tipo']} {persona['numero']} | {persona['empresa']} | "
+        f"consulta {persona['fecha_consulta']:%d/%m/%Y} por {persona['consultor']} | "
+        f"expedición {persona['fecha_expedicion']:%d/%m/%Y} | {persona['sexo']} | "
+        f"apellido RUNT: {primer_apellido(persona['nombre'])}"
+    )
+    capturas = await consultar_persona(persona, await apertura, preguntar, preguntar_edge)
+    ruta = insertar_en_pdf(capturas, persona) if capturas else None
+    if ruta:
+        log(f"PDF: {ruta}")
+    log(f"Tiempo total: {minutos(time.monotonic() - inicio)}")
+    return ruta
+
+
+async def cerrar_navegadores(apertura: asyncio.Task):
+    apertura.cancel()
+    recursos = (await asyncio.gather(apertura, return_exceptions=True))[0]
+    if isinstance(recursos, dict):
+        for tarea in (recursos["consolidado"].carga, recursos["consolium"].carga, *recursos["precargas"].values()):
+            tarea.cancel()
+            await asyncio.gather(tarea, return_exceptions=True)
+        for navegador in recursos["navegadores"]:
+            await navegador.close()
+
+
 async def principal():
     consola = ventana_consola()
 
-    async def preguntar(mensaje: str) -> str:
+    # La imagen del captcha y las opciones son para la ventana; la consola tiene el texto.
+    async def preguntar(mensaje: str, **_) -> str:
         return await asyncio.to_thread(preguntar_en_consola, mensaje, consola)
 
     # Las capturas de Edge ya tienen la pantalla cuando preguntan.
@@ -1426,26 +1482,9 @@ async def principal():
                 except ValueError as e:
                     log(f"ERROR: {e}")
                     continue
-                inicio = time.monotonic()
-                log(
-                    f"Datos: {persona['nombre']} | {persona['tipo']} {persona['numero']} | {persona['empresa']} | "
-                    f"consulta {persona['fecha_consulta']:%d/%m/%Y} por {persona['consultor']} | "
-                    f"expedición {persona['fecha_expedicion']:%d/%m/%Y} | {persona['sexo']} | "
-                    f"apellido RUNT: {primer_apellido(persona['nombre'])}"
-                )
-                capturas = await consultar_persona(persona, await apertura, preguntar, preguntar_edge)
-                if capturas:
-                    log(f"PDF: {insertar_en_pdf(capturas, persona)}")
-                log(f"Tiempo total: {minutos(time.monotonic() - inicio)}")
+                await procesar(persona, apertura, preguntar, preguntar_edge)
         finally:
-            apertura.cancel()
-            recursos = (await asyncio.gather(apertura, return_exceptions=True))[0]
-            if isinstance(recursos, dict):
-                for tarea in (recursos["consolidado"].carga, recursos["consolium"].carga, *recursos["precargas"].values()):
-                    tarea.cancel()
-                    await asyncio.gather(tarea, return_exceptions=True)
-                for navegador in recursos["navegadores"]:
-                    await navegador.close()
+            await cerrar_navegadores(apertura)
 
 
 def main():
