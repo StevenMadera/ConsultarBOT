@@ -1,8 +1,10 @@
 __pycache__/
 *.pyc
 .venv/
+# Archivos temporales de Word y Excel mientras un documento está abierto
+~$*
 
-# Datos personales generados por el bot: no subir
+# Datos personales generados por los bots: no subir
 capturas/
 salidas/
 log.txt
