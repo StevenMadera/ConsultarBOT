@@ -1,4 +1,4 @@
-# ConsultarBot
+# PaginasBOT
 
 Consulta automática de una persona en varias páginas públicas, con captura de cada resultado y un PDF final.
 
@@ -7,16 +7,17 @@ Consulta automática de una persona en varias páginas públicas, con captura de
 - Python 3.12 o superior (el comando `py` debe funcionar)
 - Edge o Chrome como navegador por defecto
 
-## Instalación (una sola vez)
+## Instalación (una sola vez por equipo)
+Doble clic en `Instalar.bat`, en la carpeta que contiene PaginasBOT, AntecedentesBOT y CuadrosBOT: instala las librerías y Chromium y crea los accesos directos (con su ícono) en el Escritorio y en el menú Inicio. Si se mueve la carpeta, se vuelve a ejecutar.
+
+Sin el instalador:
 ```
-git clone <URL-del-repositorio>
-cd ConsultarBot
 py -m pip install -r requirements.txt
 py -m playwright install chromium
 ```
 
 ## Uso
-Doble clic en `ConsultarBOT.pyw`. Se abre una ventanita en el centro de la pantalla, siempre encima de las demás.
+Doble clic en el acceso directo **PaginasBOT** (o en `PaginasBOT.pyw`). Se abre una ventanita en el centro de la pantalla, siempre encima de las demás.
 
 1. Copia la fila en Excel: nombre, documento, empresa, fecha consulta, quien consulta, fecha expedicion, sexo (ej. `Santiago Flores Alonso | 1000858557 | FALABELLA CEDI | 16/09/2026 | STEVEN | 25/06/2020 | H`). Los datos se llenan solos (también con Ctrl+V en cualquier casilla, o escribiéndolos). Pulsa Enter o «Consultar». Sexo: `H` (hombre) o `M` (mujer); a las mujeres no se les consulta la libreta militar y su informe usa `Plantilla/Mujer.pdf`. Si el documento no indica tipo, es CC; tipos: CC, CE, PEP, PPT, NIT, TI (ej. `CE 123456`).
 2. La ventanita muestra el avance de cada sitio. Cuando te necesita, suena un aviso:
@@ -32,5 +33,5 @@ Doble clic en `ConsultarBOT.pyw`. Se abre una ventanita en el centro de la panta
 Sin ventanita, en la consola: `py main.py` (los códigos se escriben en la consola y Enter sin texto sale).
 
 ## Antes de ejecutar
-- Cierra videos flotantes u otras ventanas encima del navegador: salen en la captura del FBI y de Consilium. La ventanita de ConsultarBOT no sale (Windows la excluye de las capturas de pantalla; tampoco aparece en tus recortes ni al compartir pantalla).
+- Cierra videos flotantes u otras ventanas encima del navegador: salen en la captura del FBI y de Consilium. La ventanita de PaginasBOT no sale (Windows la excluye de las capturas de pantalla; tampoco aparece en tus recortes ni al compartir pantalla).
 - Si falla una página, el error queda en `log.txt` y el bot sigue con las demás.

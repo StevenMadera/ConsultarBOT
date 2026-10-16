@@ -2,6 +2,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+# Igual al nombre del .pyw: el instalador da al acceso directo el id f"Soporte.{NOMBRE}".
+NOMBRE = "PaginasBOT"
 RAIZ = Path(__file__).parent
 CAPTURAS = RAIZ / "capturas"
 _consola = threading.Lock()

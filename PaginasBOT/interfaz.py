@@ -1,4 +1,4 @@
-"""Ventana de ConsultarBOT: pide los datos, muestra el avance y los captchas y entrega el informe."""
+"""Ventana de PaginasBOT: pide los datos, muestra el avance y los captchas y entrega el informe."""
 import asyncio
 import base64
 import concurrent.futures
@@ -16,12 +16,11 @@ import winsound
 from ctypes import wintypes
 from tkinter import messagebox, ttk
 
-import pymupdf
 from playwright.async_api import async_playwright
 
 import comun
 from captura_navegador import PANTALLA
-from comun import RAIZ, log
+from comun import NOMBRE, RAIZ, log
 from main import (CAMPOS, FORMATO, SALIDAS, SEXOS, abrir_navegadores, cerrar_navegadores, minutos, partir_fila,
                   procesar, validar)
 
@@ -92,14 +91,6 @@ def foto(png: bytes) -> tk.PhotoImage:
     return tk.PhotoImage(data=base64.b64encode(png).decode("ascii"))
 
 
-def icono() -> tk.PhotoImage:
-    with pymupdf.open() as doc:
-        pagina = doc.new_page(width=32, height=32)
-        pagina.draw_rect(pagina.rect, color=None, fill=(0.15, 0.39, 0.92), radius=0.25)
-        pagina.insert_text((8.5, 24), "C", fontname="hebo", fontsize=22, color=(1, 1, 1))
-        return foto(pagina.get_pixmap(alpha=True).tobytes("png"))
-
-
 def primera_linea(texto) -> str:
     return next(iter(str(texto).strip().splitlines()), "")
 
@@ -108,7 +99,7 @@ def separar_titulo(mensaje: str) -> tuple[str, str]:
     """'Consilium: Acepta… Pulsa Enter cuando…' -> ('Consilium', 'Acepta…'): en la ventana se pulsa «Listo»."""
     titulo, _, texto = mensaje.partition(": ")
     if not texto:
-        titulo, texto = "ConsultarBOT", mensaje
+        titulo, texto = NOMBRE, mensaje
     texto = re.sub(r"\s*(?:y\s+)?pulsa enter\b.*$", "", texto, flags=re.IGNORECASE | re.DOTALL).strip()
     texto = texto[:1].upper() + texto[1:]
     return titulo, texto if texto.endswith(".") else f"{texto}."
@@ -126,12 +117,11 @@ class Interfaz:
     def __init__(self):
         self.root = tk.Tk()
         self.root.withdraw()
-        self.root.title("ConsultarBOT")
+        self.root.title(NOMBRE)
         self.root.resizable(False, False)
         self.root.configure(background=FONDO)
         self.root.report_callback_exception = self._error_en_ventana
-        self._icono = icono()
-        self.root.iconphoto(True, self._icono)
+        self.root.iconbitmap(default=str(RAIZ / "icono.ico"))
         self._estilos()
 
         self.vivo = True
@@ -490,7 +480,7 @@ class Interfaz:
         try:
             self.bucle.call_soon_threadsafe(self.personas.put_nowait, persona)
         except RuntimeError:
-            self._mostrar_error("El bot se detuvo. Cierra ConsultarBOT y vuelve a abrirlo; el motivo está en el registro.")
+            self._mostrar_error(f"El bot se detuvo. Cierra {NOMBRE} y vuelve a abrirlo; el motivo está en el registro.")
             return
         self.estado = "consultando"
         self.accion, self.capturando = None, ()
@@ -544,7 +534,7 @@ class Interfaz:
         self.barra.update_idletasks()
         self.barra.coords(self.relleno, 0, 0, self.barra.winfo_width() * hechos / total, 6)
         self.cuenta.configure(text=f"{hechos} de {total}")
-        self.root.title(f"ConsultarBOT · {hechos}/{total}")
+        self.root.title(f"{NOMBRE} · {hechos}/{total}")
         if hechos == total:
             self.linea_estado.configure(text="Armando el PDF…")
 
@@ -658,7 +648,7 @@ class Interfaz:
 
     def _al_pregunta(self, **pregunta):
         if self.estado == "cerrando":
-            pregunta["futuro"].set_exception(RuntimeError("Se cerró ConsultarBOT."))
+            pregunta["futuro"].set_exception(RuntimeError(f"Se cerró {NOMBRE}."))
             return
         pregunta["n"] = next(self._numero)
         self.preguntas.append(pregunta)
@@ -694,7 +684,7 @@ class Interfaz:
                 etiqueta.grid()
             else:
                 etiqueta.grid_remove()
-        self.root.title("ConsultarBOT")
+        self.root.title(NOMBRE)
         self._mostrar()
         winsound.MessageBeep(winsound.MB_OK)
         if self.root.state() == "iconic":
@@ -714,11 +704,11 @@ class Interfaz:
         if self.estado == "cerrando":
             return
         if self.estado == "consultando" and not messagebox.askyesno(
-                "ConsultarBOT", "Hay una consulta en curso. ¿Cancelarla y cerrar?", parent=self.root):
+                NOMBRE, "Hay una consulta en curso. ¿Cancelarla y cerrar?", parent=self.root):
             return
         self.estado = "cerrando"
         for pregunta in self.preguntas:
-            pregunta["futuro"].set_exception(RuntimeError("Se cerró ConsultarBOT."))
+            pregunta["futuro"].set_exception(RuntimeError(f"Se cerró {NOMBRE}."))
         self.preguntas.clear()
         self.accion = None
         self._mostrar()
@@ -743,6 +733,8 @@ class Interfaz:
 def main():
     # Nítida con cualquier escala de Windows; mss hace lo mismo en su primera captura.
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    # Botón e ícono propios en la barra de tareas (si no, sale el de Python).
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"Soporte.{NOMBRE}")
     Interfaz().root.mainloop()
     # Tras cancelar, una captura de Chrome puede seguir en su hilo: no se la espera.
     os._exit(0)
