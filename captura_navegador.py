@@ -206,6 +206,8 @@ def _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, 
     numero = re.sub(r"\D", "", numero)
     abierta_antes = ventana is not None and ctypes.windll.user32.IsWindow(ventana._hWnd)
     if abierta_antes:
+        # Cargó mientras se resolvían los captchas: el margen para el JavaScript de la página ya pasó.
+        espera_minima = min(espera_minima, ESPERA_MINIMA)
         # Minimizada no se dibuja: se muestra como las demás capturas, maximizada.
         _encima(ventana)
         ventana = _esperar_pagina(titulo, nombre, preguntar, ventana)

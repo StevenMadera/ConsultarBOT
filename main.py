@@ -27,8 +27,9 @@ from consulta_terroristas import TITULO_TERRORISTAS, consultar_terroristas, url_
 URL = "https://www.procuraduria.gov.co/Pages/Consulta-de-Antecedentes.aspx"
 # Tras enviar la consulta el portal puede tardar minutos; si se recarga, la consulta empieza de cero.
 ESPERA_PROCURADURIA = 240
-# Sin respuesta en este tiempo, se lanza una segunda consulta en paralelo sin recargar la primera.
-SEGUNDA_PROCURADURIA = 90
+# Sin respuesta en este tiempo, se lanza una segunda consulta en paralelo sin recargar la primera; cuando el portal
+# funciona responde en menos de 30 s.
+SEGUNDA_PROCURADURIA = 50
 URL_RUNT = "https://portalpublico.runt.gov.co/#/consulta-ciudadano-documento/consulta/consulta-ciudadano-documento"
 URL_SIMIT = "https://www.fcm.org.co/simit/#/home-public"
 URL_LIBRETA = "https://definicion.libretamilitar.mil.co/consulta-estado-situacion-militar"
@@ -515,7 +516,7 @@ async def captura_aviso_sobre_datos(page, ruta: Path, aviso):
         await cdp.detach()
 
 
-async def consultar_runt(page, persona: dict, preguntar, turno: asyncio.Lock, listo: asyncio.Event) -> Path:
+async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turnos, listo: asyncio.Event) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
     apellido = re.sub(r"[^\w\sñÑáéíóúÁÉÍÓÚüÜ]", "", primer_apellido(persona["nombre"]))
     campo_captcha = page.locator("input[formcontrolname=captcha]")
@@ -548,10 +549,12 @@ async def consultar_runt(page, persona: dict, preguntar, turno: asyncio.Lock, li
 
     # Se llena minimizado; la ventana sale al frente cuando le toca el turno de captcha.
     await llenar()
-    async with documentos.turno_al_dia(turno, lambda: lleno_en, llenar):
-        for intento in range(3):
-            # El captcha caduca y la página puede cambiar mientras espera su turno.
-            if intento or time.monotonic() - lleno_en > documentos.VIGENCIA_CAPTCHA or not await imagen_captcha.count():
+    for intento in range(3):
+        if intento:
+            await llenar()
+        async with turnos.turno("runt", lambda: lleno_en, llenar):
+            # La página pudo cambiar mientras esperaba su turno (o no se pudo recargar a tiempo).
+            if time.monotonic() - lleno_en > documentos.VIGENCIA_CAPTCHA or not await imagen_captcha.count():
                 await llenar()
             await estado_ventana(page, "maximized")
             await imagen_captcha.scroll_into_view_if_needed()
@@ -561,30 +564,35 @@ async def consultar_runt(page, persona: dict, preguntar, turno: asyncio.Lock, li
             except PlaywrightError:
                 imagen = None
 
+            pedido = time.monotonic()
             respuesta = await preguntar("Captcha del RUNT: míralo en su ventana y escríbelo AQUÍ en la consola: ",
                                         titulo="Captcha del RUNT", imagen=imagen, intento=intento + 1)
+            log(f"RUNT: código escrito en {time.monotonic() - pedido:.0f} s.")
             if not await campo_captcha.count():
                 log("RUNT: la página cambió mientras se escribía el captcha; se carga de nuevo.")
                 continue
             await campo_captcha.fill(respuesta)
             await page.get_by_role("button", name="Consultar Información").click()
-            try:
-                await page.wait_for_function(
-                    """() => {
-                        const c = document.querySelector('input[formcontrolname=captcha]');
-                        return !c || c.offsetParent === null
-                            || /captcha no es v[aá]lido|no se ha encontrado la persona/i.test(document.body.innerText);
-                    }""",
-                    timeout=20000,
-                )
-            except PlaywrightTimeoutError:
-                pass
-            if await sin_registro.is_visible() or not await campo_captcha.is_visible():
-                break
-            log(f"RUNT: captcha incorrecto o sin resultado, intento {intento + 1}/3")
-        else:
-            raise ValueError("RUNT: no se obtuvo resultado tras 3 intentos")
-    listo.set()
+        # Mientras el sitio responde ya se puede resolver el captcha siguiente.
+        listo.set()
+        try:
+            # Cada medio segundo: con otra ventana encima, la página no depende de dibujar para comprobarlo.
+            await page.wait_for_function(
+                """() => {
+                    const c = document.querySelector('input[formcontrolname=captcha]');
+                    return !c || c.offsetParent === null
+                        || /captcha no es v[aá]lido|no se ha encontrado la persona/i.test(document.body.innerText);
+                }""",
+                timeout=20000,
+                polling=500,
+            )
+        except PlaywrightTimeoutError:
+            pass
+        if await sin_registro.is_visible() or not await campo_captcha.is_visible():
+            break
+        log(f"RUNT: captcha incorrecto o sin resultado, intento {intento + 1}/3")
+    else:
+        raise ValueError("RUNT: no se obtuvo resultado tras 3 intentos")
     ir_arriba = "document.querySelectorAll('*').forEach(e => { if (e.scrollTop) e.scrollTop = 0; }); window.scrollTo(0, 0)"
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"runt_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
@@ -1287,8 +1295,8 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
     inicio = time.monotonic()
     capturas: dict[str, Path] = {}
     limite = asyncio.Semaphore(limite_concurrencia())
-    # Un captcha a la vez: mientras se resuelve uno, los demás sitios ya se están llenando.
-    turno = asyncio.Lock()
+    # Un captcha a la vez: mientras se resuelve uno, los demás sitios ya se están llenando o procesando el suyo.
+    turnos = documentos.Turnos()
     listos = {clave: asyncio.Event() for clave in r["ventanas"]}
     abiertas = {}
     # Si el navegador automático no puede con State.gov o Justice, se capturan en Chrome como antes.
@@ -1363,7 +1371,7 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
                     page = r["ventanas"][clave] = await page.context.new_page()
                     await estado_ventana(page, "minimized")
                 try:
-                    return await consulta(page, persona, *args, turno, listos[clave])
+                    return await consulta(page, persona, *args, turnos, listos[clave])
                 except Exception:
                     if page.is_closed() and not intento:
                         log(f"{clave}: se cerró su ventana durante la consulta; se abre otra y se repite.")
@@ -1389,19 +1397,20 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
                     pass
 
     async def edge():
-        # Empieza cuando ya se resolvieron todos los captchas, para no robarles el foco a sus ventanas.
+        # Empieza cuando ya se enviaron todos los captchas; uno que haya que repetir y ya esté en la fila pasa antes.
         await asyncio.gather(*(evento.wait() for evento in listos.values()))
-        log(f"Tiempo: captchas listos a los {minutos(time.monotonic() - inicio)}")
+        log(f"Tiempo: captchas enviados a los {minutos(time.monotonic() - inicio)}")
         await asyncio.gather(apertura_chrome, eeuu, return_exceptions=True)
-        desde = time.monotonic()
-        claves = ["fbi", "consilium", *a_chrome]
-        avisar("capturando", claves=claves)
-        try:
-            # Las que no se pudieron abrir de antemano se abren al capturarlas, como antes.
-            capturas.update(await asyncio.to_thread(consultas_edge, persona, preguntar_edge, claves, abiertas))
-        finally:
-            avisar("capturando", claves=[])
-        log(f"Tiempo: capturas en Chrome {minutos(time.monotonic() - desde)}")
+        async with turnos.pantalla():
+            desde = time.monotonic()
+            claves = ["fbi", "consilium", *a_chrome]
+            avisar("capturando", claves=claves)
+            try:
+                # Las que no se pudieron abrir de antemano se abren al capturarlas, como antes.
+                capturas.update(await asyncio.to_thread(consultas_edge, persona, preguntar_edge, claves, abiertas))
+            finally:
+                avisar("capturando", claves=[])
+            log(f"Tiempo: capturas en Chrome {minutos(time.monotonic() - desde)}")
 
     async def fase(nombre: str, *tareas):
         await asyncio.gather(*tareas)
