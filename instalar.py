@@ -10,12 +10,15 @@ from win32com.shell import shell
 
 RAIZ = Path(__file__).parent
 PYTHONW = Path(sys.executable).with_name("pythonw.exe")
+# Las que se instalan en los equipos; AntecedentesBOT y CuadrosBOT todavía no.
+PUBLICADAS = ("PaginasBOT",)
 
 
 def buscar_apps() -> list[Path]:
-    """El .pyw de cada app: en esta carpeta o en sus subcarpetas, junto a su requirements.txt."""
+    """El .pyw de cada app publicada: en esta carpeta o en sus subcarpetas, junto a su requirements.txt."""
     carpetas = [RAIZ, *sorted(c for c in RAIZ.iterdir() if c.is_dir())]
-    return [pyw for c in carpetas if (c / "requirements.txt").exists() for pyw in sorted(c.glob("*.pyw"))]
+    return [pyw for c in carpetas if (c / "requirements.txt").exists() for pyw in sorted(c.glob("*.pyw"))
+            if pyw.stem in PUBLICADAS]
 
 
 def python(*argumentos: str) -> bool:
@@ -67,7 +70,7 @@ def main() -> int:
         print(f"\nFalló la instalación de {' y '.join(fallos)}: revisa la conexión a internet y vuelve a abrir "
               "Instalar.bat.")
         return 1
-    print("\nListo.")
+    print(f"\nListo: abre {nombres} desde el acceso directo del Escritorio o desde el menú Inicio.")
     return 0
 
 

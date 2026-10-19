@@ -8,6 +8,7 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -23,6 +24,13 @@ from captura_navegador import PANTALLA
 from comun import NOMBRE, RAIZ, log
 from main import (CAMPOS, FORMATO, SALIDAS, SEXOS, abrir_navegadores, cerrar_navegadores, minutos, partir_fila,
                   procesar, validar)
+
+# actualizar.py está en la carpeta que contiene las apps; si PaginasBOT se copió sola, no hay botón de actualizar.
+sys.path.append(str(RAIZ.parent))
+try:
+    import actualizar
+except ImportError:
+    actualizar = None
 
 FONDO = "#ffffff"
 TEXTO = "#1f2937"
@@ -125,6 +133,7 @@ class Interfaz:
         self._estilos()
 
         self.vivo = True
+        self.reiniciar = False
         self.eventos = queue.Queue()
         self.estado = "datos"
         self.preguntas: list[dict] = []
@@ -149,6 +158,11 @@ class Interfaz:
         self.v_aviso = ttk.Frame(self.root)
         self.v_cerrando = ttk.Frame(self.root, padding=26)
         ttk.Label(self.v_cerrando, text="Cerrando los navegadores…", style="Suave.TLabel").pack()
+        self.v_actualizando = ttk.Frame(self.root, padding=26)
+        ttk.Label(self.v_actualizando, text="Actualizando…", style="Titulo.TLabel").pack(anchor="w")
+        ttk.Label(self.v_actualizando, text=f"{NOMBRE} se volverá a abrir al terminar. Si hay librerías nuevas, puede "
+                  "tardar unos minutos.", style="Suave.TLabel", wraplength=360, justify="left").pack(anchor="w",
+                                                                                                     pady=(6, 0))
 
         self.root.protocol("WM_DELETE_WINDOW", self._al_cerrar)
         for tecla in ("<Return>", "<KP_Enter>"):
@@ -166,6 +180,8 @@ class Interfaz:
         self.sesion = None
         comun.escuchar(lambda tipo, datos: self.eventos.put((tipo, datos)))
         threading.Thread(target=self._hilo_bot, daemon=True).start()
+        if actualizar:
+            threading.Thread(target=self._buscar_version, daemon=True).start()
         self.root.after(200, self._atender)
         self.root.after(600, self._vigilar_portapapeles)
 
@@ -225,6 +241,9 @@ class Interfaz:
         self.punto.pack(side="left")
         self.texto_navegadores = ttk.Label(pie, text="Preparando los navegadores…", style="Pie.TLabel", wraplength=340)
         self.texto_navegadores.pack(side="left", padx=(4, 0))
+        self.texto_version = ttk.Label(v, style="Error.TLabel", wraplength=360, justify="left")
+        self.texto_version.grid(row=12, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.texto_version.grid_remove()
         return v
 
     def _armar_progreso(self) -> ttk.Frame:
@@ -698,10 +717,54 @@ class Interfaz:
         if self.estado == "cerrando":
             self._cerrar_ya()
 
+    # ---------- Actualización ----------
+
+    def _buscar_version(self):
+        if actualizar.hay_version_nueva():
+            self.eventos.put(("version", {}))
+
+    def _al_version(self):
+        # Si ya empezó una consulta no se interrumpe: se actualizará la próxima vez que se abra.
+        if self.estado == "datos":
+            log("Actualización: hay una versión nueva.")
+            self._actualizar()
+
+    def _actualizar(self):
+        if self.estado != "datos":
+            return
+        self.estado = "actualizando"
+        self._mostrar()
+        threading.Thread(target=self._hilo_actualizar, daemon=True).start()
+
+    def _hilo_actualizar(self):
+        try:
+            actualizar.aplicar()
+            self.eventos.put(("actualizado", {"error": None}))
+        except Exception as e:
+            self.eventos.put(("actualizado", {"error": primera_linea(e)}))
+
+    def _al_actualizado(self, error: str | None):
+        if self.estado != "actualizando":
+            return
+        self.estado = "datos"
+        if error:
+            log(f"Actualización: {error}")
+            self.texto_version.configure(text=f"No se pudo actualizar ({error}); se intentará al volver a abrir.")
+            self.texto_version.grid()
+            self._mostrar()
+            return
+        log("Actualización lista: se vuelve a abrir.")
+        self.reiniciar = True
+        self._al_cerrar()
+
     # ---------- Cierre ----------
 
     def _al_cerrar(self):
         if self.estado == "cerrando":
+            return
+        if self.estado == "actualizando" and not messagebox.askyesno(
+                NOMBRE, "Se está actualizando. Si cierras ahora y después no abre, vuelve a ejecutar el instalador. "
+                "¿Cerrar de todas formas?", parent=self.root):
             return
         if self.estado == "consultando" and not messagebox.askyesno(
                 NOMBRE, "Hay una consulta en curso. ¿Cancelarla y cerrar?", parent=self.root):
@@ -735,7 +798,10 @@ def main():
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
     # Botón e ícono propios en la barra de tareas (si no, sale el de Python).
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"Soporte.{NOMBRE}")
-    Interfaz().root.mainloop()
+    interfaz = Interfaz()
+    interfaz.root.mainloop()
+    if interfaz.reiniciar:
+        subprocess.Popen([os.path.join(os.path.dirname(sys.executable), "pythonw.exe"), str(RAIZ / f"{NOMBRE}.pyw")])
     # Tras cancelar, una captura de Chrome puede seguir en su hilo: no se la espera.
     os._exit(0)
 
