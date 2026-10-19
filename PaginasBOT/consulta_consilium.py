@@ -12,7 +12,7 @@ def url_consilium(persona: dict) -> str:
     return URL_CONSILIUM.format(nombre=quote(persona["nombre"]))
 
 
-def consultar_consilium(persona: dict, preguntar=input, ventana=None) -> Path:
+def consultar_consilium(persona: dict, preguntar=input, antes=None) -> Path:
     return capturar_navegador(
         url_consilium(persona),
         # Título de la página de resultados: la verificación previa del sitio ("Checking your browser") no lo tiene.
@@ -24,7 +24,7 @@ def consultar_consilium(persona: dict, preguntar=input, ventana=None) -> Path:
         # Sin el paso manual (desde la segunda consulta), la lista se carga con JavaScript.
         espera_minima=5,
         preguntar=preguntar,
-        ventana=ventana,
+        antes=antes,
         zoom=0.75,
     )
 

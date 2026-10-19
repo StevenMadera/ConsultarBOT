@@ -15,7 +15,7 @@ def url_terroristas(persona: dict) -> str:
     return URL_TERRORISTAS.format(nombre=quote(" ".join(persona["nombre"].split()), safe=""))
 
 
-def consultar_terroristas(persona: dict, preguntar=input, ventana=None) -> Path:
+def consultar_terroristas(persona: dict, preguntar=input, antes=None) -> Path:
     return capturar_navegador(
         url_terroristas(persona),
         TITULO_TERRORISTAS,
@@ -23,6 +23,6 @@ def consultar_terroristas(persona: dict, preguntar=input, ventana=None) -> Path:
         "terroristas",
         persona["numero"],
         preguntar=preguntar,
-        ventana=ventana,
+        antes=antes,
         zoom=1.1,
     )

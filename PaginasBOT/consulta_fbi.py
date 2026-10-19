@@ -12,11 +12,11 @@ def url_fbi(persona: dict) -> str:
     return URL_FBI.format(nombre=quote(persona["nombre"]))
 
 
-def consultar_fbi(persona: dict, preguntar=input, ventana=None) -> Path:
+def consultar_fbi(persona: dict, preguntar=input, antes=None) -> Path:
     # El filtro de búsqueda se aplica con JavaScript después de cargar: necesita más margen.
     return capturar_navegador(
         url_fbi(persona), "Fugitives", "FBI", "fbi", persona["numero"],
-        espera_minima=5, preguntar=preguntar, ventana=ventana, zoom=2 / 3,
+        espera_minima=5, preguntar=preguntar, antes=antes, zoom=2 / 3,
     )
 
 

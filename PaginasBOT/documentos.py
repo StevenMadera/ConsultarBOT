@@ -281,6 +281,82 @@ async def imprimir_pdf(page, ruta: Path, fecha_consulta: str, fondos: bool = Fal
     return ruta
 
 
+async def pdf_de_pagina(page, ruta: Path) -> Path:
+    """La página tal como está, en A4: lo mismo que Imprimir > Guardar como PDF. Si la impresión no responde (pasó
+    con la página de error del navegador), la captura de la página en una hoja A4."""
+    cdp = await page.context.new_cdp_session(page)
+    try:
+        datos = await asyncio.wait_for(
+            cdp.send("Page.printToPDF", {"paperWidth": 8.27, "paperHeight": 11.69, "printBackground": True}), 20)
+    except TimeoutError:
+        datos = None
+    finally:
+        with contextlib.suppress(PlaywrightError, TimeoutError):
+            await asyncio.wait_for(cdp.detach(), 5)
+    if datos is None:
+        log(f"{ruta.stem}: la impresión de la página no respondió; se guarda su captura en PDF.")
+        return imagen_a_pdf(await page.screenshot(timeout=15000), ruta)
+    ruta.write_bytes(base64.b64decode(datos["data"]))
+    return ruta
+
+
+# No dicen nada del sitio: la navegación se cortó por otra o este equipo se quedó sin internet.
+ERRORES_LOCALES = ("ERR_ABORTED", "ERR_INTERNET_DISCONNECTED", "ERR_NETWORK_CHANGED", "ERR_NETWORK_IO_SUSPENDED")
+ESTADO_HTTP_JS = "() => performance.getEntriesByType('navigation')[0]?.responseStatus ?? 0"
+
+
+async def caida_en_pagina(page) -> str | None:
+    """Motivo si la página es la de error del navegador o un error del servidor (5xx); None si no."""
+    if page.url.startswith("chrome-error://"):
+        return "el navegador no pudo abrir el sitio"
+    try:
+        estado = await page.evaluate(ESTADO_HTTP_JS)
+    except PlaywrightError:
+        return None
+    return f"el sitio respondió con el error {estado}" if estado >= 500 else None
+
+
+async def motivo_caida(page, error: Exception) -> tuple[str | None, str | None]:
+    """(motivo, dirección) si `error` se debe a que el sitio está caído; la dirección solo si no respondió a tiempo.
+    (None, None) si falló por otra causa."""
+    texto = str(error)
+    red = re.search(r"net::(ERR_\w+)", texto)
+    if red and red[1] not in ERRORES_LOCALES:
+        if red[1] in ("ERR_CONNECTION_CLOSED", "ERR_CONNECTION_RESET"):
+            # SIMIT, Procuraduría y RUNT cortan así las conexiones que llegan por VPN.
+            return f"el sitio cerró la conexión ({red[1]}). Si estás con VPN, apágala y repite la consulta", None
+        return f"no se pudo conectar con el sitio ({red[1]})", None
+    agotado = re.match(r"Page\.(?:goto|reload): Timeout (\d+)ms", texto)
+    if agotado:
+        direccion = re.search(r'navigating to "([^"]+)"', texto)
+        return f"el sitio no respondió en {int(agotado[1]) // 1000} s", direccion[1] if direccion else page.url
+    return await caida_en_pagina(page), None
+
+
+async def aviso_tiempo_agotado(page, url: str):
+    """Deja en la pestaña el aviso de Chrome «ha tardado demasiado tiempo en responder» para `url`, sin volver a
+    esperar. Tras agotarse la espera la pestaña sigue mostrando la página anterior, que puede ser de otra consulta."""
+    async def agotar(route):
+        if route.request.is_navigation_request():
+            await route.abort("timedout")
+        else:
+            await route.continue_()
+
+    # La carga que sigue esperando retiene la dirección unos 20 s: se detiene antes de pedirla otra vez.
+    cdp = await page.context.new_cdp_session(page)
+    try:
+        await cdp.send("Page.stopLoading")
+    finally:
+        await cdp.detach()
+    await page.route("**/*", agotar)
+    try:
+        await page.goto(url, wait_until="commit", timeout=15000)
+    except PlaywrightError:
+        pass  # Es el error esperado: la pestaña queda con el aviso.
+    finally:
+        await page.unroute("**/*", agotar)
+
+
 async def descargar(page, accion, ruta: Path, espera: int = 60000) -> Path:
     async with page.expect_download(timeout=espera) as info:
         await accion()

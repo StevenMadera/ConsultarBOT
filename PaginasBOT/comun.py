@@ -13,6 +13,15 @@ _retenidos: list[str] | None = None
 _oyente = None
 
 
+class FueraDeServicio(Exception):
+    """El sitio no respondió o mostró un error propio: en el informe va `captura`, la página caída (PNG o PDF).
+    Sin `captura`, quien tiene la página la guarda tal como quedó."""
+
+    def __init__(self, motivo: str, captura: Path | None = None):
+        super().__init__(motivo)
+        self.captura = captura
+
+
 def escuchar(funcion):
     global _oyente
     _oyente = funcion

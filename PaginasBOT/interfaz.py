@@ -64,8 +64,9 @@ ESTADOS = {
     "listo": ("✓", VERDE),
     "error": ("✕", ROJO),
     "no_aplica": ("–", APAGADO),
+    "fuera_servicio": ("!", AMBAR),
 }
-TERMINADOS = {"listo", "error", "no_aplica"}
+TERMINADOS = {"listo", "error", "no_aplica", "fuera_servicio"}
 ETIQUETAS = ("Nombre", "Documento", "Empresa", "Fecha consulta", "Quién consulta", "Fecha expedición")
 # Lo que la ventana ya muestra de otra forma.
 OMITIDOS = re.compile(r"Captura |Tiempo|Datos:|PDF: [A-Za-z]:\\")
@@ -290,11 +291,13 @@ class Interfaz:
         self.boton_carpeta.pack(side="left")
         self.fallos = ttk.Label(v, style="Error.TLabel", wraplength=360, justify="left")
         self.fallos.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self.caidos = ttk.Label(v, style="Aviso.TLabel", wraplength=360, justify="left")
+        self.caidos.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.no_aplica = ttk.Label(v, style="Suave.TLabel", wraplength=360, justify="left")
-        self.no_aplica.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Separator(v).grid(row=5, column=0, columnspan=2, sticky="we", pady=(14, 10))
+        self.no_aplica.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Separator(v).grid(row=6, column=0, columnspan=2, sticky="we", pady=(14, 10))
         pie = ttk.Frame(v)
-        pie.grid(row=6, column=0, columnspan=2, sticky="w")
+        pie.grid(row=7, column=0, columnspan=2, sticky="w")
         ttk.Button(pie, text="Nueva consulta", command=self._nueva).pack(side="left")
         ttk.Label(pie, text="o copia la siguiente fila en Excel", style="Pie.TLabel").pack(side="left", padx=(10, 0))
         return v
@@ -695,8 +698,12 @@ class Interfaz:
             self.boton_pdf.pack_forget()
         fallos = [f"✕  {SITIOS[clave]}: {explicar(self.detalles.get(clave) or 'falló')}"
                   for clave, estado in self.sitios.items() if estado == "error"]
+        caidos = [f"!  {SITIOS[clave]}: fuera de servicio, {explicar(self.detalles.get(clave) or 'no respondió')}."
+                  for clave, estado in self.sitios.items() if estado == "fuera_servicio"]
+        if caidos:
+            caidos.append("En el informe van sus páginas caídas, marcadas en la portada como «Fuera de servicio».")
         no_aplica = [SITIOS[clave] for clave, estado in self.sitios.items() if estado == "no_aplica"]
-        for etiqueta, texto in ((self.fallos, "\n".join(fallos)),
+        for etiqueta, texto in ((self.fallos, "\n".join(fallos)), (self.caidos, "\n".join(caidos)),
                                 (self.no_aplica, f"No aplica: {', '.join(no_aplica)}." if no_aplica else "")):
             etiqueta.configure(text=texto)
             if texto:

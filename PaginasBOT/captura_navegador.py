@@ -12,12 +12,13 @@ import webbrowser
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import mss
 import mss.tools
 import pygetwindow as gw
 
-from comun import CAPTURAS, log
+from comun import CAPTURAS, FueraDeServicio, log
 
 ESPERA_MINIMA = 2
 ESPERA_ESTABLE_MAXIMA = 12
@@ -54,10 +55,6 @@ def _es_verificacion(titulo: str) -> bool:
     return any(t in titulo.lower() for t in TITULOS_VERIFICACION)
 
 
-def _hay_verificacion() -> bool:
-    return any(_es_verificacion(titulo) for titulo in gw.getAllTitles())
-
-
 def _en_blanco(rgb: bytes, ancho: int) -> bool:
     # Debajo de la cabecera (el aviso del FBI y la de Consilium se dibujan antes que el resto) y sin la barra de
     # desplazamiento, todo blanco puro.
@@ -67,37 +64,60 @@ def _en_blanco(rgb: bytes, ancho: int) -> bool:
     return resto.count(255) > len(resto) * 0.995
 
 
-def _buscar_ventana(titulo: str):
-    # El editor puede tener abierto un archivo cuyo nombre contenga el mismo texto.
-    for ventana in gw.getWindowsWithTitle(titulo):
-        if "Visual Studio Code" not in ventana.title:
-            return ventana
-    return None
+def _ventanas_nuevas(antes: set[int]) -> list:
+    """Ventanas del navegador que no estaban en `antes`: las que abrió el bot para esta consulta."""
+    # El editor también es de clase Chrome y puede tener abierto un archivo con el mismo texto en el nombre.
+    return [v for v in gw.getAllWindows() if v._hWnd not in antes and _clase(v._hWnd) in CLASES_NAVEGADOR
+            and "Visual Studio Code" not in v.title]
 
 
-def _esperar_pagina(titulo: str, nombre: str, preguntar, ventana=None):
-    """Espera a que el título de la ventana sea el de la página; si sale la verificación, pide pasarla.
+def _esperar_pagina(titulo: str, nombre: str, preguntar, antes: set[int], url: str, precargada: bool):
+    """(ventana, motivo): la ventana nueva cuyo título contiene `titulo` (motivo None); si sale la verificación, pide
+    pasarla.
 
-    Con `ventana` (abierta de antemano) solo se mira esa: otra puede estar en su propia verificación.
+    Se reconoce por el título y no por el orden en que aparece: con el navegador cerrado, las ventanas del FBI y de
+    Consilium pueden abrir tarde y en cualquier orden. Si el sitio está caído devuelve la ventana que lo muestra y el
+    motivo: la página de error del navegador lleva el nombre del sitio como título. Si la ventana abierta de antemano
+    no muestra la página en 10 s (se cerró a mano, o el FBI respondió «Page not found»), la abre de nuevo.
     """
-    if ventana is None:
-        time.sleep(1)  # La pestaña nueva tarda un instante en tomar el foco.
-    fin = time.time() + ESPERA_MAXIMA
-    avisado = False
+    pagina_de_error = re.compile(rf"{re.escape(urlsplit(url).hostname)}(\s|$)", re.I)
+    inicio = time.time()
+    fin = inicio + ESPERA_MAXIMA
+    avisado, caida_desde = False, None
+    # Las ventanas que había cuando se abrió la de este sitio: las nuevas desde entonces son solo suyas.
+    solo_suyas = None if precargada else antes
+    reabrir = precargada
     while time.time() < fin:
-        verificando = _es_verificacion(ventana.title) if ventana else _hay_verificacion()
+        nuevas = _ventanas_nuevas(antes)
+        encontrada = next((v for v in nuevas if titulo in v.title), None)
+        if encontrada:
+            return encontrada, None
+        verificando = next((v for v in nuevas if _es_verificacion(v.title)), None)
         if verificando and not avisado:
             avisado = True
             log(f"{nombre}: verificación de Cloudflare detectada")
+            _encima(verificando)
             preguntar(f"{nombre}: pasa la verificación en el navegador y pulsa Enter... ")
             fin = time.time() + ESPERA_MAXIMA
-        if ventana is None:
-            encontrada = _buscar_ventana(titulo)
-        else:
-            encontrada = ventana if titulo in ventana.title else None
-        if encontrada:
-            return encontrada
+        caida = next((v for v in nuevas if pagina_de_error.match(v.title)), None)
+        if caida is None:
+            caida_desde = None
+        elif caida_desde is None:
+            caida_desde = time.time()
+        elif time.time() - caida_desde >= 5:
+            # Ese título no es un instante de la carga: la página de error se queda.
+            return caida, "el navegador mostró que no se puede acceder al sitio"
+        if reabrir and not avisado and time.time() - inicio > 10:
+            reabrir = False
+            log(f"{nombre}: su ventana no muestra la página; se abre de nuevo.")
+            solo_suyas = abrir_en_ventanas([url])
         time.sleep(0.2)
+    if solo_suyas:
+        # Una ventana de este sitio que terminó de cargar otra página: es lo que el sitio respondió.
+        otra = next((v for v in _ventanas_nuevas(solo_suyas) if v.title and not _es_verificacion(v.title)
+                     and not re.match(r"(Sin título|Untitled)\b", v.title)), None)
+        if otra:
+            return otra, "el sitio no mostró la página de la consulta"
     raise RuntimeError(f"No se encontró la ventana del navegador con la página de {nombre}")
 
 
@@ -152,24 +172,25 @@ def _fijar_encima(hwnd: int, fija: bool):
     ctypes.windll.user32.SetWindowPos(wintypes.HWND(hwnd), insertar, 0, 0, 0, 0, 0x0013)  # sin mover ni activar
 
 
-def abrir_en_ventana(url: str):
-    """Abre `url` en una ventana nueva del navegador por defecto y la minimiza: carga mientras se hace lo demás.
-
-    Devuelve la ventana; None si no se reconoce (la captura abrirá entonces la página en su momento).
-    """
+def abrir_en_ventanas(urls: list[str]) -> set[int] | None:
+    """Abre cada dirección en una ventana nueva del navegador por defecto y las minimiza: cargan mientras se hace lo
+    demás. Devuelve las ventanas que ya había (las demás son del bot); None si no se reconoce el navegador."""
     ejecutable = _navegador_por_defecto()
     if not ejecutable:
         return None
     antes = {v._hWnd for v in gw.getAllWindows()}
-    subprocess.Popen([ejecutable, "--new-window", url])
-    fin = time.time() + 10
-    while time.time() < fin:
-        for ventana in gw.getAllWindows():
-            if ventana._hWnd not in antes and ventana.title and _clase(ventana._hWnd) in CLASES_NAVEGADOR:
+    for url in urls:
+        subprocess.Popen([ejecutable, "--new-window", url])
+    # Con el navegador cerrado puede tardar en abrirlas.
+    minimizadas = set()
+    fin = time.time() + 15
+    while len(minimizadas) < len(urls) and time.time() < fin:
+        for ventana in _ventanas_nuevas(antes):
+            if ventana._hWnd not in minimizadas and ventana.title:
                 ventana.minimize()
-                return ventana
+                minimizadas.add(ventana._hWnd)
         time.sleep(0.2)
-    return None
+    return antes
 
 
 def _es_chromium(hwnd: int) -> bool:
@@ -325,33 +346,38 @@ def capturar_navegador(
     paso_manual: str | None = None,
     espera_minima: float = ESPERA_MINIMA,
     preguntar=input,
-    ventana=None,
+    antes: set[int] | None = None,
     zoom: float = 1,
 ) -> Path:
-    """Abre `url` en el navegador por defecto y captura la página de la ventana cuyo título contiene `titulo`.
+    """Abre `url` en una ventana nueva del navegador por defecto y la captura cuando su título contiene `titulo`.
 
-    Con `ventana` (de `abrir_en_ventana`) la página ya está abierta y cargada: solo se muestra y se captura.
+    Con `antes` (de `abrir_en_ventanas`) la página ya está abierta y cargada: solo se muestra y se captura.
     La página se ve como con `zoom` en la pantalla de referencia, sin importar la pantalla del equipo.
+    Si el sitio está caído, captura la página de error del navegador y lanza FueraDeServicio con ella.
     """
     with PANTALLA:
-        return _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, preguntar, ventana, zoom)
+        return _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, preguntar, antes, zoom)
 
 
-def _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, preguntar, ventana, zoom) -> Path:
+def _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, preguntar, antes, zoom) -> Path:
     numero = re.sub(r"\D", "", numero)
-    abierta_antes = ventana is not None and ctypes.windll.user32.IsWindow(ventana._hWnd)
-    if abierta_antes:
+    precargada = antes is not None
+    if precargada:
         # Cargó mientras se resolvían los captchas: el margen para el JavaScript de la página ya pasó.
         espera_minima = min(espera_minima, ESPERA_MINIMA)
-        # Minimizada no se dibuja: se muestra como las demás capturas, maximizada.
-        _encima(ventana)
-        ventana = _esperar_pagina(titulo, nombre, preguntar, ventana)
     else:
+        antes = abrir_en_ventanas([url])
+    propia = antes is not None
+    if not propia:
+        # Navegador no reconocido: pestaña nueva, buscada entre todas sus ventanas.
         webbrowser.open(url, new=2)
-        ventana = _esperar_pagina(titulo, nombre, preguntar)
+        antes = set()
+        time.sleep(1)  # La pestaña nueva tarda un instante en tomar el foco.
+    ventana, caida = _esperar_pagina(titulo, nombre, preguntar, antes, url, precargada)
 
     def mostrar():
-        if abierta_antes:
+        if propia:
+            # Minimizada no se dibuja: se muestra como las demás capturas, maximizada.
             _encima(ventana)
             return
         if ventana.isMinimized:
@@ -359,7 +385,9 @@ def _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, 
         # Windows puede negar el foco; la ventana se captura igual si está visible.
         _dar_foco(ventana._hWnd)
 
-    if paso_manual and nombre not in _PASOS_HECHOS:
+    if caida:
+        log(f"{nombre}: {caida}; se captura la página caída.")
+    elif paso_manual and nombre not in _PASOS_HECHOS:
         mostrar()
         preguntar(f"{nombre}: {paso_manual} Pulsa Enter cuando la lista esté visible... ")
         _PASOS_HECHOS.add(nombre)
@@ -368,19 +396,29 @@ def _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, 
     hwnd = ventana._hWnd
     try:
         mostrar()
+        # Encima de todo desde ya: si otra ventana la tapa, Chrome no dibuja la página que estuvo minimizada.
+        _fijar_encima(hwnd, True)
         time.sleep(0.3)
 
         with mss.mss() as sct:
             pantalla = sct.monitors[0]
-            # Recién restaurada, Windows puede tardar en sacarla de minimizada (pasó con el FBI en un equipo cargado).
-            fin = time.time() + 10
+            # Recién restaurada, Windows puede tardar en sacarla de minimizada (pasó con el FBI en un equipo cargado) y
+            # Chrome en volver a dibujar una página que estuvo minimizada un rato (pasó con Consilium).
+            fin = time.time() + 30
+            empujon = time.time() + 5
             while _region_en_pantalla(ventana, pantalla) is None:
                 if time.time() > fin:
                     raise RuntimeError(f"la ventana de {nombre} no mostró la página; no se pudo capturar")
+                if time.time() > empujon:
+                    # A veces Chrome la sigue dando por oculta aunque esté al frente: minimizarla y volver a mostrarla
+                    # la hace dibujar (pasó con Consilium).
+                    ctypes.windll.user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+                    time.sleep(0.5)
+                    empujon = time.time() + 5
                 mostrar()
-                time.sleep(0.5)
+                _fijar_encima(hwnd, True)
+                time.sleep(1)
 
-            _fijar_encima(hwnd, True)
             # Para devolverla como estaba: el navegador usa el tamaño de la última ventana para las nuevas.
             colocacion = _colocacion(hwnd)
             _ajustar_ventana(ventana, zoom, nombre)
@@ -415,12 +453,16 @@ def _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, 
         CAPTURAS.mkdir(exist_ok=True)
         ruta = CAPTURAS / f"{prefijo}_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
         mss.tools.to_png(imagen.rgb, imagen.size, output=str(ruta))
-        if abierta_antes:
-            # La abrió el bot: se cierra sin depender del foco.
-            ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+        if propia:
+            # Las abrió el bot: se cierran sin depender del foco, también la repetida si se abrió de nuevo.
+            for otra in _ventanas_nuevas(antes):
+                if otra._hWnd == hwnd or titulo in otra.title:
+                    ctypes.windll.user32.PostMessageW(otra._hWnd, 0x0010, 0, 0)  # WM_CLOSE
         else:
             # Antes de restaurar la consola, que al activarse quitaría el foco al navegador.
-            _cerrar_pestana(ventana, titulo)
+            _cerrar_pestana(ventana, urlsplit(url).hostname if caida else titulo)
+        if caida:
+            raise FueraDeServicio(caida, ruta)
         return ruta
     finally:
         _fijar_encima(hwnd, False)

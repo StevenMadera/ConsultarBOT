@@ -15,8 +15,8 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
-from captura_navegador import PAGINA_REFERENCIA, PANTALLA, abrir_en_ventana
-from comun import CAPTURAS, avisar, leer_respuesta, log
+from captura_navegador import PAGINA_REFERENCIA, PANTALLA, abrir_en_ventanas
+from comun import CAPTURAS, FueraDeServicio, avisar, leer_respuesta, log
 import documentos
 from documentos import estado_ventana
 from consulta_consilium import consultar_consilium, url_consilium
@@ -270,6 +270,44 @@ def proporcion_zona(clave: str, sexo: str) -> float:
     return zona.height / zona.width
 
 
+def filas_portada(sexo: str) -> list[str]:
+    """Los sitios en el orden de la tabla de la portada: primero las capturas, por página y hueco; luego los PDF."""
+    ubicaciones = UBICACION_PDF[sexo]
+    huecos = ("arriba", "abajo", "unico")
+    orden = sorted(ubicaciones, key=lambda clave: (ubicaciones[clave][0], huecos.index(ubicaciones[clave][1])))
+    return orden + list(documentos.ORDEN)
+
+
+def marcar_fuera_de_servicio(pagina, sexo: str, claves: set[str]):
+    """En la tabla de la portada pasa el chulo de esos sitios de «Verificada» a «Fuera de Servicio»."""
+    if not claves:
+        return
+    def centro(rect):
+        return (rect[0] + rect[2]) / 2
+
+    palabras = pagina.get_text("words")
+    verificada = next(p for p in palabras if p[4] == "Verificada")
+    desplazamiento = centro(next(p for p in palabras if p[4] == "Servicio")) - centro(verificada)
+    chulos = [(pymupdf.Rect(i["bbox"]), i["xref"]) for i in pagina.get_image_info(xrefs=True)
+              if verificada[0] <= centro(i["bbox"]) <= verificada[2]]
+    mover = []
+    for n, clave in enumerate(filas_portada(sexo), start=1):
+        if clave not in claves:
+            continue
+        fila = pagina.search_for(f"Página {n} -")
+        chulo = next(((r, x) for r, x in chulos if fila and fila[0].y0 - 2 < (r.y0 + r.y1) / 2 < fila[0].y1 + 2), None)
+        if chulo is None:
+            log(f"PDF: no se encontró el chulo de la fila {n} ({clave}) en la portada; no se marcó fuera de servicio.")
+            continue
+        mover.append(chulo)
+        pagina.add_redact_annot(chulo[0], fill=False)
+    # Solo se quita la imagen del chulo: la tabla y el texto se quedan.
+    pagina.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_REMOVE, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                            text=pymupdf.PDF_REDACT_TEXT_NONE)
+    for rect, xref in mover:
+        pagina.insert_image(rect + (desplazamiento, 0, desplazamiento, 0), xref=xref)
+
+
 def pegar_captura(pagina, captura: Path, hueco: str):
     zona = zona_pdf(pagina, hueco)
     if hueco == "unico":
@@ -417,11 +455,13 @@ def rellenar_registraduria(pagina, persona: dict) -> int:
             + reescribir_frases(pagina, VALIDEZ_RE, fecha_en_frase(fecha + timedelta(days=30))))
 
 
-def insertar_en_pdf(capturas: dict[str, Path], persona: dict) -> Path:
+def insertar_en_pdf(capturas: dict[str, Path], persona: dict, caidos: set[str] = frozenset()) -> Path:
+    """`caidos`: sitios fuera de servicio; su captura es la página caída."""
     # Mujer.pdf trae un objeto interno mal ubicado: si la reparación automática llega al guardar, descarta los cambios.
     with pymupdf.open(PLANTILLAS[persona["sexo"]]) as plantilla:
         doc = pymupdf.open("pdf", plantilla.tobytes(garbage=3))
     rellenar_portada(doc[0], persona)
+    marcar_fuera_de_servicio(doc[0], persona["sexo"], caidos)
     ubicaciones = UBICACION_PDF[persona["sexo"]]
     for clave, captura in capturas.items():
         if clave in ubicaciones:
@@ -431,10 +471,11 @@ def insertar_en_pdf(capturas: dict[str, Path], persona: dict) -> Path:
     for clave in documentos.ORDEN:
         if clave in capturas:
             with pymupdf.open(capturas[clave]) as anexo:
-                if clave == "contraloria":
+                # La página caída no tiene esas fechas.
+                if clave == "contraloria" and clave not in caidos:
                     if not sum(rellenar_hoy(pagina, persona) for pagina in anexo):
                         log("PDF: no se encontró 'hoy <día> <n> de <mes>' en el documento de la Contraloría; esa fecha no se cambió.")
-                elif clave == "registraduria":
+                elif clave == "registraduria" and clave not in caidos:
                     if sum(rellenar_registraduria(pagina, persona) for pagina in anexo) < 2:
                         log("PDF: no se encontraron las dos fechas ('Expedida el…' y 'hasta el…') en el documento de la Registraduría.")
                 doc.insert_pdf(anexo)
@@ -544,7 +585,7 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
                 break
             except PlaywrightTimeoutError:
                 if carga:
-                    raise ValueError("RUNT: la página no cargó tras recargarla; el sitio está lento o caído.") from None
+                    raise FueraDeServicio("la página no cargó tras recargarla; el sitio está lento o caído") from None
                 log("RUNT: la página no cargó en 60 s; se recarga.")
         await page.locator("mat-select[formcontrolname=tipoDocumento]").click()
         await page.get_by_role("option", name=TIPOS_RUNT[persona["tipo"].upper()], exact=True).click()
@@ -1085,7 +1126,7 @@ async def consultar(page, persona: dict, nombre: str = "Procuraduría") -> Path:
             log(f"{nombre}: contenido de resultado estable aunque cambió el rótulo del portal.")
         break
     if estado == "incidente":
-        log(f"{nombre}: el portal mostró 'problema técnico' (formulario de incidentes); se captura como resultado.")
+        log(f"{nombre}: el portal mostró 'problema técnico' (formulario de incidentes); se captura como fuera de servicio.")
     try:
         await page.wait_for_load_state("networkidle", timeout=10000)
     except PlaywrightTimeoutError:
@@ -1108,6 +1149,8 @@ async def consultar(page, persona: dict, nombre: str = "Procuraduría") -> Path:
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
     await page.screenshot(path=str(ruta), full_page=True)
+    if estado == "incidente":
+        raise FueraDeServicio("el portal mostró el formulario de atención de incidentes (problema técnico)", ruta)
     return ruta
 
 
@@ -1134,7 +1177,8 @@ async def consultar_procuraduria(page, persona: dict) -> Path:
                 if tarea.exception() is None:
                     return tarea.result()
                 error = error or tarea.exception()
-        if error and not pendientes:
+        # El formulario de incidentes ya es el resultado (fuera de servicio) aunque la otra consulta siga esperando.
+        if error and (not pendientes or isinstance(error, FueraDeServicio)):
             raise error
         raise ValueError(f"Procuraduría no mostró un resultado en {ESPERA_PROCURADURIA // 60} minutos; no se generó captura.")
     finally:
@@ -1255,10 +1299,73 @@ async def abrir_navegadores(p) -> dict:
     return r
 
 
-async def en_pestana_nueva(contexto, consulta, persona: dict) -> Path:
+async def capturar_caida(page, clave: str, persona: dict) -> Path:
+    """La página caída para el informe: en PDF si el sitio entrega un documento; si no, una captura con la proporción
+    de su recuadro y un ancho en el que el aviso de error se lee bien."""
+    try:
+        # La página de error del navegador escribe su texto un instante después de aparecer; minimizada no hay
+        # cuadros de animación, por eso se revisa cada 200 ms.
+        await page.wait_for_function("() => document.body?.innerText.trim()", timeout=5000, polling=200)
+    except PlaywrightError:
+        pass
+    if clave in documentos.ORDEN:
+        return await documentos.pdf_de_pagina(page, documentos.ruta_documento(clave, persona))
+    CAPTURAS.mkdir(exist_ok=True)
+    ruta = CAPTURAS / f"{clave}_{re.sub(r'\D', '', persona['numero'])}_{datetime.now():%Y%m%d_%H%M%S}.png"
+    tamano = {"width": 900, "height": round(900 * proporcion_zona(clave, persona["sexo"]))}
+    original = page.viewport_size
+    if original:
+        await page.set_viewport_size(tamano)
+        try:
+            await page.screenshot(path=str(ruta))
+        finally:
+            await page.set_viewport_size(original)
+        return ruta
+    # Ventana visible (sin pantalla virtual de Playwright).
+    cdp = await page.context.new_cdp_session(page)
+    try:
+        await cdp.send("Emulation.setDeviceMetricsOverride", {**tamano, "deviceScaleFactor": 0, "mobile": False})
+        await page.screenshot(path=str(ruta))
+    finally:
+        await cdp.send("Emulation.clearDeviceMetricsOverride")
+        await cdp.detach()
+    return ruta
+
+
+async def con_caida(page, clave: str, persona: dict, consulta) -> Path:
+    """Espera la consulta; si el sitio está caído, lanza FueraDeServicio con la página caída guardada."""
+    try:
+        ruta = await consulta
+    except FueraDeServicio as e:
+        if e.captura is None:
+            try:
+                e.captura = await capturar_caida(page, clave, persona)
+            except PlaywrightError as falla:
+                log(f"{clave}: no se pudo guardar la página caída ({str(falla).splitlines()[0]}).")
+        raise
+    except Exception as e:
+        try:
+            motivo, direccion = await documentos.motivo_caida(page, e)
+            if motivo:
+                if direccion:
+                    await documentos.aviso_tiempo_agotado(page, direccion)
+                captura = await capturar_caida(page, clave, persona)
+        except PlaywrightError as falla:
+            log(f"{clave}: no se pudo guardar la página caída ({str(falla).splitlines()[0]}).")
+            motivo = None
+        if not motivo:
+            raise e
+        raise FueraDeServicio(motivo, captura) from e
+    # Tras enviar el formulario, la página de error del navegador o del servidor se imprimiría como el documento.
+    if clave in documentos.ORDEN and (motivo := await documentos.caida_en_pagina(page)):
+        raise FueraDeServicio(motivo, ruta)
+    return ruta
+
+
+async def en_pestana_nueva(contexto, consulta, persona: dict, clave: str) -> Path:
     page = await contexto.new_page()
     try:
-        return await consulta(page, persona)
+        return await con_caida(page, clave, persona, consulta(page, persona))
     finally:
         await page.close()
 
@@ -1271,27 +1378,32 @@ CONSULTAS_CHROME = {
 }
 
 
-def abrir_paginas_chrome(persona: dict) -> dict:
+def abrir_paginas_chrome(persona: dict) -> set[int] | None:
     """FBI y Consilium solo cargan en Chrome: se abren al empezar, cada una en su ventana minimizada, y cargan
-    mientras se resuelven los captchas; al final solo queda capturarlas."""
+    mientras se resuelven los captchas; al final solo queda capturarlas. Devuelve las ventanas que ya había."""
     with PANTALLA:
-        ventanas = {clave: abrir_en_ventana(url) for clave, url in (("fbi", url_fbi(persona)),
-                                                                     ("consilium", url_consilium(persona)))}
-    for clave, ventana in ventanas.items():
-        if not ventana:
-            log(f"{clave}: no se pudo abrir de antemano en Chrome; se abrirá al capturarla.")
-    return {clave: ventana for clave, ventana in ventanas.items() if ventana}
+        antes = abrir_en_ventanas([url_fbi(persona), url_consilium(persona)])
+    if antes is None:
+        log("Chrome: no se reconoce el navegador por defecto; FBI y Consilium se abrirán al capturarlas.")
+    return antes
 
 
-def consultas_edge(persona: dict, preguntar, claves: list[str], abiertas: dict) -> dict[str, Path]:
+def consultas_edge(persona: dict, preguntar, claves: list[str], antes: set[int] | None,
+                   caidos: set[str]) -> dict[str, Path]:
     """Páginas que bloquean el navegador automático: se capturan en el navegador del usuario, una tras otra."""
     capturas = {}
     for clave in claves:
         avisar("sitio", clave=clave, estado="en_curso")
         try:
-            capturas[clave] = CONSULTAS_CHROME[clave](persona, preguntar, abiertas.get(clave))
+            # State.gov y Justice llegan aquí solo si fallaron sin ventana: se abren ahora.
+            capturas[clave] = CONSULTAS_CHROME[clave](persona, preguntar, antes if clave in ("fbi", "consilium") else None)
             log(f"Captura {clave}: {capturas[clave]}")
             avisar("sitio", clave=clave, estado="listo")
+        except FueraDeServicio as e:
+            capturas[clave] = e.captura
+            caidos.add(clave)
+            log(f"FUERA DE SERVICIO {clave}: {e}; en el informe va la página caída: {e.captura}")
+            avisar("sitio", clave=clave, estado="fuera_servicio", detalle=str(e))
         except Exception as e:
             log(f"ERROR {clave}: {e}")
             avisar("sitio", clave=clave, estado="error", detalle=str(e))
@@ -1303,20 +1415,23 @@ def minutos(segundos: float) -> str:
     return f"{segundos // 60}:{segundos % 60:02d}"
 
 
-async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -> dict[str, Path]:
+async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -> tuple[dict[str, Path], set[str]]:
+    """Las capturas de cada sitio y los sitios fuera de servicio (su captura es la página caída)."""
     inicio = time.monotonic()
     capturas: dict[str, Path] = {}
+    caidos: set[str] = set()
     limite = asyncio.Semaphore(limite_concurrencia())
     # Un captcha a la vez: mientras se resuelve uno, los demás sitios ya se están llenando o procesando el suyo.
     turnos = documentos.Turnos()
     listos = {clave: asyncio.Event() for clave in r["ventanas"]}
-    abiertas = {}
+    antes_chrome = None
     # Si el navegador automático no puede con State.gov o Justice, se capturan en Chrome como antes.
     a_chrome = []
 
     async def abrir_en_chrome():
+        nonlocal antes_chrome
         try:
-            abiertas.update(await asyncio.to_thread(abrir_paginas_chrome, persona))
+            antes_chrome = await asyncio.to_thread(abrir_paginas_chrome, persona)
         except Exception as e:
             log(f"Chrome: no se pudieron abrir de antemano FBI y Consilium ({e}); se abrirán al capturarlas.")
 
@@ -1328,6 +1443,12 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
             capturas[clave] = await consulta
             log(f"Captura {clave}: {capturas[clave]}")
             avisar("sitio", clave=clave, estado="listo")
+        except FueraDeServicio as e:
+            caidos.add(clave)
+            if e.captura:
+                capturas[clave] = e.captura
+            log(f"FUERA DE SERVICIO {clave}: {e}; en el informe va la página caída: {e.captura or 'no se pudo guardar'}")
+            avisar("sitio", clave=clave, estado="fuera_servicio", detalle=str(e))
         except Exception as e:
             # SIMIT, Procuraduría y RUNT cortan las conexiones que llegan por VPN.
             if re.search(r"ERR_CONNECTION_(CLOSED|RESET)", str(e)):
@@ -1335,24 +1456,25 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
             log(f"ERROR {clave}: {e}")
             avisar("sitio", clave=clave, estado="no_aplica" if "no aplica" in str(e) else "error", detalle=str(e))
 
-    async def automatica(clave: str, funcion, *args):
+    async def automatica(clave: str, funcion, page, *args):
         async with limite:
-            await registrar(clave, funcion(*args))
+            await registrar(clave, con_caida(page, clave, persona, funcion(page, *args)))
 
     async def grupo_rapido():
         # Cada una tarda pocos segundos: en serie terminan antes que SIMIT, Procuraduría y RUNT.
         async with limite:
-            await registrar("consolidado", r["consolidado"].buscar(persona))
-            await registrar("consolium", r["consolium"].buscar(persona))
+            for documento in (r["consolidado"], r["consolium"]):
+                await registrar(documento.clave,
+                                con_caida(documento.page, documento.clave, persona, documento.buscar(persona)))
             for clave, consulta in (("ofac", consultar_ofac), ("govuk", consultar_govuk), ("eumostwanted", consultar_eumostwanted)):
-                await registrar(clave, en_pestana_nueva(r["grupo"], consulta, persona))
+                await registrar(clave, en_pestana_nueva(r["grupo"], consulta, persona, clave))
 
     async def grupo_documentos():
         # Sitios sin captcha que entregan un PDF (páginas 14, 15 y 18).
         async with limite:
             for clave, consulta in (("bdme", documentos.consultar_bdme), ("contraloria", documentos.consultar_contraloria),
                                     ("rnmc", documentos.consultar_rnmc)):
-                await registrar(clave, en_pestana_nueva(r["documentos"], consulta, persona))
+                await registrar(clave, en_pestana_nueva(r["documentos"], consulta, persona, clave))
 
     async def grupo_eeuu():
         async with limite:
@@ -1383,7 +1505,9 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
                     page = r["ventanas"][clave] = await page.context.new_page()
                     await estado_ventana(page, "minimized")
                 try:
-                    return await consulta(page, persona, *args, turnos, listos[clave])
+                    return await con_caida(page, clave, persona, consulta(page, persona, *args, turnos, listos[clave]))
+                except FueraDeServicio:
+                    raise
                 except Exception:
                     if page.is_closed() and not intento:
                         log(f"{clave}: se cerró su ventana durante la consulta; se abre otra y se repite.")
@@ -1419,7 +1543,8 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
             avisar("capturando", claves=claves)
             try:
                 # Las que no se pudieron abrir de antemano se abren al capturarlas, como antes.
-                capturas.update(await asyncio.to_thread(consultas_edge, persona, preguntar_edge, claves, abiertas))
+                capturas.update(await asyncio.to_thread(consultas_edge, persona, preguntar_edge, claves, antes_chrome,
+                                                        caidos))
             finally:
                 avisar("capturando", claves=[])
             log(f"Tiempo: capturas en Chrome {minutos(time.monotonic() - desde)}")
@@ -1446,7 +1571,7 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
         con_captcha("inhabilidades", documentos.consultar_inhabilidades),
         edge(),
     )
-    return capturas
+    return capturas, caidos
 
 
 async def procesar(persona: dict, apertura: asyncio.Task, preguntar, preguntar_edge) -> Path | None:
@@ -1458,8 +1583,8 @@ async def procesar(persona: dict, apertura: asyncio.Task, preguntar, preguntar_e
         f"expedición {persona['fecha_expedicion']:%d/%m/%Y} | {persona['sexo']} | "
         f"apellido RUNT: {primer_apellido(persona['nombre'])}"
     )
-    capturas = await consultar_persona(persona, await apertura, preguntar, preguntar_edge)
-    ruta = insertar_en_pdf(capturas, persona) if capturas else None
+    capturas, caidos = await consultar_persona(persona, await apertura, preguntar, preguntar_edge)
+    ruta = insertar_en_pdf(capturas, persona, caidos) if capturas else None
     if ruta:
         log(f"PDF: {ruta}")
     log(f"Tiempo total: {minutos(time.monotonic() - inicio)}")
