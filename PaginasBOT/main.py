@@ -15,7 +15,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
-from captura_navegador import PANTALLA, abrir_en_ventana
+from captura_navegador import PAGINA_REFERENCIA, PANTALLA, abrir_en_ventana
 from comun import CAPTURAS, avisar, leer_respuesta, log
 import documentos
 from documentos import estado_ventana
@@ -494,19 +494,24 @@ CAJA_AVISO_JS = """e => {
 }"""
 
 
+async def pantalla_referencia(cdp, alto: int = PAGINA_REFERENCIA[1]):
+    """La página de la ventana visible se dibuja con el ancho de la pantalla de referencia, no con el de este equipo."""
+    await cdp.send("Emulation.setDeviceMetricsOverride",
+                   {"width": PAGINA_REFERENCIA[0], "height": alto, "deviceScaleFactor": 0, "mobile": False})
+
+
 async def captura_aviso_sobre_datos(page, ruta: Path, aviso):
     """El aviso se centra en la pantalla y tapa los datos consultados: se captura en una pantalla virtual más alta
     para que quede debajo de ellos."""
-    ancho, alto = await page.evaluate("[innerWidth, innerHeight]")
-    datos_abajo = await page.locator("input[formcontrolname=primerApellido]").evaluate("e => e.getBoundingClientRect().bottom")
-    caja = await aviso.evaluate(CAJA_AVISO_JS)
-    alto_necesario = max(alto, round(2 * (datos_abajo + 30) + caja["alto"]))
+    ancho, alto = PAGINA_REFERENCIA
     cdp = await page.context.new_cdp_session(page)
     try:
-        await cdp.send(
-            "Emulation.setDeviceMetricsOverride",
-            {"width": ancho, "height": alto_necesario, "deviceScaleFactor": 0, "mobile": False},
-        )
+        await pantalla_referencia(cdp)
+        await page.wait_for_timeout(500)
+        datos_abajo = await page.locator("input[formcontrolname=primerApellido]").evaluate("e => e.getBoundingClientRect().bottom")
+        caja = await aviso.evaluate(CAJA_AVISO_JS)
+        alto_necesario = max(alto, round(2 * (datos_abajo + 30) + caja["alto"]))
+        await pantalla_referencia(cdp, alto_necesario)
         await page.wait_for_timeout(500)
         caja = await aviso.evaluate(CAJA_AVISO_JS)
         recorte = {"x": 0, "y": 0, "width": ancho, "height": min(alto_necesario, round(caja["abajo"]) + 30)}
@@ -616,9 +621,16 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
         log("RUNT: no se encontró el apartado de licencias de conducción")
 
     await esperar_sin_carga(page)
-    await page.evaluate(ir_arriba)
-    await page.wait_for_timeout(300)
-    await page.screenshot(path=str(ruta), full_page=True)
+    cdp = await page.context.new_cdp_session(page)
+    try:
+        await pantalla_referencia(cdp)
+        await page.wait_for_timeout(500)
+        await page.evaluate(ir_arriba)
+        await page.wait_for_timeout(300)
+        await page.screenshot(path=str(ruta), full_page=True)
+    finally:
+        await cdp.send("Emulation.clearDeviceMetricsOverride")
+        await cdp.detach()
     return ruta
 
 

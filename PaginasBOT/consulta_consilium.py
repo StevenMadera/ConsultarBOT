@@ -25,6 +25,7 @@ def consultar_consilium(persona: dict, preguntar=input, ventana=None) -> Path:
         espera_minima=5,
         preguntar=preguntar,
         ventana=ventana,
+        zoom=0.75,
     )
 
 

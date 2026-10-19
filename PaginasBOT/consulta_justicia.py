@@ -24,4 +24,5 @@ def consultar_justicia(persona: dict, preguntar=input, ventana=None) -> Path:
         persona["numero"],
         preguntar=preguntar,
         ventana=ventana,
+        zoom=2 / 3,
     )
