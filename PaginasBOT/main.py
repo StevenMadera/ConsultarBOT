@@ -1346,15 +1346,17 @@ async def con_caida(page, clave: str, persona: dict, consulta) -> Path:
     except Exception as e:
         try:
             motivo, direccion = await documentos.motivo_caida(page, e)
-            if motivo:
-                if direccion:
-                    await documentos.aviso_tiempo_agotado(page, direccion)
-                captura = await capturar_caida(page, clave, persona)
-        except PlaywrightError as falla:
-            log(f"{clave}: no se pudo guardar la página caída ({str(falla).splitlines()[0]}).")
+        except PlaywrightError:
             motivo = None
         if not motivo:
-            raise e
+            raise
+        captura = None
+        try:
+            if direccion:
+                await documentos.aviso_tiempo_agotado(page, direccion)
+            captura = await capturar_caida(page, clave, persona)
+        except PlaywrightError as falla:
+            log(f"{clave}: no se pudo guardar la página caída ({str(falla).splitlines()[0]}).")
         raise FueraDeServicio(motivo, captura) from e
     # Tras enviar el formulario, la página de error del navegador o del servidor se imprimiría como el documento.
     if clave in documentos.ORDEN and (motivo := await documentos.caida_en_pagina(page)):
@@ -1497,7 +1499,12 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
     async def con_captcha(clave: str, consulta, *args):
         async def ejecutar():
             # Si la precarga sigue en curso se espera; si falló, la consulta vuelve a cargar la página.
-            await asyncio.gather(r["precargas"][clave], return_exceptions=True)
+            precarga = r["precargas"][clave]
+            esperada = not precarga.done()
+            await asyncio.gather(precarga, return_exceptions=True)
+            # Si el sitio no respondió a la precarga mientras se la esperaba, ya está caído: no se espera otra carga.
+            error = None if precarga.cancelled() else precarga.exception()
+            caido = esperada and isinstance(error, PlaywrightTimeoutError) and str(error).startswith("Page.goto:")
             for intento in range(2):
                 page = r["ventanas"][clave]
                 if page.is_closed():
@@ -1505,7 +1512,8 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
                     page = r["ventanas"][clave] = await page.context.new_page()
                     await estado_ventana(page, "minimized")
                 try:
-                    return await con_caida(page, clave, persona, consulta(page, persona, *args, turnos, listos[clave]))
+                    return await con_caida(page, clave, persona, precarga if caido else
+                                           consulta(page, persona, *args, turnos, listos[clave]))
                 except FueraDeServicio:
                     raise
                 except Exception:

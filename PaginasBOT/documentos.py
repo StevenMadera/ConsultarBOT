@@ -12,7 +12,7 @@ import pymupdf
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from comun import CAPTURAS, avisar, log
+from comun import CAPTURAS, FueraDeServicio, avisar, log
 
 ORDEN = ("bdme", "contraloria", "antecedentes", "registraduria", "rnmc", "inhabilidades")
 
@@ -34,6 +34,18 @@ TIPOS_INHABILIDADES = {"CC": "CC", "CE": "CX"}
 RECAPTCHA_RESUELTO_JS = """() => [...document.querySelectorAll('textarea[name=g-recaptcha-response]')]
     .some(t => t.value.length > 0)"""
 ESPERA_CAPTCHA = 180000
+# Segundos que la casilla de Google puede seguir sin dejarse marcar (sin terminar de cargar, o girando tras pulsarla
+# sin abrir las imágenes) antes de dar el sitio por fuera de servicio. Funcionando, responde en 1-3 s.
+ESPERA_CASILLA = 30
+ESTADO_CASILLA_JS = """e => {
+    const r = e.getBoundingClientRect(), giro = e.querySelector('.recaptcha-checkbox-spinner');
+    return {lista: r.width > 0 && r.height > 0, girando: !!giro && parseFloat(getComputedStyle(giro).opacity) > 0};
+}"""
+# El recuadro de las imágenes de Google: va en la página, oculto (visibility hidden) mientras no se usa.
+DESAFIO_VISIBLE_JS = """() => [...document.querySelectorAll('iframe[src*="/bframe"]')].some(f => {
+    const r = f.getBoundingClientRect();
+    return getComputedStyle(f).visibility === 'visible' && r.height > 100 && r.bottom > 0;
+})"""
 # Segundos que un captcha aguanta cargado: después el código cambia o Google da la casilla por caducada.
 VIGENCIA_CAPTCHA = 60
 # Mientras espera su turno, la página se recarga cuando le quedan estos segundos de vigencia.
@@ -282,19 +294,19 @@ async def imprimir_pdf(page, ruta: Path, fecha_consulta: str, fondos: bool = Fal
 
 
 async def pdf_de_pagina(page, ruta: Path) -> Path:
-    """La página tal como está, en A4: lo mismo que Imprimir > Guardar como PDF. Si la impresión no responde (pasó
-    con la página de error del navegador), la captura de la página en una hoja A4."""
+    """La página tal como está, en A4: lo mismo que Imprimir > Guardar como PDF. Si la impresión falla o no responde
+    (pasó con la página de error del navegador), la captura de la página en una hoja A4."""
     cdp = await page.context.new_cdp_session(page)
     try:
         datos = await asyncio.wait_for(
             cdp.send("Page.printToPDF", {"paperWidth": 8.27, "paperHeight": 11.69, "printBackground": True}), 20)
-    except TimeoutError:
+    except (TimeoutError, PlaywrightError):
         datos = None
     finally:
         with contextlib.suppress(PlaywrightError, TimeoutError):
             await asyncio.wait_for(cdp.detach(), 5)
     if datos is None:
-        log(f"{ruta.stem}: la impresión de la página no respondió; se guarda su captura en PDF.")
+        log(f"{ruta.stem}: la impresión de la página falló; se guarda su captura en PDF.")
         return imagen_a_pdf(await page.screenshot(timeout=15000), ruta)
     ruta.write_bytes(base64.b64decode(datos["data"]))
     return ruta
@@ -375,11 +387,25 @@ async def pdf_del_sitio_o_captura(page, boton, ruta: Path) -> Path:
     return await pagina_a_pdf(page, ruta)
 
 
+async def casilla_atascada(page, recuadro) -> bool:
+    """True si la casilla de Google no se puede marcar: no terminó de cargar, o gira sin abrir las imágenes."""
+    casilla = recuadro.content_frame.locator("#recaptcha-anchor")
+    try:
+        estado = await casilla.evaluate(ESTADO_CASILLA_JS, timeout=1000) if await casilla.count() else None
+        if estado and estado["lista"] and not estado["girando"]:
+            return False
+        return not await page.evaluate(DESAFIO_VISIBLE_JS)
+    except PlaywrightError:
+        return True
+
+
 async def esperar_recaptcha(page, sitio: str, recuadro) -> bool:
-    """True cuando la casilla queda marcada; False si Google la da por caducada."""
+    """True cuando la casilla queda marcada; False si Google la da por caducada. Si la casilla no se deja marcar
+    durante ESPERA_CASILLA segundos, el sitio está fuera de servicio."""
     caducada = recuadro.content_frame.locator(".rc-anchor-error-msg-container")
     inicio = time.monotonic()
     limite = inicio + ESPERA_CAPTCHA / 1000
+    atascada_desde = None
     avisar("accion", titulo=sitio, texto="Marca «No soy un robot» en la ventana del navegador. Sigue solo al marcarla.")
     try:
         while time.monotonic() < limite:
@@ -388,6 +414,16 @@ async def esperar_recaptcha(page, sitio: str, recuadro) -> bool:
                 return True
             if await caducada.is_visible():
                 return False
+            if not await casilla_atascada(page, recuadro):
+                atascada_desde = None
+            elif atascada_desde is None:
+                atascada_desde = time.monotonic()
+            elif time.monotonic() - atascada_desde >= ESPERA_CASILLA:
+                motivo = f"la casilla «No soy un robot» no terminó de cargar en {ESPERA_CASILLA} s"
+                with contextlib.suppress(PlaywrightError):
+                    if re.search(r"cuota|quota", await recuadro.content_frame.locator("body").inner_text(timeout=2000), re.I):
+                        motivo += " (Google avisa que el sitio superó su cuota gratuita de reCAPTCHA)"
+                raise FueraDeServicio(motivo)
             await asyncio.sleep(0.5)
         raise ValueError(f"{sitio}: no se resolvió el captcha en {ESPERA_CAPTCHA // 60000} minutos.")
     finally:
@@ -487,7 +523,7 @@ async def consultar_antecedentes(page, persona: dict, turnos: Turnos, listo) -> 
                 break
             except PlaywrightTimeoutError:
                 if carga:
-                    raise ValueError("Antecedentes (Policía): la casilla «No soy un robot» no apareció ni recargando.") from None
+                    raise FueraDeServicio("la casilla «No soy un robot» no apareció ni recargando la página") from None
                 log("Antecedentes (Policía): la casilla no apareció en 30 s; se recarga la página.")
         lleno_en = time.monotonic()
 
@@ -602,7 +638,10 @@ async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) ->
             await terminos.evaluate("e => e.click()")
         if not await terminos.is_checked():
             raise ValueError("Inhabilidades (Policía): no se pudo marcar la casilla de términos de uso.")
-        await recaptcha.wait_for(state="visible", timeout=60000)
+        try:
+            await recaptcha.wait_for(state="visible", timeout=ESPERA_CASILLA * 1000)
+        except PlaywrightTimeoutError:
+            raise FueraDeServicio(f"la casilla «No soy un robot» no apareció en {ESPERA_CASILLA} s") from None
         lleno_en = time.monotonic()
 
     resultado = page.locator("#res")
