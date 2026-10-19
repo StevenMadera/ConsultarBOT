@@ -15,11 +15,13 @@ _oyente = None
 
 class FueraDeServicio(Exception):
     """El sitio no respondió o mostró un error propio: en el informe va `captura`, la página caída (PNG o PDF).
-    Sin `captura`, quien tiene la página la guarda tal como quedó."""
+    Sin `captura`, quien tiene la página la guarda tal como quedó; con `direccion`, antes deja en ella el aviso de
+    Chrome de que esa dirección no respondió."""
 
-    def __init__(self, motivo: str, captura: Path | None = None):
+    def __init__(self, motivo: str, captura: Path | None = None, direccion: str | None = None):
         super().__init__(motivo)
         self.captura = captura
+        self.direccion = direccion
 
 
 def escuchar(funcion):

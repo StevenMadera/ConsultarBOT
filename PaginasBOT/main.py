@@ -1339,6 +1339,8 @@ async def con_caida(page, clave: str, persona: dict, consulta) -> Path:
     except FueraDeServicio as e:
         if e.captura is None:
             try:
+                if e.direccion:
+                    await documentos.aviso_tiempo_agotado(page, e.direccion)
                 e.captura = await capturar_caida(page, clave, persona)
             except PlaywrightError as falla:
                 log(f"{clave}: no se pudo guardar la página caída ({str(falla).splitlines()[0]}).")

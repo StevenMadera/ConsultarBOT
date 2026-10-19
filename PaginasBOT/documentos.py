@@ -342,7 +342,20 @@ async def motivo_caida(page, error: Exception) -> tuple[str | None, str | None]:
     if agotado:
         direccion = re.search(r'navigating to "([^"]+)"', texto)
         return f"el sitio no respondió en {int(agotado[1]) // 1000} s", direccion[1] if direccion else page.url
-    return await caida_en_pagina(page), None
+    try:
+        return await asyncio.wait_for(caida_en_pagina(page), 10), None
+    except TimeoutError:
+        # Un envío de formulario sigue sin respuesta: hasta cortarlo, la página no contesta.
+        return "el sitio no respondió", page.url
+
+
+async def detener_carga(page):
+    """Corta la carga pendiente: mientras un envío espera respuesta, evaluate y los localizadores no contestan."""
+    cdp = await page.context.new_cdp_session(page)
+    try:
+        await cdp.send("Page.stopLoading")
+    finally:
+        await cdp.detach()
 
 
 async def aviso_tiempo_agotado(page, url: str):
@@ -355,11 +368,7 @@ async def aviso_tiempo_agotado(page, url: str):
             await route.continue_()
 
     # La carga que sigue esperando retiene la dirección unos 20 s: se detiene antes de pedirla otra vez.
-    cdp = await page.context.new_cdp_session(page)
-    try:
-        await cdp.send("Page.stopLoading")
-    finally:
-        await cdp.detach()
+    await detener_carga(page)
     await page.route("**/*", agotar)
     try:
         await page.goto(url, wait_until="commit", timeout=15000)
@@ -511,10 +520,14 @@ async def consultar_antecedentes(page, persona: dict, turnos: Turnos, listo) -> 
         for carga in range(2):
             await page.goto(URL_ANTECEDENTES, wait_until="domcontentloaded", timeout=60000)
             await acepto.or_(cedula).first.wait_for(timeout=60000)
-            if await acepto.is_visible():
-                await acepto.check()
-                await page.locator("#continuarBtn").click()
-            await cedula.wait_for(state="visible", timeout=60000)
+            try:
+                if await acepto.is_visible():
+                    await acepto.check()
+                    # Sin respuesta del sitio, el clic espera la página nueva 30 s y falla.
+                    await page.locator("#continuarBtn").click()
+                await cedula.wait_for(state="visible", timeout=60000)
+            except PlaywrightTimeoutError:
+                raise FueraDeServicio("el sitio no abrió el formulario de consulta", direccion=URL_ANTECEDENTES) from None
             await page.locator("#cedulaTipo").select_option(tipo)
             await cedula.fill(persona["numero"])
             try:
@@ -528,6 +541,8 @@ async def consultar_antecedentes(page, persona: dict, turnos: Turnos, listo) -> 
         lleno_en = time.monotonic()
 
     await llenar()
+    # Motivo si el último intento falló por el sitio: no respondió o perdió la consulta.
+    caida = None
     for intento in range(3):
         if intento:
             await llenar()
@@ -541,6 +556,7 @@ async def consultar_antecedentes(page, persona: dict, turnos: Turnos, listo) -> 
             log("Antecedentes (Policía): marca 'No soy un robot' en la ventana que quedó al frente.")
             if not await esperar_recaptcha(page, "Antecedentes (Policía)", recuadro):
                 log("Antecedentes (Policía): Google dio la casilla por caducada; se carga de nuevo la página.")
+                caida = None
                 continue
             try:
                 # El resultado llega en una página nueva; si el sitio rechaza la casilla, vuelve el formulario con un aviso.
@@ -550,14 +566,24 @@ async def consultar_antecedentes(page, persona: dict, turnos: Turnos, listo) -> 
                     turno.soltar()
                     listo.set()
             except PlaywrightTimeoutError:
-                log(f"Antecedentes (Policía): el sitio no respondió en 1 minuto, intento {intento + 1}/3.")
+                log(f"Antecedentes (Policía): el sitio no respondió a la consulta, intento {intento + 1}/3.")
+                caida = "el sitio no respondió a la consulta"
+                await detener_carga(page)
                 continue
+        if await acepto.count():
+            # Si el servidor perdió la sesión, en vez del resultado vuelven los términos de uso con «No acepto» marcado.
+            log(f"Antecedentes (Policía): el sitio volvió a los términos de uso sin el resultado, intento {intento + 1}/3.")
+            caida = "el sitio volvió a los términos de uso sin dar el resultado"
+            continue
         if not await cedula.count():
             break
+        caida = None
         aviso = " ".join(" ".join(await page.locator(".ui-messages").all_inner_texts()).split())
         log(f"Antecedentes (Policía): el sitio no mostró el resultado ({aviso or 'volvió el formulario'}), "
             f"intento {intento + 1}/3.")
     else:
+        if caida:
+            raise FueraDeServicio(f"{caida} (3 intentos)", direccion=URL_ANTECEDENTES)
         raise ValueError("Antecedentes (Policía): no se obtuvo el resultado tras 3 intentos.")
     return await imprimir_pdf(page, ruta_documento("antecedentes", persona), fecha_informe(persona))
 
@@ -654,6 +680,8 @@ async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) ->
 
     await llenar()
     page.on("dialog", aviso)
+    # Motivo si el último intento falló porque el sitio no respondió a la consulta.
+    caida = None
     try:
         for intento in range(3):
             if intento:
@@ -664,6 +692,7 @@ async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) ->
                         or time.monotonic() - lleno_en > VIGENCIA_CAPTCHA:
                     await llenar()
                 avisos.clear()
+                caida = None
                 await al_frente(page)
                 await recaptcha.evaluate("e => e.scrollIntoView({block: 'center'})")
                 log("Inhabilidades (Policía): marca 'No soy un robot' en la ventana que quedó al frente.")
@@ -677,14 +706,22 @@ async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) ->
                         # Mientras el sitio responde ya se puede resolver el captcha siguiente.
                         turno.soltar()
                         listo.set()
-                except PlaywrightTimeoutError:
-                    pass
+                except PlaywrightTimeoutError as e:
+                    # Agotado el clic, el envío sigue sin respuesta; sin cortarlo, la página no contesta.
+                    if str(e).startswith("Locator.click"):
+                        caida = "el sitio no respondió a la consulta"
+                        await detener_carga(page)
             if await resultado.count():
                 break
+            if caida:
+                log(f"Inhabilidades (Policía): el sitio no respondió a la consulta en 30 s, intento {intento + 1}/3.")
+                continue
             motivo = avisos + await page.locator(".text-validation").all_inner_texts()
             log(f"Inhabilidades (Policía): el sitio no mostró el resultado "
                 f"({'; '.join(motivo) or 'devolvió el formulario vacío'}), intento {intento + 1}/3.")
         else:
+            if caida:
+                raise FueraDeServicio(f"{caida} (3 intentos)", direccion=URL_INHABILIDADES)
             raise ValueError("Inhabilidades (Policía): el sitio no mostró el resultado tras 3 intentos.")
     finally:
         page.remove_listener("dialog", aviso)
