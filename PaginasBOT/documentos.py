@@ -519,7 +519,13 @@ async def consultar_antecedentes(page, persona: dict, turnos: Turnos, listo) -> 
         nonlocal lleno_en
         for carga in range(2):
             await page.goto(URL_ANTECEDENTES, wait_until="domcontentloaded", timeout=60000)
-            await acepto.or_(cedula).first.wait_for(timeout=60000)
+            try:
+                await acepto.or_(cedula).first.wait_for(timeout=60000)
+            except PlaywrightTimeoutError:
+                if carga:
+                    raise FueraDeServicio("la página no cargó ni recargándola", direccion=URL_ANTECEDENTES) from None
+                log("Antecedentes (Policía): la página no cargó en 60 s; se recarga.")
+                continue
             try:
                 if await acepto.is_visible():
                     await acepto.check()
@@ -592,14 +598,23 @@ async def consultar_registraduria(page, persona: dict, preguntar, turnos: Turnos
     if persona["tipo"] != "CC":
         raise ValueError("La Registraduría solo certifica cédulas de ciudadanía; no aplica.")
     fecha = persona["fecha_expedicion"]
+    cedula = page.locator("#ContentPlaceHolder1_TextBox1")
     codigo = page.locator("#ContentPlaceHolder1_TextBox2")
     imagen = page.locator("#datos_contentplaceholder1_captcha1_CaptchaImage")
     lleno_en = 0.0
 
     async def llenar():
         nonlocal lleno_en
-        await page.goto(URL_REGISTRADURIA, wait_until="domcontentloaded", timeout=60000)
-        await page.locator("#ContentPlaceHolder1_TextBox1").fill(persona["numero"])
+        for carga in range(2):
+            await page.goto(URL_REGISTRADURIA, wait_until="domcontentloaded", timeout=60000)
+            try:
+                await cedula.wait_for(timeout=30000)
+                break
+            except PlaywrightTimeoutError:
+                if carga:
+                    raise FueraDeServicio("la página no cargó ni recargándola", direccion=URL_REGISTRADURIA) from None
+                log("Registraduría: la página no cargó en 30 s; se recarga.")
+        await cedula.fill(persona["numero"])
         await page.locator("#ContentPlaceHolder1_DropDownList1").select_option(f"{fecha.day:02d}")
         await page.locator("#ContentPlaceHolder1_DropDownList2").select_option(f"{fecha.month:02d}")
         await page.locator("#ContentPlaceHolder1_DropDownList3").select_option(str(fecha.year))

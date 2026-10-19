@@ -23,7 +23,7 @@ import comun
 from captura_navegador import PANTALLA
 from comun import NOMBRE, RAIZ, log
 from main import (CAMPOS, FORMATO, SALIDAS, SEXOS, abrir_navegadores, cerrar_navegadores, minutos, partir_fila,
-                  procesar, validar)
+                  procesar, sitios_de, validar)
 
 # actualizar.py está en la carpeta que contiene las apps; si PaginasBOT se copió sola, no hay botón de actualizar.
 sys.path.append(str(RAIZ.parent))
@@ -57,6 +57,9 @@ SITIOS = {
     "consolium": "EUR-Lex", "eumostwanted": "EU Most Wanted", "consilium": "Consilium", "bdme": "BDME",
     "contraloria": "Contraloría", "antecedentes": "Antecedentes", "registraduria": "Registraduría", "rnmc": "RNMC",
     "inhabilidades": "Inhabilidades",
+    # Solo en el formato de GALLAGHER.
+    "insight": "InSight Crime", "contadores": "Junta de Contadores", "dian": "DIAN ficticios", "samm": "SAMM (armas)",
+    "bid": "BID", "canada": "Canadá", "tesoro": "OFAC (Tesoro)",
 }
 ESTADOS = {
     "pendiente": ("○", APAGADO),
@@ -523,7 +526,7 @@ class Interfaz:
     def _preparar_progreso(self, persona: dict):
         for hijo in self.rejilla.winfo_children():
             hijo.destroy()
-        claves = [clave for clave in SITIOS if clave != "libreta" or persona["sexo"] == "Hombre"]
+        claves = sitios_de(persona)
         self.sitios = dict.fromkeys(claves, "pendiente")
         self.detalles = {}
         self.chips = {}
