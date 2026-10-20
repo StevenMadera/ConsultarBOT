@@ -13,6 +13,8 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from comun import CAPTURAS, FueraDeServicio, avisar, log
+from carga_paginas import cargar_pagina, cerrar_secundarias, instante_carga, marcar_precarga, pagina_actual
+from rendimiento import etapa
 
 ORDEN = ("bdme", "contraloria", "antecedentes", "registraduria", "rnmc", "inhabilidades")
 
@@ -74,10 +76,15 @@ async def al_frente(page):
     await page.bring_to_front()
 
 
-async def precargar(page, url: str):
-    """Abre la página minimizada al iniciar: en la consulta carga desde la caché."""
+async def precargar(page, url: str, lista=None):
+    """Deja el formulario listo para reutilizarlo una vez, mientras su captcha siga vigente."""
     await estado_ventana(page, "minimized")
-    await page.goto(url, wait_until="domcontentloaded", timeout=90000)
+    try:
+        lista_page = await cargar_pagina(page, url, lista)
+        marcar_precarga(lista_page, url)
+    except BaseException:
+        await cerrar_secundarias(page)
+        raise
 
 
 class Turno:
@@ -112,6 +119,10 @@ class Turnos:
         self._repartir()
 
     async def _esperar(self, prioridad: int, segundos: float | None) -> bool:
+        with etapa("cola"):
+            return await self._esperar_turno(prioridad, segundos)
+
+    async def _esperar_turno(self, prioridad: int, segundos: float | None) -> bool:
         """True cuando le toca el turno; False si antes pasan `segundos`."""
         futuro = asyncio.get_running_loop().create_future()
         entrada = (prioridad, next(self._orden), futuro)
@@ -253,7 +264,46 @@ FECHA_CONSULTA_JS = r"""(fechaConsulta) => {
     }
 }"""
 
+FECHA_PROCURADURIA_JS = r"""(fechaConsulta) => {
+    const [dia, mes, anio] = fechaConsulta.split('/').map(Number);
+    const fecha = new Date(Date.UTC(anio, mes - 1, dia));
+    const diaSemana = new Intl.DateTimeFormat('es-CO', {weekday: 'long', timeZone: 'UTC'}).format(fecha);
+    const nombreMes = new Intl.DateTimeFormat('es-CO', {month: 'long', timeZone: 'UTC'}).format(fecha);
+    const fechaLarga = `${diaSemana}, ${nombreMes} ${dia}, ${anio}`;
+    const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+        acceptNode: n => n.parentElement.closest('script, style, noscript')
+            ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT
+    });
+    const nodos = [];
+    let texto = '';
+    for (let n; (n = w.nextNode());) {
+        nodos.push({n, inicio: texto.length, fin: texto.length + n.nodeValue.length});
+        texto += n.nodeValue;
+    }
+    const patron = /fecha\s*(?:de\s*)?consulta\s*:?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{4}|[a-záéíóúñ]+\s*,\s*[a-záéíóúñ]+\s+\d{1,2}\s*,\s*\d{4})\b/gi;
+    const fechas = [...texto.matchAll(patron)];
+    for (const hallado of fechas.reverse()) {
+        const fin = hallado.index + hallado[0].length;
+        const inicio = fin - hallado[1].length;
+        const nueva = /^\d/.test(hallado[1]) ? fechaConsulta : fechaLarga;
+        let escrito = false;
+        for (const {n, inicio: desde, fin: hasta} of nodos) {
+            if (hasta <= inicio || desde >= fin) continue;
+            n.nodeValue = n.nodeValue.slice(0, Math.max(0, inicio - desde))
+                + (escrito ? '' : nueva)
+                + n.nodeValue.slice(Math.min(n.nodeValue.length, fin - desde));
+            escrito = true;
+        }
+    }
+    return fechas.length;
+}"""
+
 async def pagina_a_pdf(page, ruta: Path) -> Path:
+    with etapa("captura"):
+        return await _pagina_a_pdf(page, ruta)
+
+
+async def _pagina_a_pdf(page, ruta: Path) -> Path:
     if page.viewport_size:
         ancho = await page.evaluate(ANCHO_CONTENIDO_JS)
         if ancho > page.viewport_size["width"]:
@@ -280,6 +330,11 @@ async def reducir_recortados(cdp, page):
 
 
 async def imprimir_pdf(page, ruta: Path, fecha_consulta: str, fondos: bool = False) -> Path:
+    with etapa("captura"):
+        return await _imprimir_pdf(page, ruta, fecha_consulta, fondos)
+
+
+async def _imprimir_pdf(page, ruta: Path, fecha_consulta: str, fondos: bool = False) -> Path:
     """Lo mismo que Imprimir > Guardar como PDF en Chrome: hoja A4 como la plantilla, con las hojas que necesite.
     Toda fecha dd/mm/aaaa de la página queda como `fecha_consulta`."""
     await page.evaluate(FECHA_CONSULTA_JS, fecha_consulta)
@@ -409,6 +464,11 @@ async def casilla_atascada(page, recuadro) -> bool:
 
 
 async def esperar_recaptcha(page, sitio: str, recuadro) -> bool:
+    with etapa("usuario"):
+        return await _esperar_recaptcha(page, sitio, recuadro)
+
+
+async def _esperar_recaptcha(page, sitio: str, recuadro) -> bool:
     """True cuando la casilla queda marcada; False si Google la da por caducada. Si la casilla no se deja marcar
     durante ESPERA_CASILLA segundos, el sitio está fuera de servicio."""
     caducada = recuadro.content_frame.locator(".rc-anchor-error-msg-container")
@@ -467,7 +527,7 @@ async def esperar_cambio(page, texto_antes: str, espera: int = 60000):
 
 
 async def consultar_bdme(page, persona: dict) -> Path:
-    await page.goto(URL_BDME, wait_until="domcontentloaded", timeout=60000)
+    page = await cargar_pagina(page, URL_BDME, lambda p: p.locator("#Documento").wait_for(timeout=60000))
     await page.locator("#Documento").fill(persona["numero"])
     antes = await page.evaluate("document.body.innerText")
     await page.locator("#button").click()
@@ -477,7 +537,7 @@ async def consultar_bdme(page, persona: dict) -> Path:
 
 async def consultar_contraloria(page, persona: dict) -> Path:
     tipo = tipo_para(TIPOS_CONTRALORIA, persona, "La Contraloría")
-    await page.goto(URL_CONTRALORIA, wait_until="domcontentloaded", timeout=60000)
+    page = await cargar_pagina(page, URL_CONTRALORIA, lambda p: p.locator("#ddlTipoDocumento").wait_for(timeout=60000))
     await page.locator("#ddlTipoDocumento").select_option(tipo)
     await page.locator("#txtNumeroDocumento").fill(persona["numero"])
     # El captcha del sitio no se toca: el certificado se descarga sin él.
@@ -486,7 +546,7 @@ async def consultar_contraloria(page, persona: dict) -> Path:
 
 async def consultar_rnmc(page, persona: dict) -> Path:
     tipo = tipo_para(TIPOS_RNMC, persona, "El RNMC")
-    await page.goto(URL_RNMC, wait_until="domcontentloaded", timeout=60000)
+    page = await cargar_pagina(page, URL_RNMC, lambda p: p.locator("#ctl00_ContentPlaceHolder3_ddlTipoDoc").wait_for(timeout=60000))
     await page.locator("#ctl00_ContentPlaceHolder3_ddlTipoDoc").select_option(tipo)
     fecha = page.locator("#txtFechaexp")
     try:
@@ -509,42 +569,24 @@ async def consultar_rnmc(page, persona: dict) -> Path:
 
 
 async def consultar_antecedentes(page, persona: dict, turnos: Turnos, listo) -> Path:
+    page = pagina_actual(page)
     tipo = tipo_para(TIPOS_ANTECEDENTES, persona, "Antecedentes (Policía)")
     acepto = page.locator("[id='aceptaOption:0']")
     cedula = page.locator("#cedulaInput")
     recuadro = page.locator("#captchaAntecedentes iframe").first
     lleno_en = 0.0
+    primera_carga = True
 
     async def llenar():
-        nonlocal lleno_en
-        for carga in range(2):
-            await page.goto(URL_ANTECEDENTES, wait_until="domcontentloaded", timeout=60000)
-            try:
-                await acepto.or_(cedula).first.wait_for(timeout=60000)
-            except PlaywrightTimeoutError:
-                if carga:
-                    raise FueraDeServicio("la página no cargó ni recargándola", direccion=URL_ANTECEDENTES) from None
-                log("Antecedentes (Policía): la página no cargó en 60 s; se recarga.")
-                continue
-            try:
-                if await acepto.is_visible():
-                    await acepto.check()
-                    # Sin respuesta del sitio, el clic espera la página nueva 30 s y falla.
-                    await page.locator("#continuarBtn").click()
-                await cedula.wait_for(state="visible", timeout=60000)
-            except PlaywrightTimeoutError:
-                raise FueraDeServicio("el sitio no abrió el formulario de consulta", direccion=URL_ANTECEDENTES) from None
-            await page.locator("#cedulaTipo").select_option(tipo)
-            await cedula.fill(persona["numero"])
-            try:
-                # Google dibuja el recuadro un momento después del formulario; a veces no llega hasta recargar.
-                await recuadro.wait_for(state="visible", timeout=30000)
-                break
-            except PlaywrightTimeoutError:
-                if carga:
-                    raise FueraDeServicio("la casilla «No soy un robot» no apareció ni recargando la página") from None
-                log("Antecedentes (Policía): la casilla no apareció en 30 s; se recarga la página.")
-        lleno_en = time.monotonic()
+        nonlocal lleno_en, page, acepto, cedula, recuadro, primera_carga
+        reutilizar, primera_carga = primera_carga, False
+        page = await cargar_pagina(page, URL_ANTECEDENTES, formulario_antecedentes_listo, reutilizar=reutilizar)
+        acepto = page.locator("[id='aceptaOption:0']")
+        cedula = page.locator("#cedulaInput")
+        recuadro = page.locator("#captchaAntecedentes iframe").first
+        await page.locator("#cedulaTipo").select_option(tipo)
+        await cedula.fill(persona["numero"])
+        lleno_en = instante_carga(page)
 
     await llenar()
     # Motivo si el último intento falló por el sitio: no respondió o perdió la consulta.
@@ -595,6 +637,7 @@ async def consultar_antecedentes(page, persona: dict, turnos: Turnos, listo) -> 
 
 
 async def consultar_registraduria(page, persona: dict, preguntar, turnos: Turnos, listo) -> Path:
+    page = pagina_actual(page)
     if persona["tipo"] != "CC":
         raise ValueError("La Registraduría solo certifica cédulas de ciudadanía; no aplica.")
     fecha = persona["fecha_expedicion"]
@@ -602,23 +645,20 @@ async def consultar_registraduria(page, persona: dict, preguntar, turnos: Turnos
     codigo = page.locator("#ContentPlaceHolder1_TextBox2")
     imagen = page.locator("#datos_contentplaceholder1_captcha1_CaptchaImage")
     lleno_en = 0.0
+    primera_carga = True
 
     async def llenar():
-        nonlocal lleno_en
-        for carga in range(2):
-            await page.goto(URL_REGISTRADURIA, wait_until="domcontentloaded", timeout=60000)
-            try:
-                await cedula.wait_for(timeout=30000)
-                break
-            except PlaywrightTimeoutError:
-                if carga:
-                    raise FueraDeServicio("la página no cargó ni recargándola", direccion=URL_REGISTRADURIA) from None
-                log("Registraduría: la página no cargó en 30 s; se recarga.")
+        nonlocal lleno_en, page, cedula, codigo, imagen, primera_carga
+        reutilizar, primera_carga = primera_carga, False
+        page = await cargar_pagina(page, URL_REGISTRADURIA, formulario_registraduria_listo, reutilizar=reutilizar)
+        cedula = page.locator("#ContentPlaceHolder1_TextBox1")
+        codigo = page.locator("#ContentPlaceHolder1_TextBox2")
+        imagen = page.locator("#datos_contentplaceholder1_captcha1_CaptchaImage")
         await cedula.fill(persona["numero"])
         await page.locator("#ContentPlaceHolder1_DropDownList1").select_option(f"{fecha.day:02d}")
         await page.locator("#ContentPlaceHolder1_DropDownList2").select_option(f"{fecha.month:02d}")
         await page.locator("#ContentPlaceHolder1_DropDownList3").select_option(str(fecha.year))
-        lleno_en = time.monotonic()
+        lleno_en = instante_carga(page)
 
     await llenar()
     for intento in range(3):
@@ -660,30 +700,22 @@ async def consultar_registraduria(page, persona: dict, preguntar, turnos: Turnos
 
 
 async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) -> Path:
+    page = pagina_actual(page)
     tipo = tipo_para(TIPOS_INHABILIDADES, persona, "Inhabilidades (Policía)")
     terminos = page.locator("#cbCondiciones")
     recaptcha = page.locator("iframe[title='reCAPTCHA']").first
     lleno_en = 0.0
+    primera_carga = True
 
     async def llenar():
-        nonlocal lleno_en
-        await page.goto(URL_INHABILIDADES, wait_until="domcontentloaded", timeout=60000)
-        await page.locator("#tipo").select_option(tipo)
-        await page.locator("#nuip").fill(persona["numero"])
-        await page.locator("#fechaExpNuip").fill(f"{persona['fecha_expedicion']:%d/%m/%Y}")
-        await page.locator("#nombreEmpresa").fill(EMPRESA_INHABILIDADES)
-        await page.locator("#nitEmpresa").fill(NIT_INHABILIDADES)
-        # La casilla real está oculta: se pulsa el cuadro dibujado al inicio de la etiqueta, lejos del enlace a los términos.
-        await page.locator("label[for=cbCondiciones]").click(position={"x": 4, "y": 8})
-        if not await terminos.is_checked():
-            await terminos.evaluate("e => e.click()")
-        if not await terminos.is_checked():
-            raise ValueError("Inhabilidades (Policía): no se pudo marcar la casilla de términos de uso.")
-        try:
-            await recaptcha.wait_for(state="visible", timeout=ESPERA_CASILLA * 1000)
-        except PlaywrightTimeoutError:
-            raise FueraDeServicio(f"la casilla «No soy un robot» no apareció en {ESPERA_CASILLA} s") from None
-        lleno_en = time.monotonic()
+        nonlocal lleno_en, page, terminos, recaptcha, resultado, primera_carga
+        reutilizar, primera_carga = primera_carga, False
+        page = await cargar_pagina(page, URL_INHABILIDADES, formulario_inhabilidades_listo, reutilizar=reutilizar)
+        terminos = page.locator("#cbCondiciones")
+        recaptcha = page.locator("iframe[title='reCAPTCHA']").first
+        resultado = page.locator("#res")
+        await llenar_inhabilidades(page, persona, tipo)
+        lleno_en = instante_carga(page)
 
     resultado = page.locator("#res")
     avisos = []
@@ -694,9 +726,9 @@ async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) ->
         await dialogo.dismiss()
 
     await llenar()
-    page.on("dialog", aviso)
     # Motivo si el último intento falló porque el sitio no respondió a la consulta.
     caida = None
+    escuchando = None
     try:
         for intento in range(3):
             if intento:
@@ -706,12 +738,24 @@ async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) ->
                 if not await recaptcha.count() or not await terminos.count() \
                         or time.monotonic() - lleno_en > VIGENCIA_CAPTCHA:
                     await llenar()
+                if escuchando is not page:
+                    if escuchando:
+                        escuchando.remove_listener("dialog", aviso)
+                    page.on("dialog", aviso)
+                    escuchando = page
                 avisos.clear()
                 caida = None
                 await al_frente(page)
                 await recaptcha.evaluate("e => e.scrollIntoView({block: 'center'})")
                 log("Inhabilidades (Policía): marca 'No soy un robot' en la ventana que quedó al frente.")
-                if not await esperar_recaptcha(page, "Inhabilidades (Policía)", recaptcha):
+                try:
+                    resuelto = await esperar_recaptcha(page, "Inhabilidades (Policía)", recaptcha)
+                except FueraDeServicio:
+                    if intento == 2:
+                        raise
+                    log("Inhabilidades (Policía): el captcha quedó cargando; se recarga y se rellenan los datos.")
+                    continue
+                if not resuelto:
                     log("Inhabilidades (Policía): Google dio la casilla por caducada; se carga de nuevo la página.")
                     continue
                 try:
@@ -739,8 +783,47 @@ async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) ->
                 raise FueraDeServicio(f"{caida} (3 intentos)", direccion=URL_INHABILIDADES)
             raise ValueError("Inhabilidades (Policía): el sitio no mostró el resultado tras 3 intentos.")
     finally:
-        page.remove_listener("dialog", aviso)
+        if escuchando:
+            escuchando.remove_listener("dialog", aviso)
     # Al cargar, el sitio tapa la página casi un segundo con su animación de carga (fondo blanco y un círculo).
     await page.add_style_tag(content="#pb_loader { display: none !important; }")
     # La página entera con gráficos de fondo, como al guardarla desde Chrome: el pie lleva su línea azul y los logos.
     return await imprimir_pdf(page, ruta_documento("inhabilidades", persona), fecha_informe(persona), fondos=True)
+
+
+async def formulario_inhabilidades_listo(page):
+    await page.locator("#tipo").wait_for(timeout=60000)
+    recaptcha = page.locator("iframe[title='reCAPTCHA']").first
+    await recaptcha.wait_for(state="visible", timeout=60000)
+    await recaptcha.content_frame.locator("#recaptcha-anchor").wait_for(state="visible", timeout=60000)
+
+
+async def formulario_antecedentes_listo(page):
+    acepto = page.locator("[id='aceptaOption:0']")
+    cedula = page.locator("#cedulaInput")
+    await acepto.or_(cedula).first.wait_for(timeout=60000)
+    if await acepto.is_visible():
+        await acepto.check()
+        await page.locator("#continuarBtn").click(timeout=60000)
+    await cedula.wait_for(state="visible", timeout=60000)
+    await page.locator("#captchaAntecedentes iframe").first.wait_for(state="visible", timeout=60000)
+
+
+async def formulario_registraduria_listo(page):
+    await page.locator("#ContentPlaceHolder1_TextBox1").wait_for(timeout=60000)
+    await page.locator("#datos_contentplaceholder1_captcha1_CaptchaImage").wait_for(timeout=60000)
+
+
+async def llenar_inhabilidades(page, persona: dict, tipo: str):
+    terminos = page.locator("#cbCondiciones")
+    await page.locator("#tipo").select_option(tipo)
+    await page.locator("#nuip").fill(persona["numero"])
+    await page.locator("#fechaExpNuip").fill(f"{persona['fecha_expedicion']:%d/%m/%Y}")
+    await page.locator("#nombreEmpresa").fill(EMPRESA_INHABILIDADES)
+    await page.locator("#nitEmpresa").fill(NIT_INHABILIDADES)
+    # La casilla real está oculta: se pulsa el cuadro dibujado, lejos del enlace a los términos.
+    await page.locator("label[for=cbCondiciones]").click(position={"x": 4, "y": 8})
+    if not await terminos.is_checked():
+        await terminos.evaluate("e => e.click()")
+    if not await terminos.is_checked():
+        raise ValueError("Inhabilidades (Policía): no se pudo marcar la casilla de términos de uso.")

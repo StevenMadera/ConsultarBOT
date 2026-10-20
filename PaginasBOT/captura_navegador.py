@@ -19,6 +19,7 @@ import mss.tools
 import pygetwindow as gw
 
 from comun import CAPTURAS, FueraDeServicio, log
+from rendimiento import etapa
 
 ESPERA_MINIMA = 2
 ESPERA_ESTABLE_MAXIMA = 12
@@ -337,6 +338,24 @@ def _cerrar_pestana(ventana, titulo: str):
         user32.keybd_event(tecla, 0, evento, 0)
 
 
+def _cerrar_ventanas_consultadas(ventana, titulo: str, antes: set[int]):
+    user32 = ctypes.windll.user32
+    ventanas = {v._hWnd for v in _ventanas_nuevas(antes)
+                if v._hWnd == ventana._hWnd or titulo in v.title}
+    if ventana._hWnd not in antes:
+        ventanas.add(ventana._hWnd)
+    for hwnd in ventanas:
+        if user32.IsWindow(hwnd):
+            user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+    fin = time.monotonic() + 3
+    while ventanas and time.monotonic() < fin:
+        ventanas = {hwnd for hwnd in ventanas if user32.IsWindow(hwnd)}
+        if ventanas:
+            time.sleep(0.1)
+    if ventanas:
+        log(f"{titulo}: el navegador no cerró las ventanas de la consulta {sorted(ventanas)}.")
+
+
 def capturar_navegador(
     url: str,
     titulo: str,
@@ -356,7 +375,8 @@ def capturar_navegador(
     Si el sitio está caído, captura la página de error del navegador y lanza FueraDeServicio con ella.
     """
     with PANTALLA:
-        return _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, preguntar, antes, zoom)
+        with etapa("captura"):
+            return _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, preguntar, antes, zoom)
 
 
 def _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, preguntar, antes, zoom) -> Path:
@@ -385,16 +405,17 @@ def _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, 
         # Windows puede negar el foco; la ventana se captura igual si está visible.
         _dar_foco(ventana._hWnd)
 
-    if caida:
-        log(f"{nombre}: {caida}; se captura la página caída.")
-    elif paso_manual and nombre not in _PASOS_HECHOS:
-        mostrar()
-        preguntar(f"{nombre}: {paso_manual} Pulsa Enter cuando la lista esté visible... ")
-        _PASOS_HECHOS.add(nombre)
-
-    consola = _minimizar_consola()
+    consola = None
     hwnd = ventana._hWnd
     try:
+        if caida:
+            log(f"{nombre}: {caida}; se captura la página caída.")
+        elif paso_manual and nombre not in _PASOS_HECHOS:
+            mostrar()
+            preguntar(f"{nombre}: {paso_manual} Pulsa Enter cuando la lista esté visible... ")
+            _PASOS_HECHOS.add(nombre)
+
+        consola = _minimizar_consola()
         mostrar()
         # Encima de todo desde ya: si otra ventana la tapa, Chrome no dibuja la página que estuvo minimizada.
         _fijar_encima(hwnd, True)
@@ -453,18 +474,16 @@ def _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, 
         CAPTURAS.mkdir(exist_ok=True)
         ruta = CAPTURAS / f"{prefijo}_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
         mss.tools.to_png(imagen.rgb, imagen.size, output=str(ruta))
-        if propia:
-            # Las abrió el bot: se cierran sin depender del foco, también la repetida si se abrió de nuevo.
-            for otra in _ventanas_nuevas(antes):
-                if otra._hWnd == hwnd or titulo in otra.title:
-                    ctypes.windll.user32.PostMessageW(otra._hWnd, 0x0010, 0, 0)  # WM_CLOSE
-        else:
-            # Antes de restaurar la consola, que al activarse quitaría el foco al navegador.
-            _cerrar_pestana(ventana, urlsplit(url).hostname if caida else titulo)
         if caida:
             raise FueraDeServicio(caida, ruta)
         return ruta
     finally:
         _fijar_encima(hwnd, False)
-        if consola:
-            ctypes.windll.user32.ShowWindow(consola, 9)  # SW_RESTORE
+        try:
+            if propia:
+                _cerrar_ventanas_consultadas(ventana, titulo, antes)
+            else:
+                _cerrar_pestana(ventana, urlsplit(url).hostname if caida else titulo)
+        finally:
+            if consola:
+                ctypes.windll.user32.ShowWindow(consola, 9)  # SW_RESTORE

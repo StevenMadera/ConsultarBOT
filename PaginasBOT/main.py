@@ -28,6 +28,8 @@ from consulta_fbi import consultar_fbi, url_fbi
 from consulta_justicia import TITULO_JUSTICIA, consultar_justicia, url_justicia
 from consulta_terroristas import TITULO_TERRORISTAS, consultar_terroristas, url_terroristas
 from ocr import buscar_tesseract
+from carga_paginas import cargar_pagina, cerrar_secundarias, conservar_pagina, esperar_estable, instante_carga, pagina_actual
+from rendimiento import capturar_pantalla, etapa, medir_sitio
 
 
 
@@ -630,17 +632,9 @@ async def esperar_sin_carga(page):
             timeout=15000,
             polling=300,
         )
-        await page.wait_for_load_state("networkidle", timeout=5000)
     except PlaywrightTimeoutError:
-        pass
-    # Deja terminar la animación del panel desplegable.
-    await page.wait_for_timeout(700)
-
-
-async def precargar_runt(page):
-    """El RUNT descarga ~12 MB al abrir: se carga minimizado mientras se escriben los datos y luego sale de la caché."""
-    await documentos.precargar(page, URL_RUNT)
-    await page.locator("img.img-fluid").first.wait_for(state="visible", timeout=90000)
+        log("La página sigue mostrando carga; se comprueba su estabilidad antes de capturar.")
+    await esperar_estable(page)
 
 
 # Recuadro del aviso: el antecesor más grande del texto que no ocupa todo el ancho (el fondo gris sí lo ocupa).
@@ -673,13 +667,14 @@ async def captura_aviso_sobre_datos(page, ruta: Path, aviso):
         await page.wait_for_timeout(500)
         caja = await aviso.evaluate(CAJA_AVISO_JS)
         recorte = {"x": 0, "y": 0, "width": ancho, "height": min(alto_necesario, round(caja["abajo"]) + 30)}
-        await page.screenshot(path=str(ruta), clip=recorte)
+        await capturar_pantalla(page, path=str(ruta), clip=recorte)
     finally:
         await cdp.send("Emulation.clearDeviceMetricsOverride")
         await cdp.detach()
 
 
 async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turnos, listo: asyncio.Event) -> Path:
+    page = pagina_actual(page)
     numero = re.sub(r"\D", "", persona["numero"])
     apellido = re.sub(r"[^\w\sñÑáéíóúÁÉÍÓÚüÜ]", "", primer_apellido(persona["nombre"]))
     campo_captcha = page.locator("input[formcontrolname=captcha]")
@@ -687,28 +682,24 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
     # Respuesta válida para quien no tiene registro en el RUNT, no un captcha incorrecto.
     sin_registro = page.get_by_text(re.compile(r"no se ha encontrado la persona", re.I)).first
     lleno_en = 0.0
+    primera_carga = True
 
     async def llenar():
-        nonlocal lleno_en
-        for carga in range(2):
-            # Ya en el RUNT, goto solo cambia el hash y no recarga: quedarían el captcha viejo y el aviso anterior encima.
-            ya_abierto = page.url.startswith(URL_RUNT.split("#")[0])
-            await page.goto(URL_RUNT, wait_until="domcontentloaded")
-            if ya_abierto:
-                await page.reload(wait_until="domcontentloaded")
-            try:
-                # Sin caché tarda de 15 s a más de 1 min (unos 25 módulos) y a veces se queda en blanco.
-                await imagen_captcha.wait_for(state="visible", timeout=60000)
-                break
-            except PlaywrightTimeoutError:
-                if carga:
-                    raise FueraDeServicio("la página no cargó tras recargarla; el sitio está lento o caído") from None
-                log("RUNT: la página no cargó en 60 s; se recarga.")
+        nonlocal lleno_en, page, campo_captcha, imagen_captcha, sin_registro, primera_carga
+        reutilizar, primera_carga = primera_carga, False
+        page = await cargar_pagina(
+            page, URL_RUNT, lambda p: p.locator("img.img-fluid").first.wait_for(timeout=60000),
+            recargar=page.url.startswith(URL_RUNT.split("#")[0]),
+            reutilizar=reutilizar,
+        )
+        campo_captcha = page.locator("input[formcontrolname=captcha]")
+        imagen_captcha = page.locator("img.img-fluid").first
+        sin_registro = page.get_by_text(re.compile(r"no se ha encontrado la persona", re.I)).first
         await page.locator("mat-select[formcontrolname=tipoDocumento]").click()
         await page.get_by_role("option", name=TIPOS_RUNT[persona["tipo"].upper()], exact=True).click()
         await page.locator("input[formcontrolname=documento]").fill(numero)
         await page.locator("input[formcontrolname=primerApellido]").fill(apellido)
-        lleno_en = time.monotonic()
+        lleno_en = instante_carga(page)
 
     # Se llena minimizado; la ventana sale al frente cuando le toca el turno de captcha.
     await llenar()
@@ -733,27 +724,8 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
                 imagen = None
                 print(f"[CAPID] Error en captura: {e}")
 
-            if imagen:
-                print("[CAPID] Ejecutando OCR...")
-                captcha = leer_captcha(imagen)
-                print(f"[CAPID] Resultado OCR: {captcha!r}")
-            else:
-                print("[CAPID] No hay imagen para procesar.")
-
-
             pedido = time.monotonic()
-
-            # Leer automáticamente el ID de la captura
-            captcha = leer_captcha(imagen)
-
-            if captcha:
-                print(f"\nCAPTCHA detectado automáticamente: {captcha}")
-                respuesta = captcha
-            else:
-                print("\nNo se pudo reconocer el CAPTCHA automáticamente.")
-
-    # Mantener la entrada manual como respaldo
-            captcha = leer_captcha(imagen)
+            captcha = await asyncio.to_thread(leer_captcha, imagen) if imagen else None
 
             if captcha:
                 respuesta = captcha
@@ -803,7 +775,6 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
         await page.wait_for_timeout(700)
         await captura_aviso_sobre_datos(page, ruta, sin_registro)
         return ruta
-    await page.wait_for_load_state("networkidle")
     await esperar_sin_carga(page)
 
     # Desplegar "Licencia(s) de conducción" si está colapsada.
@@ -811,7 +782,6 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
     try:
         if await licencias.get_attribute("aria-expanded", timeout=8000) != "true":
             await licencias.click()
-            await page.wait_for_load_state("networkidle")
     except PlaywrightTimeoutError:
         log("RUNT: no se encontró el apartado de licencias de conducción")
 
@@ -822,7 +792,7 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
         await page.wait_for_timeout(500)
         await page.evaluate(ir_arriba)
         await page.wait_for_timeout(300)
-        await page.screenshot(path=str(ruta), full_page=True)
+        await capturar_pantalla(page, path=str(ruta), full_page=True)
     finally:
         await cdp.send("Emulation.clearDeviceMetricsOverride")
         await cdp.detach()
@@ -899,19 +869,19 @@ async def seleccionar_persona_simit(page, persona: dict, pedir_seleccion):
 async def consultar_simit(page, persona: dict, pedir_seleccion=None) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
     # Una sola carga completa: si la página ya está en SIMIT, goto solo cambia el hash de la SPA y hay que recargar.
-    ya_abierto = page.url.startswith(URL_SIMIT.split("#")[0])
-    await page.goto(URL_SIMIT, wait_until="domcontentloaded")
-    if ya_abierto:
-        await page.reload(wait_until="domcontentloaded")
-    validacion = page.locator("#whcModal")
-    try:
-        await validacion.wait_for(state="visible", timeout=5000)
-    except PlaywrightTimeoutError:
-        pass
-    try:
-        await validacion.wait_for(state="hidden", timeout=120000)
-    except PlaywrightTimeoutError:
-        raise ValueError("SIMIT no terminó su validación de seguridad en 2 minutos; no se generó captura.") from None
+    async def lista(p):
+        await p.locator("#txtBusqueda").wait_for(timeout=60000)
+        validacion = p.locator("#whcModal")
+        try:
+            await validacion.wait_for(state="visible", timeout=5000)
+        except PlaywrightTimeoutError:
+            pass
+        await validacion.wait_for(state="hidden", timeout=60000)
+
+    page = await cargar_pagina(
+        page, URL_SIMIT, lista,
+        recargar=page.url.startswith(URL_SIMIT.split("#")[0]),
+    )
     try:
         await page.locator("button.close:visible").first.click(timeout=5000)
     except PlaywrightTimeoutError:
@@ -925,19 +895,18 @@ async def consultar_simit(page, persona: dict, pedir_seleccion=None) -> Path:
         estado = await esperar_simit(page)
     if estado != "resultado":
         log("SIMIT: no apareció el resumen de comparendos; se captura el mensaje mostrado por el sitio.")
-    await page.wait_for_timeout(500)
-
     # Contrae la pestaña "Herramientas de accesibilidad" (el sitio recuerda su estado entre cargas).
     try:
-        await page.locator("#x-insuit-tab-title").wait_for(state="attached", timeout=15000)
         # El widget vive en un shadow DOM: solo el locator lo alcanza.
-        desplegada = await page.locator("#x-insuit-tab-title").evaluate("e => e.getBoundingClientRect().right > 40")
+        widget = page.locator("#x-insuit-tab-title")
+        desplegada = bool(await widget.count()) and await widget.evaluate(
+            "e => e.getBoundingClientRect().right > 40", timeout=1000)
     except PlaywrightTimeoutError:
         desplegada = False
         log("SIMIT: no apareció la pestaña de accesibilidad")
     if desplegada:
         await page.locator("#x-insuit-tab-arrow").click()
-        await page.wait_for_timeout(1200)
+    await esperar_estable(page)
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"simit_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
@@ -960,7 +929,7 @@ async def captura_sin_pie(page, ruta: Path):
     """Página completa sin el pie del sitio, que no aporta al PDF; si no se reconoce el pie, la página completa."""
     alto = await page.evaluate(ALTO_HASTA_PIE_JS)
     recorte = {"x": 0, "y": 0, "width": page.viewport_size["width"], "height": alto} if alto else None
-    await page.screenshot(path=str(ruta), full_page=True, clip=recorte)
+    await capturar_pantalla(page, path=str(ruta), full_page=True, clip=recorte)
 
 
 async def ajustar_ventana_a_recuadro(page, clave: str, formato: str) -> bool:
@@ -984,14 +953,19 @@ async def ajustar_ventana_a_recuadro(page, clave: str, formato: str) -> bool:
     return True
 
 
-async def captura_ajustada(page, ruta: Path, clave: str, formato: str, espera: int = 1000):
-    completa = await ajustar_ventana_a_recuadro(page, clave, formato)
-    await page.wait_for_timeout(espera)
-    await page.screenshot(path=str(ruta), full_page=completa)
+async def captura_ajustada(page, ruta: Path, clave: str, formato: str, espera: int = 0):
+    with etapa("captura"):
+        completa = await ajustar_ventana_a_recuadro(page, clave, formato)
+        if espera:
+            # Los visores de PDF no exponen su contenido como DOM: conservan su margen de renderizado.
+            await page.wait_for_timeout(espera)
+        else:
+            await esperar_estable(page)
+        await capturar_pantalla(page, path=str(ruta), full_page=completa)
 
 
 async def consultar_govuk(page, persona: dict) -> Path:
-    await page.goto(URL_GOVUK, wait_until="domcontentloaded")
+    page = await cargar_pagina(page, URL_GOVUK, lambda p: p.locator("input[name=keywords]:visible").first.wait_for(timeout=60000))
     try:
         await page.get_by_role("button", name="Reject additional cookies").click(timeout=5000)
         await page.get_by_role("button", name="Hide cookie message").click(timeout=3000)
@@ -1012,10 +986,11 @@ async def consultar_govuk(page, persona: dict) -> Path:
 async def consultar_eumostwanted(page, persona: dict) -> Path:
     nombre = " ".join(persona["nombre"].split())
     # El sitio a veces tarda más de 30 s en entregar el HTML completo.
-    await page.goto(URL_EUMOSTWANTED.format(nombre=quote_plus(nombre)), wait_until="commit", timeout=60000)
-    await page.get_by_role(
-        "heading", name=re.compile(r"search results|your search yielded no results", re.I)
-    ).first.wait_for(timeout=60000)
+    page = await cargar_pagina(
+        page, URL_EUMOSTWANTED.format(nombre=quote_plus(nombre)),
+        lambda p: p.get_by_role("heading", name=re.compile(r"search results|your search yielded no results", re.I)
+                               ).first.wait_for(timeout=60000),
+    )
     try:
         await page.get_by_text("I don't agree", exact=True).first.click(timeout=5000)
     except PlaywrightTimeoutError:
@@ -1033,21 +1008,11 @@ async def consultar_eumostwanted(page, persona: dict) -> Path:
 
 async def capturar_sin_ventana(page, persona: dict, clave: str, url: str, titulo: str) -> Path:
     """State.gov y Justice: antes solo cargaban en Chrome; hoy cargan aquí y van en paralelo con los captchas."""
-    respuesta = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    if respuesta and respuesta.status >= 400:
-        raise ValueError(f"el sitio respondió {respuesta.status}")
-    # State.gov responde primero con una verificación de AWS (HTTP 202) que recarga sola la página.
-    limite = time.monotonic() + 60
-    while True:
-        try:
-            if titulo in await page.title():
-                break
-        except PlaywrightError:
-            pass
-        if time.monotonic() > limite:
-            raise ValueError("la página no cargó")
-        await page.wait_for_timeout(500)
-    await page.wait_for_load_state("load", timeout=60000)
+    async def lista(p):
+        await p.wait_for_function("titulo => document.title.includes(titulo)", arg=titulo, timeout=60000)
+        await p.wait_for_load_state("load", timeout=60000)
+
+    page = await cargar_pagina(page, url, lista)
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"{clave}_{re.sub(r'\D', '', persona['numero'])}_{datetime.now():%Y%m%d_%H%M%S}.png"
@@ -1099,15 +1064,13 @@ BUSCAR_EN_DOCUMENTO_JS = """q => {
 async def cargar_consolidado(page):
     await page.set_viewport_size({"width": 1600, "height": round(1600 * proporcion_zona("consolidado", "Hombre"))})
     await page.goto(ARCHIVO_CONSOLIDADO.as_uri(), wait_until="load")
+    return page
 
 
 async def cargar_eurlex(page):
     """Diario Oficial L 25/2022, donde se busca el número como con Ctrl+F."""
     await page.set_viewport_size({"width": 1600, "height": round(1600 * proporcion_zona("consolium", "Hombre"))})
-    await page.goto(URL_EURLEX, wait_until="domcontentloaded", timeout=60000)
-    # La primera respuesta (HTTP 202) es una página intermedia que recarga sola el documento.
-    await page.get_by_text("Diario Oficial").first.wait_for(timeout=60000)
-    await page.wait_for_load_state("load", timeout=60000)
+    return await cargar_pagina(page, URL_EURLEX, lambda p: p.get_by_text("Diario Oficial").first.wait_for(timeout=60000))
 
 
 class Documento:
@@ -1116,38 +1079,47 @@ class Documento:
     def __init__(self, page, cargar, clave: str, nombre: str):
         self.page, self.cargar, self.clave, self.nombre = page, cargar, clave, nombre
         self.carga = asyncio.create_task(cargar(page))
+        self.reintentar = False
 
     async def buscar(self, persona: dict) -> Path:
         """Equivale a buscar el número con Ctrl+F: resalta las coincidencias y muestra la barra de búsqueda."""
+        if self.reintentar:
+            self.carga = asyncio.create_task(self.cargar(self.page))
+            self.reintentar = False
         try:
-            await self.carga
+            with etapa("carga"):
+                await self.carga
+        except FueraDeServicio:
+            self.reintentar = True
+            raise
         except Exception as e:
             log(f"{self.nombre}: falló la carga ({e}); se carga de nuevo.")
             self.carga = asyncio.create_task(self.cargar(self.page))
-            await self.carga
+            with etapa("carga"):
+                await self.carga
+        page = pagina_actual(self.page)
         numero = re.sub(r"\D", "", persona["numero"])
         # El recuadro cambia de alto según la plantilla; el ancho se mantiene para no reacomodar el documento.
         alto = round(1600 * proporcion_zona(self.clave, persona["formato"]))
-        await self.page.set_viewport_size({"width": 1600, "height": alto})
-        coincidencias = await self.page.evaluate(BUSCAR_EN_DOCUMENTO_JS, numero)
+        await page.set_viewport_size({"width": 1600, "height": alto})
+        coincidencias = await page.evaluate(BUSCAR_EN_DOCUMENTO_JS, numero)
         log(f"{self.nombre}: {coincidencias} coincidencias para {numero}")
-        await self.page.wait_for_timeout(500)
+        await esperar_estable(page)
 
         CAPTURAS.mkdir(exist_ok=True)
         ruta = CAPTURAS / f"{self.clave}_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
-        await self.page.screenshot(path=str(ruta))
+        await capturar_pantalla(page, path=str(ruta))
         return ruta
 
 
 async def consultar_ofac(page, persona: dict) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
-    await page.goto(URL_OFAC, wait_until="domcontentloaded")
+    page = await cargar_pagina(page, URL_OFAC, lambda p: p.locator("#ctl00_MainContent_ddlType").wait_for(timeout=60000))
     await page.locator("#ctl00_MainContent_ddlType").select_option(label="Individual")
     await page.locator("#ctl00_MainContent_ddlCountry").select_option(label="Colombia")
     await page.locator("#ctl00_MainContent_txtID").fill(numero)
     async with page.expect_navigation(wait_until="load", timeout=30000):
         await page.locator("#ctl00_MainContent_btnSearch").click()
-    await page.wait_for_timeout(500)
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"ofac_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
@@ -1157,7 +1129,7 @@ async def consultar_ofac(page, persona: dict) -> Path:
 
 async def consultar_libreta(page, persona: dict) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
-    await page.goto(URL_LIBRETA, wait_until="domcontentloaded")
+    page = await cargar_pagina(page, URL_LIBRETA, lambda p: p.locator("#tipoDocumento").wait_for(timeout=60000))
     await page.locator("#tipoDocumento").select_option(label=TIPOS_LIBRETA[persona["tipo"].upper()])
     await page.locator("#numeroDocumento").fill(numero)
     await page.get_by_role("button", name="Consultar", exact=True).click()
@@ -1193,8 +1165,7 @@ async def buscar_en_sitio(page, campo, persona: dict):
 
 async def consultar_contadores(page, persona: dict) -> Path:
     """Junta Central de Contadores: el número buscado como con Ctrl+F en el listado de sancionados."""
-    await page.goto(URL_CONTADORES, wait_until="domcontentloaded", timeout=90000)
-    await page.get_by_text("CC/CE", exact=True).first.wait_for(timeout=60000)
+    page = await cargar_pagina(page, URL_CONTADORES, lambda p: p.get_by_text("CC/CE", exact=True).first.wait_for(timeout=60000))
     # Ctrl+F solo ve las filas que muestra la página: se muestran todas (el listado tiene unas cien).
     siguiente = page.locator("a[href*='apex.widget.report.paginate']", has_text="Siguiente")
     if await siguiente.count():
@@ -1206,7 +1177,7 @@ async def consultar_contadores(page, persona: dict) -> Path:
     log(f"Junta Central de Contadores: {coincidencias} coincidencias para {persona['numero']}")
     await page.wait_for_timeout(500)
     ruta = ruta_captura("contadores", persona)
-    await page.screenshot(path=str(ruta))
+    await capturar_pantalla(page, path=str(ruta))
     return ruta
 
 
@@ -1293,7 +1264,7 @@ async def consultar_dian(page, persona: dict) -> Path:
     """Proveedores ficticios de la DIAN (PDF): el número buscado como con Ctrl+F."""
     url = await url_dian(page.context.request)
     # Si el sitio está caído, la página de error queda en la pestaña.
-    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    page = await cargar_pagina(page, url)
     respuesta = await page.context.request.get(url, timeout=90000)
     if not respuesta.ok:
         raise ValueError(f"La DIAN respondió {respuesta.status} al descargar la lista de proveedores ficticios.")
@@ -1305,17 +1276,15 @@ async def consultar_dian(page, persona: dict) -> Path:
 
 
 async def consultar_samm(page, persona: dict) -> Path:
-    await page.goto(URL_SAMM, wait_until="domcontentloaded", timeout=60000)
+    page = await cargar_pagina(page, URL_SAMM, lambda p: p.locator("#edit-search-api-fulltext").wait_for(timeout=60000))
     await buscar_en_sitio(page, page.locator("#edit-search-api-fulltext"), persona)
-    # El recuadro de resultados aparece con una animación.
-    await page.wait_for_timeout(1500)
     ruta = ruta_captura("samm", persona)
     await captura_ajustada(page, ruta, "samm", persona["formato"])
     return ruta
 
 
 async def consultar_bid(page, persona: dict) -> Path:
-    await page.goto(URL_BID, wait_until="domcontentloaded", timeout=60000)
+    page = await cargar_pagina(page, URL_BID, lambda p: p.locator("input[name=query]:visible").first.wait_for(timeout=60000))
     try:
         await page.get_by_role("button", name="Rechazarlas todas").click(timeout=8000)
     except PlaywrightTimeoutError:
@@ -1332,8 +1301,11 @@ async def consultar_bid(page, persona: dict) -> Path:
 async def consultar_canada(page, persona: dict) -> Path:
     # Canada.ca invita al azar a una encuesta («Government of Canada», Yes / No) con una ventanita encima de los
     # resultados, a veces segundos después de cargar: sin su gestor de invitaciones no sale.
-    await page.route(re.compile(r"/invitation-manager/|/im\.xml"), lambda route: route.abort())
-    await page.goto(URL_CANADA, wait_until="domcontentloaded", timeout=60000)
+    async def configurar(p):
+        await p.route(re.compile(r"/invitation-manager/|/im\.xml"), lambda route: route.abort())
+
+    page = await cargar_pagina(page, URL_CANADA, lambda p: p.locator("#wb-srch-q").wait_for(timeout=60000),
+                               configurar=configurar)
     await buscar_en_sitio(page, page.locator("#wb-srch-q"), persona)
     await page.get_by_text(re.compile(r"results? for|no (search )?results", re.I)).first.wait_for(timeout=30000)
     ruta = ruta_captura("canada", persona)
@@ -1343,7 +1315,7 @@ async def consultar_canada(page, persona: dict) -> Path:
 
 async def consultar_tesoro(page, persona: dict) -> Path:
     """Buscador del sitio de OFAC (Tesoro de EE. UU.): los resultados salen en search.usa.gov."""
-    await page.goto(URL_TESORO, wait_until="domcontentloaded", timeout=60000)
+    page = await cargar_pagina(page, URL_TESORO, lambda p: p.get_by_role("button", name="SEARCH").first.wait_for(timeout=60000))
     await page.get_by_role("button", name="SEARCH").first.click()
     await buscar_en_sitio(page, page.locator("form[action*='search.usa.gov'] input[name=query]"), persona)
     # Los resultados se dibujan un par de segundos después de cargar.
@@ -1357,7 +1329,15 @@ async def consultar_insight(page, persona: dict, preguntar_edge) -> Path:
     """InSight Crime. Su verificación («Checking your browser») solo pasa con la ventana a la vista; si pide confirmar
     que es una persona, lo hace el usuario."""
     await documentos.al_frente(page)
-    await page.goto(URL_INSIGHT.format(nombre=quote_plus(persona["nombre"])), wait_until="domcontentloaded", timeout=60000)
+    async def lista(p):
+        await p.wait_for_function(
+            """() => document.title.includes('InSight Crime')
+                || /checking your browser|confirm you are human|i am human/i.test(document.body.innerText)""",
+            timeout=60000,
+        )
+
+    page = await cargar_pagina(page, URL_INSIGHT.format(nombre=quote_plus(persona["nombre"])), lista)
+    await documentos.al_frente(page)
     cargada = "() => document.title.includes('InSight Crime')"
     try:
         await page.wait_for_function(cargada, timeout=30000, polling=500)
@@ -1499,9 +1479,17 @@ async def consultar(page, persona: dict, nombre: str = "Procuraduría") -> Path:
         await respuesta_loc.fill(respuesta)
         await respuesta_loc.evaluate("e => e.blur()")
 
+    if estado != "incidente":
+        fechas = await cuerpo.evaluate(
+            "(elemento, fecha) => (" + documentos.FECHA_PROCURADURIA_JS + ")(fecha)",
+            documentos.fecha_informe(persona),
+        )
+        if not fechas:
+            log(f"{nombre}: no se encontró la fecha de consulta; se conserva la fecha del portal.")
+
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    await page.screenshot(path=str(ruta), full_page=True)
+    await capturar_pantalla(page, path=str(ruta), full_page=True)
     if estado == "incidente":
         raise FueraDeServicio("el portal mostró el formulario de atención de incidentes (problema técnico)", ruta)
     return ruta
@@ -1593,10 +1581,10 @@ def memoria_libre_mb() -> int | None:
 
 
 def limite_concurrencia() -> int:
-    """Páginas automáticas a la vez: hasta una por núcleo lógico y por cada ~300 MB de RAM libre (mínimo 2)."""
+    """Entre dos y cuatro consultas automáticas, reservando recursos para las ventanas de captcha."""
     nucleos = os.cpu_count() or 2
     libre = memoria_libre_mb()
-    return max(2, min(nucleos, libre // 300 if libre is not None else nucleos))
+    return max(2, min(4, nucleos, libre // 500 if libre is not None else nucleos))
 
 
 async def abrir_navegadores(p) -> dict:
@@ -1639,15 +1627,24 @@ async def abrir_navegadores(p) -> dict:
     claves = ("runt", "antecedentes", "registraduria", "inhabilidades")
     r["ventanas"] = dict(zip(claves, await asyncio.gather(*(ventana_minimizada() for _ in claves))))
 
-    async def precargar_despues_del_runt(page, url):
-        # El RUNT es el primer captcha y su página es la más pesada: las demás cargan cuando termina.
-        await asyncio.gather(r["precargas"]["runt"], return_exceptions=True)
-        await documentos.precargar(page, url)
+    limite_precarga = asyncio.Semaphore(2)
 
-    r["precargas"]["runt"] = asyncio.create_task(precargar_runt(r["ventanas"]["runt"]))
-    for clave, url in (("antecedentes", documentos.URL_ANTECEDENTES), ("registraduria", documentos.URL_REGISTRADURIA),
-                       ("inhabilidades", documentos.URL_INHABILIDADES)):
-        r["precargas"][clave] = asyncio.create_task(precargar_despues_del_runt(r["ventanas"][clave], url))
+    async def precargar_limitada(clave, url, lista):
+        with medir_sitio(f"precarga_{clave}"):
+            with etapa("cola"):
+                await limite_precarga.acquire()
+            try:
+                await documentos.precargar(r["ventanas"][clave], url, lista)
+            finally:
+                limite_precarga.release()
+
+    for clave, url, lista in (
+        ("runt", URL_RUNT, lambda p: p.locator("img.img-fluid").first.wait_for(timeout=60000)),
+        ("registraduria", documentos.URL_REGISTRADURIA, documentos.formulario_registraduria_listo),
+        ("antecedentes", documentos.URL_ANTECEDENTES, documentos.formulario_antecedentes_listo),
+        ("inhabilidades", documentos.URL_INHABILIDADES, documentos.formulario_inhabilidades_listo),
+    ):
+        r["precargas"][clave] = asyncio.create_task(precargar_limitada(clave, url, lista))
     r["consolidado"] = Documento(await onu.new_page(), cargar_consolidado, "consolidado", "Documento consolidado")
     r["consolium"] = Documento(await eurlex.new_page(), cargar_eurlex, "consolium", "EUR-Lex")
     return r
@@ -1671,7 +1668,7 @@ async def capturar_caida(page, clave: str, persona: dict) -> Path:
     if original:
         await page.set_viewport_size(tamano)
         try:
-            await page.screenshot(path=str(ruta))
+            await capturar_pantalla(page, path=str(ruta))
         finally:
             await page.set_viewport_size(original)
         return ruta
@@ -1679,7 +1676,7 @@ async def capturar_caida(page, clave: str, persona: dict) -> Path:
     cdp = await page.context.new_cdp_session(page)
     try:
         await cdp.send("Emulation.setDeviceMetricsOverride", {**tamano, "deviceScaleFactor": 0, "mobile": False})
-        await page.screenshot(path=str(ruta))
+        await capturar_pantalla(page, path=str(ruta))
     finally:
         await cdp.send("Emulation.clearDeviceMetricsOverride")
         await cdp.detach()
@@ -1687,10 +1684,18 @@ async def capturar_caida(page, clave: str, persona: dict) -> Path:
 
 
 async def con_caida(page, clave: str, persona: dict, consulta) -> Path:
+    try:
+        return await _con_caida(page, clave, persona, consulta)
+    finally:
+        await cerrar_secundarias(page)
+
+
+async def _con_caida(page, clave: str, persona: dict, consulta) -> Path:
     """Espera la consulta; si el sitio está caído, lanza FueraDeServicio con la página caída guardada."""
     try:
         ruta = await consulta
     except FueraDeServicio as e:
+        page = pagina_actual(page)
         if e.captura is None:
             try:
                 if e.direccion:
@@ -1700,6 +1705,7 @@ async def con_caida(page, clave: str, persona: dict, consulta) -> Path:
                 log(f"{clave}: no se pudo guardar la página caída ({str(falla).splitlines()[0]}).")
         raise
     except Exception as e:
+        page = pagina_actual(page)
         try:
             motivo, direccion = await documentos.motivo_caida(page, e)
         except PlaywrightError:
@@ -1715,17 +1721,21 @@ async def con_caida(page, clave: str, persona: dict, consulta) -> Path:
             log(f"{clave}: no se pudo guardar la página caída ({str(falla).splitlines()[0]}).")
         raise FueraDeServicio(motivo, captura) from e
     # Tras enviar el formulario, la página de error del navegador o del servidor se imprimiría como el documento.
-    if clave in documentos.ORDEN and (motivo := await documentos.caida_en_pagina(page)):
+    if clave in documentos.ORDEN and (motivo := await documentos.caida_en_pagina(pagina_actual(page))):
         raise FueraDeServicio(motivo, ruta)
     return ruta
 
 
 async def en_pestana_nueva(contexto, consulta, persona: dict, clave: str) -> Path:
-    page = await contexto.new_page()
+    ancho = 1024 if clave in documentos.ORDEN else VIEWPORT["width"]
+    aislado = await contexto.browser.new_context(
+        viewport={"width": ancho, "height": VIEWPORT["height"]}, ignore_https_errors=True, user_agent=USER_AGENT,
+    )
     try:
+        page = await aislado.new_page()
         return await con_caida(page, clave, persona, consulta(page, persona))
     finally:
-        await page.close()
+        await aislado.close()
 
 
 CONSULTAS_CHROME = {
@@ -1750,11 +1760,16 @@ def consultas_edge(persona: dict, preguntar, claves: list[str], antes: set[int] 
                    caidos: set[str]) -> dict[str, Path]:
     """Páginas que bloquean el navegador automático: se capturan en el navegador del usuario, una tras otra."""
     capturas = {}
+    def pedir(mensaje):
+        with etapa("usuario"):
+            return preguntar(mensaje)
+
     for clave in claves:
         avisar("sitio", clave=clave, estado="en_curso")
         try:
             # State.gov y Justice llegan aquí solo si fallaron sin ventana: se abren ahora.
-            capturas[clave] = CONSULTAS_CHROME[clave](persona, preguntar, antes if clave in ("fbi", "consilium") else None)
+            with medir_sitio(clave):
+                capturas[clave] = CONSULTAS_CHROME[clave](persona, pedir, antes if clave in ("fbi", "consilium") else None)
             log(f"Captura {clave}: {capturas[clave]}")
             avisar("sitio", clave=clave, estado="listo")
         except FueraDeServicio as e:
@@ -1785,6 +1800,16 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
     antes_chrome = None
     # Si el navegador automático no puede con State.gov o Justice, se capturan en Chrome como antes.
     a_chrome = []
+    preguntar_original = preguntar
+    preguntar_edge_original = preguntar_edge
+
+    async def preguntar(mensaje, **opciones):
+        with etapa("usuario"):
+            return await preguntar_original(mensaje, **opciones)
+
+    def preguntar_edge(mensaje):
+        with etapa("usuario"):
+            return preguntar_edge_original(mensaje)
 
     async def abrir_en_chrome():
         nonlocal antes_chrome
@@ -1796,9 +1821,16 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
     apertura_chrome = asyncio.create_task(abrir_en_chrome())
 
     async def registrar(clave: str, consulta):
+        with medir_sitio(clave):
+            await _registrar(clave, consulta)
+
+    async def _registrar(clave: str, consulta):
         avisar("sitio", clave=clave, estado="en_curso")
         try:
-            capturas[clave] = await consulta
+            ruta = await consulta
+            if clave in a_chrome:
+                return
+            capturas[clave] = ruta
             log(f"Captura {clave}: {capturas[clave]}")
             avisar("sitio", clave=clave, estado="listo")
         except FueraDeServicio as e:
@@ -1815,46 +1847,50 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
             avisar("sitio", clave=clave, estado="no_aplica" if "no aplica" in str(e) else "error", detalle=str(e))
 
     async def automatica(clave: str, funcion, page, *args):
-        async with limite:
-            await registrar(clave, con_caida(page, clave, persona, funcion(page, *args)))
+        await en_cupo(clave, lambda: con_caida(page, clave, persona, funcion(page, *args)))
 
-    async def grupo_rapido():
-        # Cada una tarda pocos segundos: en serie terminan antes que SIMIT, Procuraduría y RUNT.
-        async with limite:
-            for documento in (r["consolidado"], r["consolium"]):
-                await registrar(documento.clave,
-                                con_caida(documento.page, documento.clave, persona, documento.buscar(persona)))
-            for clave, consulta in (("ofac", consultar_ofac), ("govuk", consultar_govuk), ("eumostwanted", consultar_eumostwanted)):
-                await registrar(clave, en_pestana_nueva(r["grupo"], consulta, persona, clave))
+    async def en_cupo(clave, crear):
+        async def ejecutar():
+            with etapa("cola"):
+                await limite.acquire()
+            try:
+                return await crear()
+            finally:
+                limite.release()
+        await registrar(clave, ejecutar())
 
-    async def grupo_documentos():
-        # Sitios sin captcha que entregan un PDF (páginas 14, 15 y 18).
-        async with limite:
-            for clave, consulta in (("bdme", documentos.consultar_bdme), ("contraloria", documentos.consultar_contraloria),
-                                    ("rnmc", documentos.consultar_rnmc)):
-                await registrar(clave, en_pestana_nueva(r["documentos"], consulta, persona, clave))
+    async def fijo(documento):
+        try:
+            return await _con_caida(documento.page, documento.clave, persona, documento.buscar(persona))
+        finally:
+            documento.page = await conservar_pagina(documento.page)
 
-    async def grupo_gallagher(consultas):
-        # Los sitios que solo están en el formato de GALLAGHER.
-        async with limite:
-            for clave, consulta in consultas:
-                await registrar(clave, en_pestana_nueva(r["gallagher"], consulta, persona, clave))
+    async def nueva(clave, consulta, contexto):
+        await en_cupo(clave, lambda: en_pestana_nueva(contexto, consulta, persona, clave))
 
     async def grupo_eeuu():
-        async with limite:
-            for clave, url, titulo in (("terroristas", url_terroristas(persona), TITULO_TERRORISTAS),
-                                       ("justicia", url_justicia(persona), TITULO_JUSTICIA)):
-                avisar("sitio", clave=clave, estado="en_curso")
-                page = await r["eeuu"].new_page()
+        async def sitio(clave, url, titulo):
+            async def consultar():
+                aislado = await r["eeuu"].browser.new_context(
+                    viewport=VIEWPORT, ignore_https_errors=True, user_agent=USER_AGENT)
                 try:
-                    capturas[clave] = await capturar_sin_ventana(page, persona, clave, url, titulo)
-                    log(f"Captura {clave}: {capturas[clave]}")
-                    avisar("sitio", clave=clave, estado="listo")
+                    page = await aislado.new_page()
+                    return await con_caida(
+                        page, clave, persona, capturar_sin_ventana(page, persona, clave, url, titulo))
+                except FueraDeServicio:
+                    raise
                 except Exception as e:
                     log(f"{clave}: no cargó en el navegador automático ({str(e).splitlines()[0]}); se capturará en Chrome.")
                     a_chrome.append(clave)
+                    return None
                 finally:
-                    await page.close()
+                    await aislado.close()
+            await en_cupo(clave, consultar)
+
+        await asyncio.gather(
+            sitio("terroristas", url_terroristas(persona), TITULO_TERRORISTAS),
+            sitio("justicia", url_justicia(persona), TITULO_JUSTICIA),
+        )
 
     eeuu = asyncio.create_task(grupo_eeuu())
 
@@ -1863,10 +1899,12 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
             # Si la precarga sigue en curso se espera; si falló, la consulta vuelve a cargar la página.
             precarga = r["precargas"][clave]
             esperada = not precarga.done()
-            await asyncio.gather(precarga, return_exceptions=True)
+            with etapa("carga"):
+                await asyncio.gather(precarga, return_exceptions=True)
             # Si el sitio no respondió a la precarga mientras se la esperaba, ya está caído: no se espera otra carga.
             error = None if precarga.cancelled() else precarga.exception()
-            caido = esperada and isinstance(error, PlaywrightTimeoutError) and str(error).startswith("Page.goto:")
+            caido = esperada and (isinstance(error, FueraDeServicio)
+                                  or isinstance(error, PlaywrightTimeoutError) and str(error).startswith("Page.goto:"))
             for intento in range(2):
                 page = r["ventanas"][clave]
                 if page.is_closed():
@@ -1885,7 +1923,7 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
                     # Lo que mostraba la ventana al fallar, para poder ver la causa.
                     ruta = CAPTURAS / f"error_{clave}_{datetime.now():%Y%m%d_%H%M%S}.png"
                     try:
-                        await page.screenshot(path=str(ruta), timeout=10000)
+                        await capturar_pantalla(page, path=str(ruta), timeout=10000)
                         log(f"{clave}: pantalla del error guardada en {ruta.name}")
                     except PlaywrightError:
                         pass
@@ -1940,15 +1978,19 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
             "consultas automáticas listas",
             automatica("procuraduria", consultar_procuraduria, r["procuraduria"], persona),
             automatica("simit", consultar_simit, r["simit"], persona, preguntar),
-            grupo_rapido(),
+            *(en_cupo(doc.clave, lambda doc=doc: fijo(doc)) for doc in (r["consolidado"], r["consolium"])),
+            *(nueva(clave, consulta, r["grupo"]) for clave, consulta in (
+                ("ofac", consultar_ofac), ("govuk", consultar_govuk), ("eumostwanted", consultar_eumostwanted))),
             # A las mujeres no se les consulta la libreta militar.
             *([automatica("libreta", consultar_libreta, r["libreta"], persona)] if persona["sexo"] == "Hombre" else []),
             eeuu,
-            grupo_documentos(),
+            *(nueva(clave, consulta, r["documentos"]) for clave, consulta in (
+                ("bdme", documentos.consultar_bdme), ("contraloria", documentos.consultar_contraloria),
+                ("rnmc", documentos.consultar_rnmc))),
             # La Junta de Contadores es la más lenta: va con las que tardan poco.
-            *([grupo_gallagher((("contadores", consultar_contadores), ("dian", consultar_dian))),
-               grupo_gallagher((("samm", consultar_samm), ("bid", consultar_bid), ("canada", consultar_canada),
-                                ("tesoro", consultar_tesoro)))]
+            *([nueva(clave, consulta, r["gallagher"]) for clave, consulta in (
+                ("contadores", consultar_contadores), ("dian", consultar_dian), ("samm", consultar_samm),
+                ("bid", consultar_bid), ("canada", consultar_canada), ("tesoro", consultar_tesoro))]
               if persona["formato"] == "Gallagher" else []),
         ),
         con_captcha("runt", consultar_runt, preguntar),
@@ -1985,6 +2027,9 @@ async def cerrar_navegadores(apertura: asyncio.Task):
             tarea.cancel()
             await asyncio.gather(tarea, return_exceptions=True)
         for navegador in recursos["navegadores"]:
+            for contexto in navegador.contexts:
+                for page in list(contexto.pages):
+                    await cerrar_secundarias(page)
             await navegador.close()
 
 

@@ -30,7 +30,7 @@ Doble clic en el acceso directo **PaginasBOT** (o en `PaginasBOT.pyw`). Se abre 
    - FBI o Consilium (verificación de Cloudflare o cookies): haz el paso en el navegador y pulsa «Listo».
    - SIMIT con varias personas: elige la que corresponde.
 
-   Al empezar se abren minimizadas dos ventanas de Chrome (FBI y Consilium): no las cierres, el bot las captura y las cierra al final.
+   Al empezar se abren minimizadas dos ventanas de Chrome (FBI y Consilium): no las cierres. El bot cierra cada ventana en cuanto termina su captura, también si falla la consulta, sin esperar a que termine todo el informe. Las ventanas que ya tenías abiertas no se cierran.
 3. Al terminar: «Abrir PDF», «Abrir carpeta» y lo que no se pudo consultar. Para otra persona, copia la siguiente fila. El PDF queda en `salidas/` y las capturas en `capturas/`.
 4. Cierra la ventanita para salir; si hay una consulta en curso, pregunta antes.
 
@@ -40,5 +40,15 @@ Sin ventanita, en la consola: `py main.py` (los códigos se escriben en la conso
 Al abrir, PaginasBOT revisa si GitHub tiene una versión nueva. Si la hay (y todavía no se empezó una consulta), muestra «Actualizando…», baja los cambios (con `git pull` si se instaló con `git clone`; si no, solo los archivos que cambiaron), vuelve a ejecutar el instalador —que instala Tesseract OCR directamente si falta— y se abre de nuevo sola. `salidas/`, `capturas/` y `log.txt` no se tocan. Donde se programa (cambios sin commit o commits sin subir) nunca se actualiza.
 
 ## Antes de ejecutar
+- Las páginas automáticas tienen recuperación durante la carga inicial del formulario: a los 15 segundos se solicita otra pestaña y se usa la primera que quede lista. Se permiten como máximo dos recuperaciones secundarias simultáneas; si no hay cupo, la original sigue cargando mientras espera. A los 30 segundos se reintenta solo la secundaria, sin descartar el progreso de la original; si ninguna responde a los 60 segundos desde el inicio, se marca como fuera de servicio. Los envíos de consulta y el tiempo de resolver captchas quedan fuera de este mecanismo. Procuraduría conserva sus tiempos actuales; FBI y Consilium no se duplican. El documento consolidado local no necesita esta recuperación.
+- En Inhabilidades se espera a que aparezca la casilla real de reCAPTCHA, no solo su marco. Si la casilla queda cargando al intentar resolverla, se vuelve a cargar el formulario y se rellenan documento, fecha de expedición, empresa, NIT y términos antes de pedir el captcha otra vez (hasta tres intentos).
+- La captura de Procuraduría usa la fecha de consulta ingresada en Excel en el campo «Fecha de consulta». Reconoce fechas numéricas y el formato del portal («martes, octubre 20, 2026»); recalcula el día de la semana y conserva la hora. El cambio es local, antes de capturar: no modifica el registro del portal ni otras fechas del resultado. Si no se reconoce ese campo, se conserva la fecha original y se avisa en `log.txt`.
 - Cierra videos flotantes u otras ventanas encima del navegador: salen en la captura del FBI y de Consilium. La ventanita de PaginasBOT no sale (Windows la excluye de las capturas de pantalla; tampoco aparece en tus recortes ni al compartir pantalla).
 - Si falla una página, el error queda en `log.txt` y el bot sigue con las demás.
+
+## Rendimiento
+- Se precargan hasta dos formularios con captcha a la vez, sin hacer esperar todos al RUNT. Una precarga se reutiliza una sola vez si el formulario sigue listo y tiene menos de 45 segundos; se conserva su antigüedad real para no alargar artificialmente la vigencia del captcha. Repetir una consulta o un captcha fuerza una carga nueva.
+- Cada consulta automática ocupa su propio cupo y contexto aislado. La cola permite entre dos y cuatro consultas simultáneas según CPU y RAM libre, reservando recursos para los captchas; una página lenta no retiene el cupo de todo su grupo.
+- Antes de las capturas ajustadas se comprueba estabilidad del texto y tamaño, carga de imágenes y fuentes y finalización de indicadores y animaciones finitas. No se espera a que desaparezca todo el tráfico de red (la analítica puede seguir activa). Se conservan los márgenes específicos de visores PDF y de las capturas de FBI/Consilium.
+- El OCR del RUNT se ejecuta una sola vez por imagen y fuera del bucle de consultas, manteniendo la entrada manual de respaldo.
+- `log.txt` incluye líneas `Rendimiento <sitio>` con segundos de `cola`, `carga`, `usuario`, `captura`, `respuesta_procesamiento` y `total`, incluso si hay errores. La espera de reCAPTCHA está en `usuario`; `respuesta_procesamiento` es el tiempo restante, no una medición exclusiva del servidor. Las precargas se registran por separado como `precarga_<sitio>`. Estos tiempos permiten comparar varias ejecuciones reales sin prometer un tiempo fijo para portales externos.
