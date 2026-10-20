@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+*.rar
 .venv/
 # Archivos temporales de Word y Excel mientras un documento está abierto
 ~$*
