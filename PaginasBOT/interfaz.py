@@ -155,6 +155,8 @@ class Interfaz:
         self._imagen = None
         self._reloj = None
         self._secuencia = user32.GetClipboardSequenceNumber()
+        self._intentos = 0
+        self._ultimo_error = None
 
         self.v_datos = self._armar_datos()
         self.v_consultando = self._armar_progreso()
@@ -219,7 +221,7 @@ class Interfaz:
         v = ttk.Frame(self.root, padding=(22, 18, 22, 14))
         v.columnconfigure(1, weight=1)
         ttk.Label(v, text="Nueva consulta", style="Titulo.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(v, text="Copia la fila en Excel y los datos se llenan solos.", style="Suave.TLabel").grid(
+        ttk.Label(v, text="Copia la fila en Excel o LibreOffice y los datos se llenan solos.", style="Suave.TLabel").grid(
             row=1, column=0, columnspan=2, sticky="w", pady=(0, 12))
         self.entradas = []
         for fila, etiqueta in enumerate(ETIQUETAS, start=2):
@@ -452,18 +454,30 @@ class Interfaz:
         secuencia = user32.GetClipboardSequenceNumber()
         if secuencia != self._secuencia:
             self._secuencia = secuencia
-            if self.estado in ("datos", "resultado") and not self.preguntas:
-                self._fila_copiada()
-        self.root.after(600, self._vigilar_portapapeles)
+            # LibreOffice entrega el texto un momento después de copiar: mientras no se pueda leer, se reintenta.
+            self._intentos = 15 if self.estado in ("datos", "resultado") and not self.preguntas else 0
+        if self._intentos:
+            self._intentos = 0 if self._fila_copiada() else self._intentos - 1
+            if not self._intentos and self._ultimo_error:
+                log(f"Portapapeles: no se pudo leer lo copiado ({self._ultimo_error}).")
+        self.root.after(200 if self._intentos else 600, self._vigilar_portapapeles)
 
-    def _fila_copiada(self):
+    def _fila_copiada(self) -> bool:
+        """Llena los datos si lo copiado es una fila; False si todavía no se pudo leer."""
         try:
             texto = self.root.clipboard_get()
-        except tk.TclError:
-            return
+        except tk.TclError as e:
+            self._ultimo_error = str(e)
+            return False
+        self._ultimo_error = None
+        if not texto.strip():
+            self._ultimo_error = "vacío"
+            return False
         campos = partir_fila(texto)
         if "\t" not in texto or len(campos) != len(CAMPOS):
-            return
+            if "\t" in texto:
+                log(f"Portapapeles: la fila copiada tiene {len(campos)} datos y se esperan {len(CAMPOS)}.")
+            return True
         if self.estado == "resultado":
             self._nueva()
         self._llenar(campos)
@@ -471,6 +485,7 @@ class Interfaz:
             self.root.deiconify()
         dar_foco(self.hwnd)
         self.root.focus_force()
+        return True
 
     def _llenar(self, campos: list[str]):
         for entrada, valor in zip(self.entradas, campos):

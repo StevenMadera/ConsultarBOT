@@ -1,0 +1,4 @@
+playwright
+pymupdf
+pytesseract
+Pillow
