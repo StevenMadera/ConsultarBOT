@@ -2,6 +2,8 @@ import asyncio
 import functools
 import os
 import re
+import io
+import pytesseract
 import sys
 import time
 import unicodedata
@@ -9,6 +11,8 @@ from datetime import date, datetime, timedelta
 from difflib import get_close_matches
 from pathlib import Path
 from urllib.parse import quote_plus
+
+from PIL import Image, ImageOps, ImageFilter
 
 import pymupdf
 from playwright.async_api import Error as PlaywrightError
@@ -23,6 +27,8 @@ from consulta_consilium import consultar_consilium, url_consilium
 from consulta_fbi import consultar_fbi, url_fbi
 from consulta_justicia import TITULO_JUSTICIA, consultar_justicia, url_justicia
 from consulta_terroristas import TITULO_TERRORISTAS, consultar_terroristas, url_terroristas
+
+
 
 URL = "https://www.procuraduria.gov.co/Pages/Consulta-de-Antecedentes.aspx"
 # Tras enviar la consulta el portal puede tardar minutos; si se recarga, la consulta empieza de cero.
@@ -118,6 +124,59 @@ HOY_RE = re.compile(r"\b(hoy)\s+(\S+)\s+(\d{1,2})\s+(de)\s+([^\W\d_]+)(?:\s+(de)
 # Registraduría: "Expedida el 15 de octubre de 2026" y "hasta el 14 de Noviembre de 2026".
 EXPEDIDA_RE = re.compile(r"\b(expedida)\s+(el)\s+(\d{1,2})\s+(de)\s+([^\W\d_]+)\s+(de)\s+(\d{4})", re.IGNORECASE)
 VALIDEZ_RE = re.compile(r"\b(hasta)\s+(el)\s+(\d{1,2})\s+(de)\s+([^\W\d_]+)\s+(de)\s+(\d{4})", re.IGNORECASE)
+
+
+pytesseract.pytesseract.tesseract_cmd = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
+print("Ruta OCR:", pytesseract.pytesseract.tesseract_cmd)
+print("Versión OCR:", pytesseract.get_tesseract_version())
+
+
+def leer_captcha(imagen):
+    if not imagen:
+        print("[CAPTCHA] No se recibió ninguna imagen.")
+        return None
+
+    try:
+        # La captura de Playwright llega como bytes
+        img = Image.open(io.BytesIO(imagen)).convert("L")
+
+        # Mejorar el contraste y ampliar el texto
+        img = ImageOps.autocontrast(img)
+        img = img.resize(
+            (img.width * 3, img.height * 3)
+        )
+        img = img.filter(ImageFilter.SHARPEN)
+
+        # Reconocer texto, priorizando letras y números
+        texto = pytesseract.image_to_string(
+            img,
+            config="--oem 3 --psm 6"
+        )
+
+        print(f"\nTexto detectado en CAPTCHA:\n{texto}")
+
+        # Ajusta este patrón al formato real del ID
+        coincidencia = re.search(
+            r"\b(?=\d*[a-z])(?=[a-z]*\d)[a-z\d]+\b",
+            texto,
+            re.IGNORECASE
+        )
+
+        if coincidencia:
+            captcha = coincidencia.group(0)
+            print(f"[CAPTCHA] Captcha detectado: {captcha}")
+            return captcha
+
+        print("[CAPTCHA] No se detectó ningún captcha.")
+        return None
+
+
+    except Exception as e:
+        print(f"Error leyendo CAPTCHA: {e}")
+        return None
+
 
 
 def sin_tildes(s: str) -> str:
@@ -660,22 +719,59 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
             # La página pudo cambiar mientras esperaba su turno (o no se pudo recargar a tiempo).
             if time.monotonic() - lleno_en > documentos.VIGENCIA_CAPTCHA or not await imagen_captcha.count():
                 await llenar()
+
             await estado_ventana(page, "maximized")
             await imagen_captcha.scroll_into_view_if_needed()
             await page.bring_to_front()
+
+            print("[CAPID] Intentando tomar captura...")
+
             try:
                 imagen = await imagen_captcha.screenshot(timeout=5000)
-            except PlaywrightError:
+                print(f"[CAPID] Captura obtenida: {len(imagen)} bytes")
+            except PlaywrightError as e:
                 imagen = None
+                print(f"[CAPID] Error en captura: {e}")
+
+            if imagen:
+                print("[CAPID] Ejecutando OCR...")
+                captcha = leer_captcha(imagen)
+                print(f"[CAPID] Resultado OCR: {captcha!r}")
+            else:
+                print("[CAPID] No hay imagen para procesar.")
+
 
             pedido = time.monotonic()
-            respuesta = await preguntar("Captcha del RUNT: míralo en su ventana y escríbelo AQUÍ en la consola: ",
-                                        titulo="Captcha del RUNT", imagen=imagen, intento=intento + 1)
+
+            # Leer automáticamente el ID de la captura
+            captcha = leer_captcha(imagen)
+
+            if captcha:
+                print(f"\nCAPTCHA detectado automáticamente: {captcha}")
+                respuesta = captcha
+            else:
+                print("\nNo se pudo reconocer el CAPTCHA automáticamente.")
+
+    # Mantener la entrada manual como respaldo
+            captcha = leer_captcha(imagen)
+
+            if captcha:
+                respuesta = captcha
+                log(f"BASER: CAPID detectado automáticamente: {respuesta}")
+            else:
+                respuesta = await preguntar(
+                    "CAPTCHA del RUNT: escríbelo manualmente: ",
+                    titulo="captcha del RUNT",
+                    imagen=imagen,
+                    intento=intento + 1
+                )
+
             log(f"RUNT: código escrito en {time.monotonic() - pedido:.0f} s.")
             if not await campo_captcha.count():
                 log("RUNT: la página cambió mientras se escribía el captcha; se carga de nuevo.")
                 continue
             await campo_captcha.fill(respuesta)
+            log(f"RUNT: se escribió el CAPTCHA: {respuesta}")
             await page.get_by_role("button", name="Consultar Información").click()
         # Mientras el sitio responde ya se puede resolver el captcha siguiente.
         listo.set()
