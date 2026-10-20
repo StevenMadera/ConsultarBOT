@@ -51,5 +51,7 @@ echo [3/3] Instalando lo necesario y creando el acceso directo...
     exit /b 1
 )
 "%PY%" -3 "%CARPETA%\instalar.py"
+set "RESULTADO=%ERRORLEVEL%"
 rmdir /s /q "%TEMPORAL%" 2>nul
 pause
+exit /b %RESULTADO%

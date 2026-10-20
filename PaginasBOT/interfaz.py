@@ -22,7 +22,7 @@ from playwright.async_api import async_playwright
 import comun
 from captura_navegador import PANTALLA
 from comun import NOMBRE, RAIZ, log
-from main import (CAMPOS, FORMATO, SALIDAS, SEXOS, abrir_navegadores, cerrar_navegadores, minutos, partir_fila,
+from main import (CAMPOS, FORMATO, SEXOS, abrir_navegadores, carpeta_salidas, cerrar_navegadores, minutos, partir_fila,
                   procesar, sitios_de, validar)
 
 # actualizar.py está en la carpeta que contiene las apps; si PaginasBOT se copió sola, no hay botón de actualizar.
@@ -571,8 +571,7 @@ class Interfaz:
         if self.ruta and self.ruta.exists():
             subprocess.Popen(["explorer", "/select,", str(self.ruta)])
         else:
-            SALIDAS.mkdir(exist_ok=True)
-            os.startfile(SALIDAS)
+            os.startfile(carpeta_salidas())
 
     # ---------- Comunicación con el bot ----------
 

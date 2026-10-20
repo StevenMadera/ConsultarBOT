@@ -18,6 +18,7 @@ import pymupdf
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
+from win32com.shell import shell
 
 from captura_navegador import PAGINA_REFERENCIA, PANTALLA, abrir_en_ventanas
 from comun import CAPTURAS, FueraDeServicio, avisar, leer_respuesta, log
@@ -62,7 +63,7 @@ VIEWPORT = {"width": 1366, "height": 768}
 # La Procuraduría muestra el resultado dentro de un marco (iframe): más estrecha, el texto ocupa más alto
 # y podría quedar cortado dentro del marco. Se mantiene el ancho con el que se verificó.
 VIEWPORT_PROCURADURIA = {"width": 1920, "height": 1080}
-SALIDAS = Path(__file__).parent / "salidas"
+SALIDAS = Path(shell.SHGetKnownFolderPath(shell.FOLDERID_Documents)) / "PAGINAS"
 PLANTILLAS = {
     "Hombre": Path(__file__).parent / "Plantilla" / "Hombre.pdf",
     # Igual a la de hombre, sin la página de la libreta militar.
@@ -572,6 +573,13 @@ def rellenar_registraduria(pagina, persona: dict) -> int:
             + reescribir_frases(pagina, VALIDEZ_RE, fecha_en_frase(fecha + timedelta(days=30))))
 
 
+def carpeta_salidas() -> Path:
+    hoy = date.today()
+    carpeta = SALIDAS / MESES[hoy.month - 1].upper() / hoy.strftime("%d-%m-%Y")
+    carpeta.mkdir(parents=True, exist_ok=True)
+    return carpeta
+
+
 def insertar_en_pdf(capturas: dict[str, Path], persona: dict, caidos: set[str] = frozenset()) -> Path:
     """`caidos`: sitios fuera de servicio; su captura es la página caída."""
     formato = persona["formato"]
@@ -600,12 +608,12 @@ def insertar_en_pdf(capturas: dict[str, Path], persona: dict, caidos: set[str] =
                 doc.insert_pdf(anexo)
         else:
             log(f"PDF: falta el documento de {clave}; se omite.")
-    SALIDAS.mkdir(exist_ok=True)
+    carpeta = carpeta_salidas()
     base = re.sub(r'[<>:"/\\|?*]', "", f"{persona['numero']} - {persona['nombre']}").strip()
-    ruta = SALIDAS / f"{base}.pdf"
+    ruta = carpeta / f"{base}.pdf"
     contador = 2
     while ruta.exists():
-        ruta = SALIDAS / f"{base} ({contador}).pdf"
+        ruta = carpeta / f"{base} ({contador}).pdf"
         contador += 1
     # Sin compresión, las capturas PNG dejan el PDF en ~50 MB; deflate es sin pérdida.
     doc.save(ruta, garbage=3, deflate=True)

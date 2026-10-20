@@ -4,3 +4,4 @@ mss
 pygetwindow
 pytesseract
 Pillow
+pywin32

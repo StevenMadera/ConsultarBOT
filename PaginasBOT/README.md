@@ -31,7 +31,7 @@ Doble clic en el acceso directo **PaginasBOT** (o en `PaginasBOT.pyw`). Se abre 
    - SIMIT con varias personas: elige la que corresponde.
 
    Al empezar se abren minimizadas dos ventanas de Chrome (FBI y Consilium): no las cierres. El bot cierra cada ventana en cuanto termina su captura, también si falla la consulta, sin esperar a que termine todo el informe. Las ventanas que ya tenías abiertas no se cierran.
-3. Al terminar: «Abrir PDF», «Abrir carpeta» y lo que no se pudo consultar. Para otra persona, copia la siguiente fila. El PDF queda en `salidas/` y las capturas en `capturas/`.
+3. Al terminar: «Abrir PDF», «Abrir carpeta» y lo que no se pudo consultar. Para otra persona, copia la siguiente fila. El PDF final queda en `Documentos\PAGINAS\<MES>\<DD-MM-AAAA>\`, por ejemplo `Documentos\PAGINAS\OCTUBRE\20-10-2026\`. Se usa el día real de generación, no la fecha de consulta ingresada en Excel. Se respeta la ubicación de Documentos configurada en Windows, incluso si está en OneDrive o redirigida. Las carpetas se crean automáticamente; si el nombre ya existe, se añade un contador sin sobrescribirlo. Las capturas y PDF intermedios siguen en `capturas/`; los informes antiguos de `salidas/` no se mueven ni se borran.
 4. Cierra la ventanita para salir; si hay una consulta en curso, pregunta antes.
 
 Sin ventanita, en la consola: `py main.py` (los códigos se escriben en la consola y Enter sin texto sale).
@@ -48,6 +48,7 @@ Al abrir, PaginasBOT revisa si GitHub tiene una versión nueva. Si la hay (y tod
 
 ## Rendimiento
 - Se precargan hasta dos formularios con captcha a la vez, sin hacer esperar todos al RUNT. Una precarga se reutiliza una sola vez si el formulario sigue listo y tiene menos de 45 segundos; se conserva su antigüedad real para no alargar artificialmente la vigencia del captcha. Repetir una consulta o un captcha fuerza una carga nueva.
+- Las pestañas de recuperación se abren en segundo plano, sin activar su ventana ni tapar el captcha que se está resolviendo. Solo se muestra un captcha a la vez; el primero listo puede pasar sin esperar a que carguen los demás.
 - Cada consulta automática ocupa su propio cupo y contexto aislado. La cola permite entre dos y cuatro consultas simultáneas según CPU y RAM libre, reservando recursos para los captchas; una página lenta no retiene el cupo de todo su grupo.
 - Antes de las capturas ajustadas se comprueba estabilidad del texto y tamaño, carga de imágenes y fuentes y finalización de indicadores y animaciones finitas. No se espera a que desaparezca todo el tráfico de red (la analítica puede seguir activa). Se conservan los márgenes específicos de visores PDF y de las capturas de FBI/Consilium.
 - El OCR del RUNT se ejecuta una sola vez por imagen y fuera del bucle de consultas, manteniendo la entrada manual de respaldo.

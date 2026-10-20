@@ -135,5 +135,39 @@ class InstalacionTesseractTests(unittest.TestCase):
             self.assertIsNone(buscar_tesseract())
 
 
+class InstaladorCompletoTests(unittest.TestCase):
+    def test_instala_dependencias_navegador_ocr_accesos_y_carpeta(self):
+        with tempfile.TemporaryDirectory() as temporal:
+            base = Path(temporal)
+            app = base / "PaginasBOT.pyw"
+            app.touch()
+            app.with_name("requirements.txt").write_text("playwright\npywin32\n", encoding="utf-8")
+            carpetas = {
+                instalar.shell.FOLDERID_Documents: str(base / "Documentos OneDrive"),
+                instalar.shell.FOLDERID_Desktop: str(base / "Escritorio"),
+                instalar.shell.FOLDERID_Programs: str(base / "Inicio"),
+            }
+            for exito in (True, False):
+                with self.subTest(exito=exito), \
+                        patch.object(instalar, "buscar_apps", return_value=[app]), \
+                        patch.object(instalar, "python", return_value=exito) as ejecutar, \
+                        patch.object(instalar, "instalar_tesseract", return_value=exito) as ocr, \
+                        patch.object(instalar.shell, "SHGetKnownFolderPath", side_effect=carpetas.get), \
+                        patch.object(instalar, "crear_acceso") as acceso, \
+                        redirect_stdout(io.StringIO()) as salida:
+                    resultado = instalar.main()
+                self.assertEqual(resultado, 0 if exito else 1)
+                self.assertEqual(ejecutar.call_args_list[0].args, (
+                    "-m", "pip", "install", "--disable-pip-version-check",
+                    "-r", str(app.with_name("requirements.txt"))))
+                self.assertEqual(ejecutar.call_args_list[1].args,
+                                 ("-m", "playwright", "install", "chromium"))
+                ocr.assert_called_once()
+                self.assertEqual(acceso.call_count, 2)
+                self.assertTrue((base / "Documentos OneDrive" / "PAGINAS").is_dir())
+                if not exito:
+                    self.assertIn("Falló la instalación", salida.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

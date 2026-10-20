@@ -31,6 +31,12 @@ class CargaPaginasTests(unittest.IsolatedAsyncioTestCase):
         self.primera = self.pagina("primera")
         self.segunda = self.pagina("segunda")
         self.contexto.new_page.return_value = self.segunda
+
+        async def abrir(original):
+            return await self.contexto.new_page()
+
+        self.parches.enter_context(patch.object(
+            carga, "abrir_pestana_en_fondo", side_effect=abrir))
         self.parches.enter_context(patch.object(carga, "_sustitutas", {}))
         self.parches.enter_context(patch.object(carga, "_precargadas", {}))
 
@@ -236,6 +242,56 @@ class CargaPaginasTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CargaNavegadorTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Comprueba el foco de ventanas de Windows")
+    async def test_recuperacion_no_tapa_el_captcha_activo(self):
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32")
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=False)
+            try:
+                contexto = await browser.new_context(no_viewport=True)
+                original = await contexto.new_page()
+                await main.documentos.estado_ventana(original, "minimized")
+                activo = await (await browser.new_context(no_viewport=True)).new_page()
+                await activo.set_content("<title>Captcha activo</title><input id='respuesta'>")
+                await main.documentos.al_frente(activo)
+                self.assertTrue(await activo.evaluate("document.hasFocus()"))
+                ventana_activa = user32.GetForegroundWindow()
+
+                async def responder(route):
+                    html = "<p>Cargando</p>" if route.request.frame.page is original else '<input id="documento">'
+                    await route.fulfill(body=html, content_type="text/html")
+
+                await contexto.route("https://bot.test/**", responder)
+                with patch.object(carga, "SEGUNDA_PESTANA", 0.2), \
+                        patch.object(carga, "RECARGA", 10), patch.object(carga, "LIMITE_CARGA", 20), \
+                        patch.object(carga, "log"):
+                    ganadora = await carga.cargar_pagina(
+                        original, "https://bot.test/",
+                        lambda page: page.locator("#documento").wait_for(timeout=60000))
+                self.assertIsNot(ganadora, original)
+                self.assertIs(ganadora.context, contexto)
+                await ganadora.locator("#documento").fill("123456")
+                self.assertEqual(user32.GetForegroundWindow(), ventana_activa)
+                self.assertTrue(await activo.evaluate("document.hasFocus()"))
+                await carga.cerrar_secundarias(original)
+                self.assertEqual(user32.GetForegroundWindow(), ventana_activa)
+                self.assertTrue(await activo.evaluate("document.hasFocus()"))
+            finally:
+                await browser.close()
+
+    async def test_error_al_crear_pestana_se_propaga_y_libera_cdp(self):
+        cdp = Mock(send=AsyncMock(side_effect=PlaywrightError("fallo CDP")), detach=AsyncMock())
+        contexto = Mock(new_cdp_session=AsyncMock(return_value=cdp))
+        original = Mock(context=contexto)
+        with self.assertRaisesRegex(PlaywrightError, "fallo CDP"):
+            await carga.abrir_pestana_en_fondo(original)
+        cdp.detach.assert_awaited_once()
+        contexto.new_page.assert_not_called()
+
     async def test_precarga_real_reutilizada_conserva_antiguedad(self):
         async with async_playwright() as p:
             browser = await p.chromium.launch()

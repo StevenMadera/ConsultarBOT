@@ -129,6 +129,14 @@ def main() -> int:
     if any(pyw.stem == "PaginasBOT" for pyw in apps) and not instalar_tesseract():
         fallos.append("Tesseract OCR")
 
+    try:
+        documentos = Path(shell.SHGetKnownFolderPath(shell.FOLDERID_Documents)) / "PAGINAS"
+        documentos.mkdir(parents=True, exist_ok=True)
+        print(f"\nCarpeta de informes: {documentos}")
+    except OSError as error:
+        print(f"No se pudo crear la carpeta de informes: {error}")
+        fallos.append("la carpeta de informes")
+
     print("\nCreando accesos directos…")
     for carpeta in (shell.FOLDERID_Desktop, shell.FOLDERID_Programs):
         destino = Path(shell.SHGetKnownFolderPath(carpeta))

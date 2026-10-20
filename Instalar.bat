@@ -12,4 +12,6 @@ py -m pip install --disable-pip-version-check --quiet pywin32 || (
     exit /b 1
 )
 py "%~dp0instalar.py"
+set "RESULTADO=%ERRORLEVEL%"
 pause
+exit /b %RESULTADO%

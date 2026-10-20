@@ -100,6 +100,23 @@ async def _detener(page: Page):
         log(f"Carga inicial: no se pudo detener la pestaña pendiente ({detalle[0] if detalle else 'tiempo agotado'}).")
 
 
+async def abrir_pestana_en_fondo(original: Page) -> Page:
+    # context.new_page() activa la ventana y puede tapar el captcha que tiene el turno.
+    contexto = original.context
+    cdp = await contexto.new_cdp_session(original)
+    try:
+        info = await cdp.send("Target.getTargetInfo")
+        async with contexto.expect_page() as pendiente:
+            await cdp.send("Target.createTarget", {
+                "url": "about:blank",
+                "browserContextId": info["targetInfo"]["browserContextId"],
+                "background": True,
+            })
+        return await pendiente.value
+    finally:
+        await cdp.detach()
+
+
 async def cargar_pagina(
     page: Page,
     url: str,
@@ -185,7 +202,7 @@ async def _cargar_pagina(page, url, lista, *, recargar, configurar, reutilizar):
         nonlocal permiso
         await limite_secundarias().acquire()
         permiso = True
-        segunda = await original.context.new_page()
+        segunda = await abrir_pestana_en_fondo(original)
         paginas.append(segunda)
         if original.viewport_size:
             await segunda.set_viewport_size(original.viewport_size)
