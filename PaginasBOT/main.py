@@ -130,7 +130,6 @@ pytesseract.pytesseract.tesseract_cmd = (
     r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 )
 print("Ruta OCR:", pytesseract.pytesseract.tesseract_cmd)
-print("Versión OCR:", pytesseract.get_tesseract_version())
 
 
 def leer_captcha(imagen):

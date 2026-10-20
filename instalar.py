@@ -1,5 +1,6 @@
 """Instala los BOT de esta carpeta: sus librerías, Chromium si lo usan y un acceso directo con su ícono en el
 Escritorio y en el menú Inicio. Se abre con Instalar.bat."""
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,11 @@ RAIZ = Path(__file__).parent
 PYTHONW = Path(sys.executable).with_name("pythonw.exe")
 # Las que se instalan en los equipos; AntecedentesBOT y CuadrosBOT todavía no.
 PUBLICADAS = ("PaginasBOT",)
+TESSERACT_ID = "UB-Mannheim.TesseractOCR"
+RUTAS_TESSERACT = (
+    Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
+    Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
+)
 
 
 def buscar_apps() -> list[Path]:
@@ -23,6 +29,41 @@ def buscar_apps() -> list[Path]:
 
 def python(*argumentos: str) -> bool:
     return subprocess.run([sys.executable, *argumentos]).returncode == 0
+
+
+def instalar_tesseract() -> bool:
+    tesseract = shutil.which("tesseract")
+    if tesseract or any(ruta.is_file() for ruta in RUTAS_TESSERACT):
+        print(f"Tesseract OCR ya está instalado: {tesseract or next(r for r in RUTAS_TESSERACT if r.is_file())}")
+        return True
+
+    winget = shutil.which("winget")
+    if not winget:
+        print("No se encontró Tesseract ni WinGet. Instala Tesseract OCR y vuelve a ejecutar el instalador.")
+        return False
+
+    print("\nInstalando Tesseract OCR…")
+    try:
+        resultado = subprocess.run(
+            [winget, "install", "--exact", "--id", TESSERACT_ID, "--silent",
+             "--accept-package-agreements", "--accept-source-agreements"],
+            capture_output=True, text=True, timeout=600,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"No se pudo ejecutar la instalación de Tesseract OCR: {error}")
+        return False
+
+    tesseract = shutil.which("tesseract")
+    ruta = next((ruta for ruta in RUTAS_TESSERACT if ruta.is_file()), None)
+    if resultado.returncode == 0 and (tesseract or ruta):
+        print(f"Tesseract OCR quedó instalado: {tesseract or ruta}")
+        return True
+
+    detalle = (resultado.stderr or resultado.stdout).strip().splitlines()
+    print("No se pudo instalar Tesseract OCR con WinGet.")
+    if detalle:
+        print(detalle[-1])
+    return False
 
 
 def crear_acceso(ruta: Path, pyw: Path):
@@ -58,6 +99,8 @@ def main() -> int:
         print("\nInstalando Chromium para Playwright…")
         if not python("-m", "playwright", "install", "chromium"):
             fallos.append("Chromium")
+    if any(pyw.stem == "PaginasBOT" for pyw in apps) and not instalar_tesseract():
+        fallos.append("Tesseract OCR")
 
     print("\nCreando accesos directos…")
     for carpeta in (shell.FOLDERID_Desktop, shell.FOLDERID_Programs):

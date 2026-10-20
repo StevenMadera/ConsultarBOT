@@ -7,7 +7,7 @@ Consulta automática de una persona en varias páginas públicas, con captura de
 - Edge o Chrome como navegador por defecto
 
 ## Instalación (una sola vez por equipo)
-Doble clic en `Instalar PaginasBOT.bat` (está en la raíz del repositorio; basta enviar ese archivo). Instala Python 3.14 para el usuario si falta, descarga el programa en `C:\Users\<usuario>\BOTs`, instala las librerías y Chromium y crea el acceso directo **PaginasBOT** en el Escritorio y en el menú Inicio. Si algo se daña, volver a ejecutarlo lo repara sin borrar `salidas/`.
+Doble clic en `Instalar PaginasBOT.bat` (está en la raíz del repositorio; basta enviar ese archivo). Instala Python 3.14 para el usuario si falta, descarga el programa en `C:\Users\<usuario>\BOTs`, instala las librerías, Chromium y Tesseract OCR (con WinGet si aún no está instalado), y crea el acceso directo **PaginasBOT** en el Escritorio y en el menú Inicio. Si algo se daña, volver a ejecutarlo lo repara sin borrar `salidas/`.
 
 Con la carpeta ya descargada (por ejemplo, con `git clone`): doble clic en `Instalar.bat` de la raíz. Si se mueve la carpeta, se vuelve a ejecutar.
 
@@ -34,7 +34,7 @@ Doble clic en el acceso directo **PaginasBOT** (o en `PaginasBOT.pyw`). Se abre 
 Sin ventanita, en la consola: `py main.py` (los códigos se escriben en la consola y Enter sin texto sale).
 
 ## Actualizaciones
-Al abrir, PaginasBOT revisa si GitHub tiene una versión nueva. Si la hay (y todavía no se empezó una consulta), muestra «Actualizando…», baja los cambios (con `git pull` si se instaló con `git clone`; si no, solo los archivos que cambiaron), vuelve a ejecutar el instalador y se abre de nuevo sola. `salidas/`, `capturas/` y `log.txt` no se tocan. Donde se programa (cambios sin commit o commits sin subir) nunca se actualiza.
+Al abrir, PaginasBOT revisa si GitHub tiene una versión nueva. Si la hay (y todavía no se empezó una consulta), muestra «Actualizando…», baja los cambios (con `git pull` si se instaló con `git clone`; si no, solo los archivos que cambiaron), vuelve a ejecutar el instalador —que instala Tesseract OCR con WinGet si falta— y se abre de nuevo sola. `salidas/`, `capturas/` y `log.txt` no se tocan. Donde se programa (cambios sin commit o commits sin subir) nunca se actualiza.
 
 ## Antes de ejecutar
 - Cierra videos flotantes u otras ventanas encima del navegador: salen en la captura del FBI y de Consilium. La ventanita de PaginasBOT no sale (Windows la excluye de las capturas de pantalla; tampoco aparece en tus recortes ni al compartir pantalla).
