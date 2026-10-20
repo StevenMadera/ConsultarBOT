@@ -27,6 +27,7 @@ from consulta_consilium import consultar_consilium, url_consilium
 from consulta_fbi import consultar_fbi, url_fbi
 from consulta_justicia import TITULO_JUSTICIA, consultar_justicia, url_justicia
 from consulta_terroristas import TITULO_TERRORISTAS, consultar_terroristas, url_terroristas
+from ocr import buscar_tesseract
 
 
 
@@ -126,9 +127,9 @@ EXPEDIDA_RE = re.compile(r"\b(expedida)\s+(el)\s+(\d{1,2})\s+(de)\s+([^\W\d_]+)\
 VALIDEZ_RE = re.compile(r"\b(hasta)\s+(el)\s+(\d{1,2})\s+(de)\s+([^\W\d_]+)\s+(de)\s+(\d{4})", re.IGNORECASE)
 
 
-pytesseract.pytesseract.tesseract_cmd = (
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-)
+tesseract = buscar_tesseract()
+if tesseract:
+    pytesseract.pytesseract.tesseract_cmd = str(tesseract)
 print("Ruta OCR:", pytesseract.pytesseract.tesseract_cmd)
 
 
