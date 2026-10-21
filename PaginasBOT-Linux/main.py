@@ -1877,8 +1877,6 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
         except Exception as e:
             log(f"Chrome: no se pudieron abrir de antemano FBI y Consilium ({e}); se abrirán al capturarlas.")
 
-    apertura_chrome = asyncio.create_task(abrir_en_chrome())
-
     async def registrar(clave: str, consulta):
         with medir_sitio(clave):
             await _registrar(clave, consulta)
@@ -1946,8 +1944,6 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
             sitio("terroristas", url_terroristas(persona), TITULO_TERRORISTAS),
             sitio("justicia", url_justicia(persona), TITULO_JUSTICIA),
         )
-
-    eeuu = asyncio.create_task(grupo_eeuu())
 
     async def con_captcha(clave: str, consulta, *args):
         async def ejecutar():
@@ -2032,6 +2028,20 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
         await asyncio.gather(*tareas)
         log(f"Tiempo: {nombre} a los {minutos(time.monotonic() - inicio)}")
 
+    # El RUNT, primer captcha, va solo hasta que le toca su turno: con todo a la vez, su página y las de los demás
+    # captchas tardaban más de un minuto en abrir. Lo demás carga mientras se escribe su código.
+    primero = asyncio.create_task(con_captcha("runt", consultar_runt, preguntar))
+    turno = asyncio.create_task(turnos.repartido.wait())
+    try:
+        await asyncio.wait([primero, turno], timeout=PRIORIDAD_RUNT, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        primero.cancel()
+        raise
+    finally:
+        turno.cancel()
+    apertura_chrome = asyncio.create_task(abrir_en_chrome())
+    eeuu = asyncio.create_task(grupo_eeuu())
+
     # Las más largas primero: el límite deja esperando a las últimas en un equipo débil.
     await asyncio.gather(
         fase(
@@ -2053,7 +2063,7 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
                 ("bid", consultar_bid), ("canada", consultar_canada), ("tesoro", consultar_tesoro))]
               if persona["formato"] == "Gallagher" else []),
         ),
-        con_captcha("runt", consultar_runt, preguntar),
+        primero,
         con_captcha("antecedentes", documentos.consultar_antecedentes),
         con_captcha("registraduria", documentos.consultar_registraduria, preguntar),
         con_captcha("inhabilidades", documentos.consultar_inhabilidades),
