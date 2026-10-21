@@ -5,6 +5,7 @@ import contextlib
 import itertools
 import re
 import time
+import weakref
 from datetime import date, datetime
 from pathlib import Path
 
@@ -39,6 +40,10 @@ ESPERA_CAPTCHA = 180000
 # Segundos que la casilla de Google puede seguir sin dejarse marcar (sin terminar de cargar, o girando tras pulsarla
 # sin abrir las imágenes) antes de dar el sitio por fuera de servicio. Funcionando, responde en 1-3 s.
 ESPERA_CASILLA = 30
+# Si la casilla tardó más que esto en marcarse, o no se marcó, su contexto queda en casillas_lentas y main cambia
+# esa ventana por una limpia: Google la endurece cada vez más en la misma ventana.
+CASILLA_LENTA = 60
+casillas_lentas = weakref.WeakSet()
 ESTADO_CASILLA_JS = """e => {
     const r = e.getBoundingClientRect(), giro = e.querySelector('.recaptcha-checkbox-spinner');
     return {lista: r.width > 0 && r.height > 0, girando: !!giro && parseFloat(getComputedStyle(giro).opacity) > 0};
@@ -477,7 +482,10 @@ async def _esperar_recaptcha(page, sitio: str, recuadro) -> bool:
     try:
         while time.monotonic() < limite:
             if await page.evaluate(RECAPTCHA_RESUELTO_JS):
-                log(f"{sitio}: casilla marcada en {time.monotonic() - inicio:.0f} s.")
+                tardo = time.monotonic() - inicio
+                log(f"{sitio}: casilla marcada en {tardo:.0f} s.")
+                if tardo > CASILLA_LENTA:
+                    casillas_lentas.add(page.context)
                 return True
             if await caducada.is_visible():
                 return False
@@ -492,6 +500,7 @@ async def _esperar_recaptcha(page, sitio: str, recuadro) -> bool:
                         motivo += " (Google avisa que el sitio superó su cuota gratuita de reCAPTCHA)"
                 raise FueraDeServicio(motivo)
             await asyncio.sleep(0.5)
+        casillas_lentas.add(page.context)
         raise ValueError(f"{sitio}: no se resolvió el captcha en {ESPERA_CAPTCHA // 60000} minutos.")
     finally:
         avisar("accion_fin")
