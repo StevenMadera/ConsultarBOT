@@ -68,6 +68,13 @@ SALIDAS = Path(shell.SHGetKnownFolderPath(shell.FOLDERID_Documents)) / "PAGINAS"
 PERFIL_RUNT = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / NOMBRE / "perfil_runt"
 # Al abrir, el RUNT carga solo hasta estos segundos: con todo a la vez tardaba 20-100 s en un equipo de 2 núcleos.
 PRIORIDAD_RUNT = 20
+# Google pone la casilla «No soy un robot» cada vez más difícil y lenta en la misma ventana: cada RENOVAR_CADA consultas,
+# o si la casilla tardó, la ventana se cambia por una limpia.
+CON_CASILLA = ("antecedentes", "inhabilidades")
+RENOVAR_CADA = 5
+# Sin la marca de navegador automatizado (navigator.webdriver), que también le hace poner la casilla más difícil.
+SIN_AUTOMATIZACION = {"args": ["--start-maximized", "--disable-blink-features=AutomationControlled"],
+                      "ignore_default_args": ["--enable-automation"]}
 PLANTILLAS = {
     "Hombre": Path(__file__).parent / "Plantilla" / "Hombre.pdf",
     # Igual a la de hombre, sin la página de la libreta militar.
@@ -1634,6 +1641,17 @@ async def abrir_perfil_runt(p, opciones: dict):
         return None
 
 
+async def abrir_visible(p):
+    """Navegador de las ventanas con captcha: el Google Chrome instalado, que Google ve como un Chrome normal; si no
+    abre, el Chromium del bot."""
+    try:
+        return await p.chromium.launch(headless=False, channel="chrome", **SIN_AUTOMATIZACION)
+    except PlaywrightError as e:
+        log(f"Ventanas de captcha: no abrió Google Chrome ({(str(e).splitlines() or [''])[0]}); se usa el Chromium "
+            "del bot.")
+        return await p.chromium.launch(headless=False, **SIN_AUTOMATIZACION)
+
+
 async def abrir_navegadores(p) -> dict:
     """Abre los navegadores y los documentos fijos mientras se escriben los datos.
 
@@ -1644,7 +1662,7 @@ async def abrir_navegadores(p) -> dict:
     # El headless nuevo (canal "chromium") incluye el visor de PDF que usa la libreta.
     automatico, visible, perfil_runt = await asyncio.gather(
         p.chromium.launch(headless=True, channel="chromium", args=[f"--host-resolver-rules={REGLAS_BLOQUEO}"]),
-        p.chromium.launch(headless=False, args=["--start-maximized"]),
+        abrir_visible(p),
         abrir_perfil_runt(p, opciones),
     )
     # Una pestaña por contexto: Chrome frena las pestañas en segundo plano de una misma ventana.
@@ -1665,10 +1683,12 @@ async def abrir_navegadores(p) -> dict:
         "documentos": pdfs,
         "ventanas": {},
         "precargas": {},
+        "usos": dict.fromkeys(CON_CASILLA, 0),
     }
     # Sitios con captcha: cada uno en su ventana, minimizada mientras se llena; sale al frente en su turno.
     async def nueva_ventana():
-        return await (await visible.new_context(no_viewport=True, **opciones)).new_page()
+        # Con el user agent propio del navegador: si no coincide con su versión real, Google desconfía.
+        return await (await visible.new_context(no_viewport=True, ignore_https_errors=True)).new_page()
 
     async def ventana_minimizada(clave):
         if clave == "runt" and perfil_runt:
@@ -1705,13 +1725,26 @@ async def abrir_navegadores(p) -> dict:
             finally:
                 limite_precarga.release()
 
-    for clave, url, lista in (
-        ("runt", URL_RUNT, lambda p: p.locator("img.img-fluid").first.wait_for(timeout=60000)),
-        ("registraduria", documentos.URL_REGISTRADURIA, documentos.formulario_registraduria_listo),
-        ("antecedentes", documentos.URL_ANTECEDENTES, documentos.formulario_antecedentes_listo),
-        ("inhabilidades", documentos.URL_INHABILIDADES, documentos.formulario_inhabilidades_listo),
-    ):
+    formularios = {
+        "runt": (URL_RUNT, lambda p: p.locator("img.img-fluid").first.wait_for(timeout=60000)),
+        "registraduria": (documentos.URL_REGISTRADURIA, documentos.formulario_registraduria_listo),
+        "antecedentes": (documentos.URL_ANTECEDENTES, documentos.formulario_antecedentes_listo),
+        "inhabilidades": (documentos.URL_INHABILIDADES, documentos.formulario_inhabilidades_listo),
+    }
+    for clave, (url, lista) in formularios.items():
         r["precargas"][clave] = asyncio.create_task(precargar_limitada(clave, url, lista))
+
+    async def renovar(clave):
+        """Cambia la ventana del sitio por una limpia (sin las cookies de Google) y deja su formulario listo."""
+        vieja = r["ventanas"][clave]
+        r["ventanas"][clave] = await ventana_minimizada(clave)
+        try:
+            await vieja.context.close()
+        except PlaywrightError:
+            pass
+        await precargar_limitada(clave, *formularios[clave])
+
+    r["renovar"] = renovar
     r["consolidado"] = Documento(await onu.new_page(), despues_del_runt(cargar_consolidado), "consolidado",
                                  "Documento consolidado")
     r["consolium"] = Documento(await eurlex.new_page(), despues_del_runt(cargar_eurlex), "consolium", "EUR-Lex")
@@ -2079,7 +2112,23 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
         *(con_captcha(*captcha) for captcha in captchas[1:]),
         edge(),
     )
+    renovar_ventanas(r, omitidos)
     return capturas, caidos
+
+
+def renovar_ventanas(r: dict, omitidos: set[str]):
+    """Al terminar la consulta, con la pantalla libre, cambia por una limpia la ventana de cada casilla «No soy un
+    robot» que ya lleva RENOVAR_CADA consultas o que tardó; la siguiente consulta espera a que esté lista."""
+    for clave in CON_CASILLA:
+        if clave in omitidos:
+            continue
+        r["usos"][clave] += 1
+        lenta = r["ventanas"][clave].context in documentos.casillas_lentas
+        if lenta or r["usos"][clave] >= RENOVAR_CADA:
+            motivo = "su casilla tardó" if lenta else f"lleva {RENOVAR_CADA} consultas"
+            log(f"{clave}: se cambia su ventana por una limpia ({motivo}).")
+            r["usos"][clave] = 0
+            r["precargas"][clave] = asyncio.create_task(r["renovar"](clave))
 
 
 async def procesar(persona: dict, apertura: asyncio.Task, preguntar, preguntar_edge) -> Path | None:

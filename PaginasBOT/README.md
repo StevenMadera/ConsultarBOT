@@ -27,6 +27,7 @@ Doble clic en el acceso directo **PaginasBOT** (o en `PaginasBOT.pyw`). Se abre 
 2. La ventanita muestra el avance de cada sitio. Cuando te necesita, suena un aviso:
    - RUNT y Registraduría: la imagen del código aparece en la ventanita; escríbelo y pulsa Enter.
    - Antecedentes e Inhabilidades (Policía): la ventanita se pasa a la esquina superior derecha; marca "No soy un robot" en la ventana del navegador y el bot sigue solo.
+     Las ventanas de captcha son del Google Chrome instalado (si no lo hay, del Chromium del bot), sin la marca de navegador automatizado que hace que Google pida más imágenes. Cada 5 consultas, o si la casilla tardó más de un minuto o no se marcó, las ventanas de Antecedentes e Inhabilidades se cambian por unas nuevas, sin las cookies de Google, al terminar la consulta.
    - FBI o Consilium (verificación de Cloudflare o cookies): haz el paso en el navegador y pulsa «Listo».
    - SIMIT con varias personas: elige la que corresponde.
 

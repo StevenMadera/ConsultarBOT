@@ -95,6 +95,8 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
         r["navegadores"] = (contexto.browser, contexto.browser)
         r["ventanas"] = {clave: page for clave in documentos.ORDEN_TURNOS}
         r["precargas"] = {clave: asyncio.create_task(asyncio.sleep(0)) for clave in r["ventanas"]}
+        r["usos"] = dict.fromkeys(main.CON_CASILLA, 0)
+        r["renovar"] = AsyncMock()
         for nombre in ("consolidado", "consolium"):
             r[nombre] = SimpleNamespace(clave=nombre, page=page,
                                        buscar=lambda persona, nombre=nombre: trabajo(nombre))
@@ -218,6 +220,74 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
         p.chromium.launch = AsyncMock(return_value=browser)
         return p
 
+    async def test_ventanas_de_la_casilla_se_cambian_cada_tantas_consultas_o_si_tardo(self):
+        renovadas = []
+
+        async def renovar(clave):
+            renovadas.append(clave)
+
+        normal, lenta = Mock(), Mock()
+        r = {"usos": dict.fromkeys(main.CON_CASILLA, 0), "renovar": renovar, "precargas": {},
+             "ventanas": {clave: Mock(context=normal) for clave in main.CON_CASILLA}}
+        with patch.object(main, "log"):
+            for _ in range(main.RENOVAR_CADA - 1):
+                main.renovar_ventanas(r, set())
+            self.assertEqual(r["precargas"], {})
+            # Sin fecha de expedición, Inhabilidades no se consultó: no cuenta.
+            main.renovar_ventanas(r, {"inhabilidades"})
+            await asyncio.gather(*r["precargas"].values())
+            self.assertEqual(renovadas, ["antecedentes"])
+            self.assertEqual(r["usos"], {"antecedentes": 0, "inhabilidades": main.RENOVAR_CADA - 1})
+            r["ventanas"]["antecedentes"] = Mock(context=lenta)
+            documentos.casillas_lentas.add(lenta)
+            main.renovar_ventanas(r, set())
+            await asyncio.gather(*r["precargas"].values())
+        self.assertEqual(renovadas, ["antecedentes", "antecedentes", "inhabilidades"])
+        self.assertEqual(r["usos"], {"antecedentes": 0, "inhabilidades": 0})
+
+    async def test_renovar_cambia_la_ventana_cierra_la_vieja_y_deja_el_formulario_listo(self):
+        async def nueva_pagina():
+            pagina = Mock()
+            pagina.context.close = AsyncMock()
+            return pagina
+
+        precargas = []
+
+        async def precargar(page, url, lista):
+            precargas.append((page, url))
+
+        p = self._playwright_falso()
+        p.chromium.launch.return_value.new_context.return_value.new_page = AsyncMock(side_effect=nueva_pagina)
+        with patch.object(main, "estado_ventana", new_callable=AsyncMock), \
+                patch.object(main, "abrir_perfil_runt", AsyncMock(return_value=None)), \
+                patch.object(documentos, "precargar", side_effect=precargar), \
+                patch.object(main, "Documento"), patch.object(rendimiento, "log"):
+            r = await main.abrir_navegadores(p)
+            await asyncio.wait_for(asyncio.gather(*r["precargas"].values()), 2)
+            vieja = r["ventanas"]["antecedentes"]
+            await asyncio.wait_for(r["renovar"]("antecedentes"), 2)
+        nueva = r["ventanas"]["antecedentes"]
+        self.assertIsNot(nueva, vieja)
+        vieja.context.close.assert_awaited_once()
+        nueva.context.close.assert_not_awaited()
+        self.assertEqual(precargas[-1], (nueva, documentos.URL_ANTECEDENTES))
+
+    async def test_ventanas_de_captcha_sin_marca_de_automatizado_y_con_respaldo(self):
+        navegador = Mock()
+        p = Mock()
+        p.chromium.launch = AsyncMock(side_effect=[main.PlaywrightError("Chromium distribution 'chrome' is not found"),
+                                                   navegador])
+        with patch.object(main, "log") as log:
+            self.assertIs(await main.abrir_visible(p), navegador)
+        primera, segunda = p.chromium.launch.call_args_list
+        self.assertEqual(primera.kwargs["channel"], "chrome")
+        self.assertNotIn("channel", segunda.kwargs)
+        for llamada in (primera, segunda):
+            self.assertFalse(llamada.kwargs["headless"])
+            self.assertIn("--disable-blink-features=AutomationControlled", llamada.kwargs["args"])
+            self.assertEqual(llamada.kwargs["ignore_default_args"], ["--enable-automation"])
+        self.assertIn("Chromium del bot", log.call_args.args[0])
+
     async def test_mediciones_separan_etapas_sin_contar_doble(self):
         with patch.object(rendimiento, "log") as log:
             with rendimiento.medir_sitio("prueba"):
@@ -260,6 +330,30 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EstabilidadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_casilla_lenta_o_sin_resolver_marca_su_ventana(self):
+        html = """<textarea name="g-recaptcha-response"></textarea>
+            <iframe srcdoc="<div id='recaptcha-anchor' style='width:20px;height:20px'></div>"></iframe>
+            <script>setTimeout(() => document.querySelector('textarea').value = 'TOKEN', 300)</script>"""
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                with patch.object(documentos, "log"), patch.object(documentos, "avisar"):
+                    for lenta, marcada in ((60, False), (0.1, True)):
+                        contexto = await browser.new_context()
+                        page = await contexto.new_page()
+                        await page.set_content(html)
+                        with patch.object(documentos, "CASILLA_LENTA", lenta):
+                            self.assertTrue(await documentos.esperar_recaptcha(page, "Prueba", page.locator("iframe")))
+                        self.assertEqual(contexto in documentos.casillas_lentas, marcada)
+                    contexto = await browser.new_context()
+                    page = await contexto.new_page()
+                    await page.set_content(html.replace("TOKEN", ""))
+                    with patch.object(documentos, "ESPERA_CAPTCHA", 1000), self.assertRaises(ValueError):
+                        await documentos.esperar_recaptcha(page, "Prueba", page.locator("iframe"))
+                    self.assertIn(contexto, documentos.casillas_lentas)
+            finally:
+                await browser.close()
+
     async def test_espera_resultado_y_no_espera_trafico_de_analitica(self):
         async with async_playwright() as p:
             browser = await p.chromium.launch()

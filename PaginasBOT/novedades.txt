@@ -1,6 +1,10 @@
 # Lo que ve cada equipo en la ventana de novedades al actualizarse. Lo más nuevo arriba.
 # Cada versión empieza con una línea «== título ==» distinta; cada cambio, con «- ». Las líneas con # no se muestran.
 
+== 21 de octubre de 2026 (captchas) ==
+- Las ventanas de captcha ahora son de Google Chrome y Google ya no las ve como un navegador automatizado: la casilla «No soy un robot» de Antecedentes e Inhabilidades debería pedir menos imágenes.
+- Cada 5 consultas, o si la casilla tardó más de un minuto, esas dos ventanas se cambian solas por unas nuevas, para que no se vuelvan lentas.
+
 == 21 de octubre de 2026 (tarde) ==
 - Al empezar la consulta, el RUNT carga primero y lo demás después: RUNT, Antecedentes e Inhabilidades ya no se quedan cargando uno o dos minutos.
 - Las páginas con captcha que ya estaban listas se aprovechan aunque el equipo esté ocupado, en vez de volver a cargarlas.
