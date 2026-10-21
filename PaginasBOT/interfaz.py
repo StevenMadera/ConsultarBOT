@@ -15,6 +15,7 @@ import tkinter as tk
 import traceback
 import winsound
 from ctypes import wintypes
+from pathlib import Path
 from tkinter import messagebox, ttk
 
 from playwright.async_api import async_playwright
@@ -23,7 +24,7 @@ import comun
 from captura_navegador import PANTALLA
 from comun import NOMBRE, RAIZ, log
 from main import (CAMPOS, FORMATO, SEXOS, abrir_navegadores, carpeta_salidas, cerrar_navegadores, minutos, partir_fila,
-                  procesar, sitios_de, validar)
+                  procesar, sin_fecha_expedicion, sitios_de, validar)
 
 # actualizar.py está en la carpeta que contiene las apps; si PaginasBOT se copió sola, no hay botón de actualizar.
 sys.path.append(str(RAIZ.parent))
@@ -73,6 +74,9 @@ TERMINADOS = {"listo", "error", "no_aplica", "fuera_servicio"}
 ETIQUETAS = ("Nombre", "Documento", "Empresa", "Fecha consulta", "Quién consulta", "Fecha expedición")
 # Lo que la ventana ya muestra de otra forma.
 OMITIDOS = re.compile(r"Captura |Tiempo|Datos:|PDF: [A-Za-z]:\\")
+NOVEDADES = RAIZ / "novedades.txt"
+# Fuera de la carpeta del programa: un archivo nuevo ahí frenaría la actualización con git.
+NOVEDADES_VISTAS = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / NOMBRE / "novedades_vistas.txt"
 
 user32 = ctypes.windll.user32
 
@@ -125,6 +129,27 @@ def explicar(detalle: str) -> str:
     return detalle if len(detalle) <= 110 else detalle[:109] + "…"
 
 
+def novedades_pendientes() -> list[tuple[str, list[str]]]:
+    """Las versiones de novedades.txt que este equipo aún no vio, la más nueva primero."""
+    try:
+        lineas = NOVEDADES.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    versiones = []
+    for linea in map(str.strip, lineas):
+        if linea.startswith("==") and linea.endswith("=="):
+            versiones.append((linea.strip("= "), []))
+        elif linea.startswith("-") and versiones:
+            versiones[-1][1].append(linea.lstrip("- "))
+    try:
+        vista = NOVEDADES_VISTAS.read_text(encoding="utf-8").strip()
+    except OSError:
+        vista = None
+    titulos = [titulo for titulo, _ in versiones]
+    # La primera vez en un equipo solo se muestra la última versión.
+    return versiones[:titulos.index(vista)] if vista in titulos else versiones[:1]
+
+
 class Interfaz:
     def __init__(self):
         self.root = tk.Tk()
@@ -145,6 +170,7 @@ class Interfaz:
         self.capturando: tuple[str, ...] = ()
         self.sitios: dict[str, str] = {}
         self.detalles: dict[str, str] = {}
+        self.omitidos: list[str] = []
         self.chips = {}
         self.inicio = 0.0
         self.ruta = None
@@ -190,6 +216,7 @@ class Interfaz:
         threading.Thread(target=self._hilo_bot, daemon=True).start()
         if actualizar:
             threading.Thread(target=self._buscar_version, daemon=True).start()
+            self.root.after(700, self._mostrar_novedades)
         self.root.after(200, self._atender)
         self.root.after(600, self._vigilar_portapapeles)
 
@@ -308,9 +335,11 @@ class Interfaz:
         self.caidos.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.no_aplica = ttk.Label(v, style="Suave.TLabel", wraplength=360, justify="left")
         self.no_aplica.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Separator(v).grid(row=6, column=0, columnspan=2, sticky="we", pady=(14, 10))
+        self.texto_omitidos = ttk.Label(v, style="Aviso.TLabel", wraplength=360, justify="left")
+        self.texto_omitidos.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Separator(v).grid(row=7, column=0, columnspan=2, sticky="we", pady=(14, 10))
         pie = ttk.Frame(v)
-        pie.grid(row=7, column=0, columnspan=2, sticky="w")
+        pie.grid(row=8, column=0, columnspan=2, sticky="w")
         ttk.Button(pie, text="Nueva consulta", command=self._nueva).pack(side="left")
         ttk.Label(pie, text="o copia la siguiente fila en Excel", style="Pie.TLabel").pack(side="left", padx=(10, 0))
         return v
@@ -553,6 +582,8 @@ class Interfaz:
         self.sitios = dict.fromkeys(claves, "pendiente")
         self.detalles = {}
         self.chips = {}
+        omitidos = sin_fecha_expedicion(persona)
+        self.omitidos = [nombre for clave, nombre in SITIOS.items() if clave in omitidos]
         filas = -(-len(claves) // 3)
         for i, clave in enumerate(claves):
             marco = ttk.Frame(self.rejilla)
@@ -728,8 +759,10 @@ class Interfaz:
         if caidos:
             caidos.append("En el informe van sus páginas caídas, marcadas en la portada como «Fuera de servicio».")
         no_aplica = [SITIOS[clave] for clave, estado in self.sitios.items() if estado == "no_aplica"]
+        omitidos = (f"Sin fecha de expedición se omitieron: {', '.join(self.omitidos)}." if self.omitidos else "")
         for etiqueta, texto in ((self.fallos, "\n".join(fallos)), (self.caidos, "\n".join(caidos)),
-                                (self.no_aplica, f"No aplica: {', '.join(no_aplica)}." if no_aplica else "")):
+                                (self.no_aplica, f"No aplica: {', '.join(no_aplica)}." if no_aplica else ""),
+                                (self.texto_omitidos, omitidos)):
             etiqueta.configure(text=texto)
             if texto:
                 etiqueta.grid()
@@ -750,6 +783,41 @@ class Interfaz:
             self._cerrar_ya()
 
     # ---------- Actualización ----------
+
+    def _mostrar_novedades(self):
+        """Tras actualizarse, lo que cambió (novedades.txt), una sola vez por versión."""
+        versiones = novedades_pendientes()
+        if not versiones:
+            return
+        ventana = tk.Toplevel(self.root)
+        ventana.withdraw()
+        ventana.title(f"{NOMBRE} · Novedades")
+        ventana.configure(background=FONDO)
+        ventana.resizable(False, False)
+        ventana.transient(self.root)
+        v = ttk.Frame(ventana, padding=(22, 18, 22, 14))
+        v.pack(fill="both", expand=True)
+        ttk.Label(v, text=f"{NOMBRE} se actualizó", style="Titulo.TLabel").pack(anchor="w")
+        # Si estuvo mucho sin abrirse, solo las tres últimas versiones: la ventana no debe pasar del alto de la pantalla.
+        for titulo, cambios in versiones[:3]:
+            ttk.Label(v, text=titulo, style="Negrita.TLabel").pack(anchor="w", pady=(12, 2))
+            for cambio in cambios:
+                ttk.Label(v, text=f"•  {cambio}", wraplength=400, justify="left").pack(anchor="w", pady=1)
+        boton = ttk.Button(v, text="Entendido", style="Acento.TButton", command=ventana.destroy)
+        boton.pack(anchor="e", pady=(14, 0))
+        ventana.bind("<Return>", lambda _: ventana.destroy())
+        ventana.update_idletasks()
+        izquierda, arriba, derecha, abajo = area_de_trabajo()
+        ventana.geometry(f"+{(izquierda + derecha - ventana.winfo_reqwidth()) // 2}"
+                         f"+{max(arriba, (arriba + abajo - ventana.winfo_reqheight()) // 2)}")
+        ventana.attributes("-topmost", True)
+        ventana.deiconify()
+        boton.focus_set()
+        try:
+            NOVEDADES_VISTAS.parent.mkdir(parents=True, exist_ok=True)
+            NOVEDADES_VISTAS.write_text(versiones[0][0], encoding="utf-8")
+        except OSError as e:
+            log(f"Novedades: no se pudo guardar que ya se vieron ({e}).")
 
     def _buscar_version(self):
         if actualizar.hay_version_nueva():

@@ -2,6 +2,7 @@ import asyncio
 import sys
 import unittest
 from contextlib import ExitStack
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -25,7 +26,10 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
     async def test_gallagher_conserva_todos_los_sitios(self):
         await self.verificar_cola("Gallagher")
 
-    async def verificar_cola(self, formato):
+    async def test_sin_fecha_de_expedicion_omite_las_consultas_que_la_piden(self):
+        await self.verificar_cola("Hombre", fecha_expedicion=None)
+
+    async def verificar_cola(self, formato, fecha_expedicion=date(2020, 1, 1)):
         activos, maximo = 0, 0
         iniciados = []
         govuk_listo = asyncio.Event()
@@ -96,7 +100,8 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(main, "consultas_edge",
                                             return_value={"fbi": Path("fbi.png"), "consilium": Path("consilium.png")}))
             capturas, caidos = await asyncio.wait_for(main.consultar_persona(
-                {"formato": formato, "sexo": "Hombre", "nombre": "Prueba"},
+                {"formato": formato, "sexo": "Hombre", "nombre": "Prueba", "tipo": "CC",
+                 "fecha_expedicion": fecha_expedicion},
                 r, AsyncMock(), Mock()), 5)
         self.assertTrue(govuk_listo.is_set())
         self.assertEqual(maximo, 2)
@@ -108,6 +113,9 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
         }
         if formato == "Gallagher":
             esperadas.update(("contadores", "dian", "samm", "bid", "canada", "tesoro", "insight"))
+        if fecha_expedicion is None:
+            esperadas -= {"registraduria", "rnmc", "inhabilidades"}
+            self.assertNotIn("rnmc", iniciados)
         self.assertEqual(set(capturas), esperadas)
 
     async def test_precargas_esperan_al_runt_un_tiempo_y_luego_van_de_dos_en_dos(self):

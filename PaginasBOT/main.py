@@ -194,18 +194,18 @@ CAMPOS = ("nombre", "documento", "empresa", "fecha consulta", "quien consulta", 
 FORMATO = (
     "Copia la fila de Excel con: nombre, documento, empresa, fecha consulta, quien consulta, fecha expedicion, sexo "
     "(ej. Santiago Flores Alonso | 1000858557 | FALABELLA CEDI | 16/09/2026 | STEVEN | 25/06/2020 | H). "
-    "Sexo: H (hombre) o M (mujer). A mano, separa los datos con ;"
+    "Fecha expedicion: 0 si no se tiene. Sexo: H (hombre) o M (mujer). A mano, separa los datos con ;"
 )
 SEXOS = {"H": "Hombre", "HOMBRE": "Hombre", "M": "Mujer", "MUJER": "Mujer"}
 
 
-def leer_fecha(texto: str, campo: str) -> date:
+def leer_fecha(texto: str, campo: str, ayuda: str = "Usa dd/mm/aaaa.") -> date:
     for formato in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
         try:
             return datetime.strptime(texto, formato).date()
         except ValueError:
             pass
-    raise ValueError(f"{campo.capitalize()} no válida: {texto!r}. Usa dd/mm/aaaa.")
+    raise ValueError(f"{campo.capitalize()} no válida: {texto!r}. {ayuda}")
 
 
 def partir_fila(linea: str) -> list[str]:
@@ -249,7 +249,9 @@ def validar(campos: list[str]) -> dict:
         "empresa": empresa,
         "fecha_consulta": leer_fecha(fecha_consulta, "fecha de consulta"),
         "consultor": consultor,
-        "fecha_expedicion": leer_fecha(fecha_expedicion, "fecha de expedición"),
+        # «0»: no se tiene; las consultas que la piden se omiten.
+        "fecha_expedicion": None if fecha_expedicion == "0" else leer_fecha(
+            fecha_expedicion, "fecha de expedición", "Usa dd/mm/aaaa, o 0 si no se tiene."),
         "sexo": SEXOS[sexo.upper()],
         # La plantilla del informe: GALLAGHER tiene la suya; las demás empresas, la de hombre o la de mujer.
         "formato": "Gallagher" if "GALLAGHER" in empresa.upper() else SEXOS[sexo.upper()],
@@ -382,7 +384,17 @@ def filas_portada(formato: str) -> list[str]:
 
 def sitios_de(persona: dict) -> list[str]:
     """Los sitios que se le consultan a la persona, en el orden del informe."""
-    return [clave for clave in filas_portada(persona["formato"]) if clave != "libreta" or persona["sexo"] == "Hombre"]
+    omitidos = sin_fecha_expedicion(persona)
+    return [clave for clave in filas_portada(persona["formato"])
+            if (clave != "libreta" or persona["sexo"] == "Hombre") and clave not in omitidos]
+
+
+def sin_fecha_expedicion(persona: dict) -> set[str]:
+    """Las consultas que piden la fecha de expedición, si no se tiene: se omiten sin marcarlas en la portada."""
+    if persona["fecha_expedicion"] is not None:
+        return set()
+    # El RNMC no la pide para un NIT.
+    return {"registraduria", "inhabilidades"} | (set() if persona["tipo"] == "NIT" else {"rnmc"})
 
 
 def centro_columna(palabras, titulo: str) -> float:
@@ -593,6 +605,7 @@ def insertar_en_pdf(capturas: dict[str, Path], persona: dict, caidos: set[str] =
     rellenar_portada(doc[0], persona)
     mover_chulos(doc[0], formato, caidos, "Fuera de Servicio")
     mover_chulos(doc[0], formato, set(UBICACION_PDF[formato]) - {*sitios_de(persona)}, "No Aplica")
+    omitidos = sin_fecha_expedicion(persona)
     ubicaciones = UBICACION_PDF[formato]
     for clave, captura in capturas.items():
         if clave in ubicaciones:
@@ -610,7 +623,7 @@ def insertar_en_pdf(capturas: dict[str, Path], persona: dict, caidos: set[str] =
                     if sum(rellenar_registraduria(pagina, persona) for pagina in anexo) < 2:
                         log("PDF: no se encontraron las dos fechas ('Expedida el…' y 'hasta el…') en el documento de la Registraduría.")
                 doc.insert_pdf(anexo)
-        else:
+        elif clave not in omitidos:
             log(f"PDF: falta el documento de {clave}; se omite.")
     carpeta = carpeta_salidas()
     base = re.sub(r'[<>:"/\\|?*]', "", f"{persona['numero']} - {persona['nombre']}").strip()
@@ -1843,6 +1856,12 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
     # Un captcha a la vez: mientras se resuelve uno, los demás sitios ya se están llenando o procesando el suyo.
     turnos = documentos.Turnos()
     listos = {clave: asyncio.Event() for clave in r["ventanas"]}
+    omitidos = sin_fecha_expedicion(persona)
+    if omitidos:
+        log(f"Sin fecha de expedición: se omite {', '.join(c for c in documentos.ORDEN if c in omitidos)}.")
+    # Chrome espera a que cada sitio con captcha esté listo.
+    for clave in omitidos & listos.keys():
+        listos[clave].set()
     antes_chrome = None
     # Si el navegador automático no puede con State.gov o Justice, se capturan en Chrome como antes.
     a_chrome = []
@@ -2033,17 +2052,19 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
             eeuu,
             *(nueva(clave, consulta, r["documentos"]) for clave, consulta in (
                 ("bdme", documentos.consultar_bdme), ("contraloria", documentos.consultar_contraloria),
-                ("rnmc", documentos.consultar_rnmc))),
+                ("rnmc", documentos.consultar_rnmc)) if clave not in omitidos),
             # La Junta de Contadores es la más lenta: va con las que tardan poco.
             *([nueva(clave, consulta, r["gallagher"]) for clave, consulta in (
                 ("contadores", consultar_contadores), ("dian", consultar_dian), ("samm", consultar_samm),
                 ("bid", consultar_bid), ("canada", consultar_canada), ("tesoro", consultar_tesoro))]
               if persona["formato"] == "Gallagher" else []),
         ),
-        con_captcha("runt", consultar_runt, preguntar),
-        con_captcha("antecedentes", documentos.consultar_antecedentes),
-        con_captcha("registraduria", documentos.consultar_registraduria, preguntar),
-        con_captcha("inhabilidades", documentos.consultar_inhabilidades),
+        *(con_captcha(clave, consulta, *args) for clave, consulta, *args in (
+            ("runt", consultar_runt, preguntar),
+            ("antecedentes", documentos.consultar_antecedentes),
+            ("registraduria", documentos.consultar_registraduria, preguntar),
+            ("inhabilidades", documentos.consultar_inhabilidades),
+        ) if clave not in omitidos),
         edge(),
     )
     return capturas, caidos
@@ -2052,11 +2073,12 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
 async def procesar(persona: dict, apertura: asyncio.Task, preguntar, preguntar_edge) -> Path | None:
     """Consulta a la persona en todos los sitios y arma su informe; devuelve el PDF (None si no hubo capturas)."""
     inicio = time.monotonic()
+    expedicion = persona["fecha_expedicion"]
     log(
         f"Datos: {persona['nombre']} | {persona['tipo']} {persona['numero']} | {persona['empresa']} | "
         f"consulta {persona['fecha_consulta']:%d/%m/%Y} por {persona['consultor']} | "
-        f"expedición {persona['fecha_expedicion']:%d/%m/%Y} | {persona['sexo']} | "
-        f"apellido RUNT: {primer_apellido(persona['nombre'])}"
+        + (f"expedición {expedicion:%d/%m/%Y}" if expedicion else "sin fecha de expedición")
+        + f" | {persona['sexo']} | apellido RUNT: {primer_apellido(persona['nombre'])}"
     )
     capturas, caidos = await consultar_persona(persona, await apertura, preguntar, preguntar_edge)
     ruta = insertar_en_pdf(capturas, persona, caidos) if capturas else None

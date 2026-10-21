@@ -1,0 +1,9 @@
+# Lo que ve cada equipo en la ventana de novedades al actualizarse. Lo más nuevo arriba.
+# Cada versión empieza con una línea «== título ==» distinta; cada cambio, con «- ». Las líneas con # no se muestran.
+
+== 21 de octubre de 2026 ==
+- Si no tienes la fecha de expedición, escribe 0: se omiten Registraduría, RNMC e Inhabilidades y al final la ventanita te avisa cuáles se omitieron.
+- El RUNT carga primero al abrir PaginasBOT y guarda su caché: queda listo mucho antes.
+- Las páginas que se quedaban cargando ahora esperan más y se recargan solas una vez antes de darse por caídas.
+- Pulsa F9 en la ventanita para verla por AnyDesk o Meet; F9 otra vez la vuelve a ocultar de las capturas de FBI y Consilium.
+- Después de cada actualización verás esta ventana con lo que cambió.
