@@ -110,7 +110,7 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
             esperadas.update(("contadores", "dian", "samm", "bid", "canada", "tesoro", "insight"))
         self.assertEqual(set(capturas), esperadas)
 
-    async def test_precargas_dos_a_la_vez_sin_esperar_al_runt(self):
+    async def test_precargas_esperan_al_runt_un_tiempo_y_luego_van_de_dos_en_dos(self):
         runt_liberado = asyncio.Event()
         otra_iniciada = asyncio.Event()
         activos, maximo = 0, 0
@@ -127,19 +127,17 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 activos -= 1
 
-        page = Mock()
-        contexto = Mock()
-        contexto.new_page = AsyncMock(return_value=page)
-        browser = Mock()
-        browser.new_context = AsyncMock(return_value=contexto)
-        p = Mock()
-        p.chromium.launch = AsyncMock(return_value=browser)
-        with patch.object(main, "estado_ventana", new_callable=AsyncMock), \
+        with patch.object(main, "PRIORIDAD_RUNT", 0.3), \
+                patch.object(main, "estado_ventana", new_callable=AsyncMock), \
+                patch.object(main, "abrir_perfil_runt", AsyncMock(return_value=None)), \
                 patch.object(documentos, "precargar", side_effect=precargar), \
                 patch.object(main, "Documento"), patch.object(rendimiento, "log"):
-            r = await main.abrir_navegadores(p)
+            r = await main.abrir_navegadores(self._playwright_falso())
             try:
-                await asyncio.wait_for(otra_iniciada.wait(), 1)
+                await asyncio.sleep(0.05)
+                self.assertFalse(otra_iniciada.is_set())
+                # Si el RUNT tarda más que su prioridad, las demás ya no lo esperan.
+                await asyncio.wait_for(otra_iniciada.wait(), 2)
                 self.assertFalse(r["precargas"]["runt"].done())
                 runt_liberado.set()
                 await asyncio.gather(*r["precargas"].values())
@@ -148,6 +146,42 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
                     tarea.cancel()
                 await asyncio.gather(*r["precargas"].values(), return_exceptions=True)
         self.assertEqual(maximo, 2)
+
+    async def test_precargas_y_documentos_siguen_apenas_termina_el_runt(self):
+        cargado = asyncio.Event()
+        async def precargar(page, url, lista):
+            await asyncio.sleep(0.01)
+
+        async def cargar(page):
+            cargado.set()
+
+        with patch.object(main, "PRIORIDAD_RUNT", 30), \
+                patch.object(main, "estado_ventana", new_callable=AsyncMock), \
+                patch.object(main, "abrir_perfil_runt", AsyncMock(return_value=None)), \
+                patch.object(main, "cargar_consolidado", cargar), \
+                patch.object(documentos, "precargar", side_effect=precargar), \
+                patch.object(main, "Documento") as documento, patch.object(rendimiento, "log"):
+            r = await main.abrir_navegadores(self._playwright_falso())
+            try:
+                await asyncio.wait_for(asyncio.gather(*r["precargas"].values()), 2)
+                carga_del_documento = documento.call_args_list[0].args[1]
+                await asyncio.wait_for(carga_del_documento(Mock()), 2)
+                self.assertTrue(cargado.is_set())
+            finally:
+                for tarea in r["precargas"].values():
+                    tarea.cancel()
+                await asyncio.gather(*r["precargas"].values(), return_exceptions=True)
+
+    @staticmethod
+    def _playwright_falso():
+        page = Mock()
+        contexto = Mock()
+        contexto.new_page = AsyncMock(return_value=page)
+        browser = Mock()
+        browser.new_context = AsyncMock(return_value=contexto)
+        p = Mock()
+        p.chromium.launch = AsyncMock(return_value=browser)
+        return p
 
     async def test_mediciones_separan_etapas_sin_contar_doble(self):
         with patch.object(rendimiento, "log") as log:

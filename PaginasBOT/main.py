@@ -21,7 +21,7 @@ from playwright.async_api import async_playwright
 from win32com.shell import shell
 
 from captura_navegador import PAGINA_REFERENCIA, PANTALLA, abrir_en_ventanas
-from comun import CAPTURAS, FueraDeServicio, avisar, leer_respuesta, log
+from comun import CAPTURAS, NOMBRE, FueraDeServicio, avisar, leer_respuesta, log
 import documentos
 from documentos import estado_ventana
 from consulta_consilium import consultar_consilium, url_consilium
@@ -64,6 +64,10 @@ VIEWPORT = {"width": 1366, "height": 768}
 # y podría quedar cortado dentro del marco. Se mantiene el ancho con el que se verificó.
 VIEWPORT_PROCURADURIA = {"width": 1920, "height": 1080}
 SALIDAS = Path(shell.SHGetKnownFolderPath(shell.FOLDERID_Documents)) / "PAGINAS"
+# El RUNT descarga unos 12 MB de código: con un perfil propio la caché queda para la próxima vez (8 s -> 3-4 s).
+PERFIL_RUNT = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / NOMBRE / "perfil_runt"
+# Al abrir, el RUNT carga solo hasta estos segundos: con todo a la vez tardaba 20-100 s en un equipo de 2 núcleos.
+PRIORIDAD_RUNT = 20
 PLANTILLAS = {
     "Hombre": Path(__file__).parent / "Plantilla" / "Hombre.pdf",
     # Igual a la de hombre, sin la página de la libreta militar.
@@ -1596,18 +1600,40 @@ def limite_concurrencia() -> int:
     return max(2, min(4, nucleos, libre // 500 if libre is not None else nucleos))
 
 
+async def abrir_perfil_runt(p, opciones: dict):
+    """Navegador con ventana y perfil propio para el RUNT; None si otro PaginasBOT ya lo usa o no abre."""
+    try:
+        PERFIL_RUNT.mkdir(parents=True, exist_ok=True)
+        # Chrome no deja borrarlo mientras usa el perfil; abrirlo igual sumaría una ventana en blanco al otro bot.
+        (PERFIL_RUNT / "lockfile").unlink(missing_ok=True)
+    except PermissionError:
+        log("RUNT: otro PaginasBOT está usando su caché; esta vez carga sin ella.")
+        return None
+    except OSError as e:
+        log(f"RUNT: no se pudo preparar su caché ({e}); carga sin ella.")
+        return None
+    try:
+        return await p.chromium.launch_persistent_context(
+            PERFIL_RUNT, headless=False, no_viewport=True, args=["--start-maximized", "--hide-crash-restore-bubble"],
+            **opciones)
+    except PlaywrightError as e:
+        log(f"RUNT: no abrió el navegador con su caché ({(str(e).splitlines() or [''])[0]}); carga sin ella.")
+        return None
+
+
 async def abrir_navegadores(p) -> dict:
     """Abre los navegadores y los documentos fijos mientras se escriben los datos.
 
     Un solo navegador sin ventana con un contexto aislado por consulta; el RUNT va aparte con ventana para el captcha.
     """
-    # El headless nuevo (canal "chromium") incluye el visor de PDF que usa la libreta.
-    automatico, visible = await asyncio.gather(
-        p.chromium.launch(headless=True, channel="chromium", args=[f"--host-resolver-rules={REGLAS_BLOQUEO}"]),
-        p.chromium.launch(headless=False, args=["--start-maximized"]),
-    )
     # La Procuraduría bloquea el user agent "HeadlessChrome".
     opciones = {"ignore_https_errors": True, "user_agent": USER_AGENT}
+    # El headless nuevo (canal "chromium") incluye el visor de PDF que usa la libreta.
+    automatico, visible, perfil_runt = await asyncio.gather(
+        p.chromium.launch(headless=True, channel="chromium", args=[f"--host-resolver-rules={REGLAS_BLOQUEO}"]),
+        p.chromium.launch(headless=False, args=["--start-maximized"]),
+        abrir_perfil_runt(p, opciones),
+    )
     # Una pestaña por contexto: Chrome frena las pestañas en segundo plano de una misma ventana.
     procuraduria, simit, libreta, grupo, eeuu, onu, eurlex, gallagher, pdfs = await asyncio.gather(
         automatico.new_context(viewport=VIEWPORT_PROCURADURIA, **opciones),
@@ -1616,7 +1642,7 @@ async def abrir_navegadores(p) -> dict:
         automatico.new_context(viewport={"width": 1024, "height": 768}, **opciones),
     )
     r = {
-        "navegadores": (automatico, visible),
+        "navegadores": (automatico, visible, *([perfil_runt] if perfil_runt else [])),
         "procuraduria": await procuraduria.new_page(),
         "simit": await simit.new_page(),
         "libreta": await libreta.new_page(),
@@ -1628,19 +1654,38 @@ async def abrir_navegadores(p) -> dict:
         "precargas": {},
     }
     # Sitios con captcha: cada uno en su ventana, minimizada mientras se llena; sale al frente en su turno.
-    async def ventana_minimizada():
-        page = await (await visible.new_context(no_viewport=True, **opciones)).new_page()
+    async def nueva_ventana():
+        return await (await visible.new_context(no_viewport=True, **opciones)).new_page()
+
+    async def ventana_minimizada(clave):
+        if clave == "runt" and perfil_runt:
+            page = perfil_runt.pages[0] if perfil_runt.pages else await perfil_runt.new_page()
+        else:
+            page = await nueva_ventana()
         await estado_ventana(page, "minimized")
         return page
 
     claves = ("runt", "antecedentes", "registraduria", "inhabilidades")
-    r["ventanas"] = dict(zip(claves, await asyncio.gather(*(ventana_minimizada() for _ in claves))))
+    r["ventanas"] = dict(zip(claves, await asyncio.gather(*(ventana_minimizada(clave) for clave in claves))))
+    r["nueva_ventana"] = nueva_ventana
 
     limite_precarga = asyncio.Semaphore(2)
+
+    async def esperar_al_runt():
+        # asyncio.wait no cancela la precarga del RUNT si se cancela quien espera.
+        await asyncio.wait([r["precargas"]["runt"]], timeout=PRIORIDAD_RUNT)
+
+    def despues_del_runt(cargar):
+        async def cargar_despues(page):
+            await esperar_al_runt()
+            return await cargar(page)
+        return cargar_despues
 
     async def precargar_limitada(clave, url, lista):
         with medir_sitio(f"precarga_{clave}"):
             with etapa("cola"):
+                if clave != "runt":
+                    await esperar_al_runt()
                 await limite_precarga.acquire()
             try:
                 await documentos.precargar(r["ventanas"][clave], url, lista)
@@ -1654,8 +1699,9 @@ async def abrir_navegadores(p) -> dict:
         ("inhabilidades", documentos.URL_INHABILIDADES, documentos.formulario_inhabilidades_listo),
     ):
         r["precargas"][clave] = asyncio.create_task(precargar_limitada(clave, url, lista))
-    r["consolidado"] = Documento(await onu.new_page(), cargar_consolidado, "consolidado", "Documento consolidado")
-    r["consolium"] = Documento(await eurlex.new_page(), cargar_eurlex, "consolium", "EUR-Lex")
+    r["consolidado"] = Documento(await onu.new_page(), despues_del_runt(cargar_consolidado), "consolidado",
+                                 "Documento consolidado")
+    r["consolium"] = Documento(await eurlex.new_page(), despues_del_runt(cargar_eurlex), "consolium", "EUR-Lex")
     return r
 
 
@@ -1905,7 +1951,12 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
                 page = r["ventanas"][clave]
                 if page.is_closed():
                     # Se cerró la ventana: se abre otra en el mismo contexto.
-                    page = r["ventanas"][clave] = await page.context.new_page()
+                    try:
+                        page = await page.context.new_page()
+                    except PlaywrightError:
+                        # El navegador con la caché del RUNT se cierra junto con su única ventana.
+                        page = await r["nueva_ventana"]()
+                    r["ventanas"][clave] = page
                     await estado_ventana(page, "minimized")
                 try:
                     return await con_caida(page, clave, persona, precarga if caido else
