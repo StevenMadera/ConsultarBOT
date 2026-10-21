@@ -10,7 +10,6 @@ from playwright.async_api import async_playwright
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "PaginasBOT"))
 try:
     import documentos
-    from carga_paginas import cerrar_secundarias
 finally:
     sys.path.pop(0)
 
@@ -70,7 +69,6 @@ class InhabilidadesRecargaTests(unittest.IsolatedAsyncioTestCase):
                 })
                 self.assertEqual(cargas.count("https://bot.test/formulario"), 2)
                 self.assertTrue(listo.is_set())
-                await cerrar_secundarias(page)
             finally:
                 await browser.close()
 

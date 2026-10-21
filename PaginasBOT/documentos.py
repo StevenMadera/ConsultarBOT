@@ -13,7 +13,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from comun import CAPTURAS, FueraDeServicio, avisar, log
-from carga_paginas import cargar_pagina, cerrar_secundarias, instante_carga, marcar_precarga, pagina_actual
+from carga_paginas import cargar_pagina, instante_carga, marcar_precarga
 from rendimiento import etapa
 
 ORDEN = ("bdme", "contraloria", "antecedentes", "registraduria", "rnmc", "inhabilidades")
@@ -79,12 +79,7 @@ async def al_frente(page):
 async def precargar(page, url: str, lista=None):
     """Deja el formulario listo para reutilizarlo una vez, mientras su captcha siga vigente."""
     await estado_ventana(page, "minimized")
-    try:
-        lista_page = await cargar_pagina(page, url, lista)
-        marcar_precarga(lista_page, url)
-    except BaseException:
-        await cerrar_secundarias(page)
-        raise
+    marcar_precarga(await cargar_pagina(page, url, lista), url)
 
 
 class Turno:
@@ -569,7 +564,6 @@ async def consultar_rnmc(page, persona: dict) -> Path:
 
 
 async def consultar_antecedentes(page, persona: dict, turnos: Turnos, listo) -> Path:
-    page = pagina_actual(page)
     tipo = tipo_para(TIPOS_ANTECEDENTES, persona, "Antecedentes (Policía)")
     acepto = page.locator("[id='aceptaOption:0']")
     cedula = page.locator("#cedulaInput")
@@ -637,7 +631,6 @@ async def consultar_antecedentes(page, persona: dict, turnos: Turnos, listo) -> 
 
 
 async def consultar_registraduria(page, persona: dict, preguntar, turnos: Turnos, listo) -> Path:
-    page = pagina_actual(page)
     if persona["tipo"] != "CC":
         raise ValueError("La Registraduría solo certifica cédulas de ciudadanía; no aplica.")
     fecha = persona["fecha_expedicion"]
@@ -700,7 +693,6 @@ async def consultar_registraduria(page, persona: dict, preguntar, turnos: Turnos
 
 
 async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) -> Path:
-    page = pagina_actual(page)
     tipo = tipo_para(TIPOS_INHABILIDADES, persona, "Inhabilidades (Policía)")
     terminos = page.locator("#cbCondiciones")
     recaptcha = page.locator("iframe[title='reCAPTCHA']").first

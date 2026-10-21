@@ -29,7 +29,7 @@ from consulta_fbi import consultar_fbi, url_fbi
 from consulta_justicia import TITULO_JUSTICIA, consultar_justicia, url_justicia
 from consulta_terroristas import TITULO_TERRORISTAS, consultar_terroristas, url_terroristas
 from ocr import buscar_tesseract
-from carga_paginas import cargar_pagina, cerrar_secundarias, conservar_pagina, esperar_estable, instante_carga, pagina_actual
+from carga_paginas import cargar_pagina, esperar_estable, instante_carga
 from rendimiento import capturar_pantalla, etapa, medir_sitio
 
 
@@ -682,7 +682,6 @@ async def captura_aviso_sobre_datos(page, ruta: Path, aviso):
 
 
 async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turnos, listo: asyncio.Event) -> Path:
-    page = pagina_actual(page)
     numero = re.sub(r"\D", "", persona["numero"])
     apellido = re.sub(r"[^\w\sñÑáéíóúÁÉÍÓÚüÜ]", "", primer_apellido(persona["nombre"]))
     campo_captcha = page.locator("input[formcontrolname=captcha]")
@@ -733,7 +732,8 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
                 print(f"[CAPID] Error en captura: {e}")
 
             pedido = time.monotonic()
-            captcha = await asyncio.to_thread(leer_captcha, imagen) if imagen else None
+            # La lectura automática se prueba solo la primera vez: si falló, el código lo escribe la persona.
+            captcha = await asyncio.to_thread(leer_captcha, imagen) if imagen and not intento else None
 
             if captcha:
                 respuesta = captcha
@@ -1020,7 +1020,8 @@ async def capturar_sin_ventana(page, persona: dict, clave: str, url: str, titulo
         await p.wait_for_function("titulo => document.title.includes(titulo)", arg=titulo, timeout=60000)
         await p.wait_for_load_state("load", timeout=60000)
 
-    page = await cargar_pagina(page, url, lista)
+    # Si no abre aquí en un minuto, se captura en Chrome: no se espera la recarga.
+    page = await cargar_pagina(page, url, lista, espera=60, intentos=1)
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"{clave}_{re.sub(r'\D', '', persona['numero'])}_{datetime.now():%Y%m%d_%H%M%S}.png"
@@ -1105,7 +1106,7 @@ class Documento:
             self.carga = asyncio.create_task(self.cargar(self.page))
             with etapa("carga"):
                 await self.carga
-        page = pagina_actual(self.page)
+        page = self.page
         numero = re.sub(r"\D", "", persona["numero"])
         # El recuadro cambia de alto según la plantilla; el ancho se mantiene para no reacomodar el documento.
         alto = round(1600 * proporcion_zona(self.clave, persona["formato"]))
@@ -1692,18 +1693,10 @@ async def capturar_caida(page, clave: str, persona: dict) -> Path:
 
 
 async def con_caida(page, clave: str, persona: dict, consulta) -> Path:
-    try:
-        return await _con_caida(page, clave, persona, consulta)
-    finally:
-        await cerrar_secundarias(page)
-
-
-async def _con_caida(page, clave: str, persona: dict, consulta) -> Path:
     """Espera la consulta; si el sitio está caído, lanza FueraDeServicio con la página caída guardada."""
     try:
         ruta = await consulta
     except FueraDeServicio as e:
-        page = pagina_actual(page)
         if e.captura is None:
             try:
                 if e.direccion:
@@ -1713,7 +1706,6 @@ async def _con_caida(page, clave: str, persona: dict, consulta) -> Path:
                 log(f"{clave}: no se pudo guardar la página caída ({str(falla).splitlines()[0]}).")
         raise
     except Exception as e:
-        page = pagina_actual(page)
         try:
             motivo, direccion = await documentos.motivo_caida(page, e)
         except PlaywrightError:
@@ -1729,7 +1721,7 @@ async def _con_caida(page, clave: str, persona: dict, consulta) -> Path:
             log(f"{clave}: no se pudo guardar la página caída ({str(falla).splitlines()[0]}).")
         raise FueraDeServicio(motivo, captura) from e
     # Tras enviar el formulario, la página de error del navegador o del servidor se imprimiría como el documento.
-    if clave in documentos.ORDEN and (motivo := await documentos.caida_en_pagina(pagina_actual(page))):
+    if clave in documentos.ORDEN and (motivo := await documentos.caida_en_pagina(page)):
         raise FueraDeServicio(motivo, ruta)
     return ruta
 
@@ -1868,10 +1860,7 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
         await registrar(clave, ejecutar())
 
     async def fijo(documento):
-        try:
-            return await _con_caida(documento.page, documento.clave, persona, documento.buscar(persona))
-        finally:
-            documento.page = await conservar_pagina(documento.page)
+        return await con_caida(documento.page, documento.clave, persona, documento.buscar(persona))
 
     async def nueva(clave, consulta, contexto):
         await en_cupo(clave, lambda: en_pestana_nueva(contexto, consulta, persona, clave))
@@ -1883,12 +1872,11 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
                     viewport=VIEWPORT, ignore_https_errors=True, user_agent=USER_AGENT)
                 try:
                     page = await aislado.new_page()
-                    return await con_caida(
-                        page, clave, persona, capturar_sin_ventana(page, persona, clave, url, titulo))
-                except FueraDeServicio:
-                    raise
+                    return await capturar_sin_ventana(page, persona, clave, url, titulo)
                 except Exception as e:
-                    log(f"{clave}: no cargó en el navegador automático ({str(e).splitlines()[0]}); se capturará en Chrome.")
+                    # Si el sitio de verdad está caído, Chrome captura su página de error.
+                    detalle = (str(e).splitlines() or [type(e).__name__])[0]
+                    log(f"{clave}: no cargó en el navegador automático ({detalle}); se capturará en Chrome.")
                     a_chrome.append(clave)
                     return None
                 finally:
@@ -2035,9 +2023,6 @@ async def cerrar_navegadores(apertura: asyncio.Task):
             tarea.cancel()
             await asyncio.gather(tarea, return_exceptions=True)
         for navegador in recursos["navegadores"]:
-            for contexto in navegador.contexts:
-                for page in list(contexto.pages):
-                    await cerrar_secundarias(page)
             await navegador.close()
 
 

@@ -6,7 +6,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "PaginasBOT"))
@@ -90,7 +89,6 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(rendimiento, "log"))
             stack.enter_context(patch.object(main, "limite_concurrencia", return_value=2))
             stack.enter_context(patch.object(main, "con_caida", side_effect=con_caida))
-            stack.enter_context(patch.object(main, "_con_caida", side_effect=con_caida))
             stack.enter_context(patch.object(main, "en_pestana_nueva", side_effect=nueva))
             stack.enter_context(patch.object(main, "capturar_sin_ventana", side_effect=eeuu))
             stack.enter_context(patch.object(main, "consultar_insight", side_effect=insight))
@@ -223,8 +221,10 @@ class EstabilidadTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(liberar.is_set())
                 liberar.set()
                 await page.set_content('<div class="spinner">Cargando</div>')
-                with self.assertRaises(PlaywrightTimeoutError):
+                # Si la página no se queda quieta, se captura igual: no se pierde el sitio.
+                with patch.object(carga, "log") as log:
                     await carga.esperar_estable(page, timeout=600)
+                self.assertIn("se captura como está", log.call_args.args[0])
             finally:
                 await browser.close()
 
