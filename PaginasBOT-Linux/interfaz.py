@@ -191,12 +191,16 @@ def novedades_pendientes() -> list[tuple[str, list[str]]]:
     except OSError:
         vista = None
     titulos = [titulo for titulo, _ in versiones]
-    # La primera vez en un equipo solo se muestra la última versión.
+    if vista is None:
+        # Nunca vio esta ventana: se actualizó desde una versión anterior a las novedades y le faltan todas.
+        return versiones
     return versiones[:titulos.index(vista)] if vista in titulos else versiones[:1]
 
 
 class Interfaz:
     def __init__(self):
+        # Sin registro, es la primera vez que se abre en este equipo: no hay novedades que contar.
+        self.instalacion_nueva = not (RAIZ / "log.txt").exists()
         # Con la clase del acceso del menú (StartupWMClass) el panel muestra la ventana con su ícono.
         self.root = tk.Tk(className=NOMBRE)
         self.root.withdraw()
@@ -829,10 +833,19 @@ class Interfaz:
     # ---------- Actualización ----------
 
     def _mostrar_novedades(self):
-        """Tras actualizarse, lo que cambió (novedades.txt), una sola vez por versión."""
+        """Tras actualizarse, todo lo que cambió desde la versión que tenía (novedades.txt), una sola vez."""
         versiones = novedades_pendientes()
         if not versiones:
             return
+        if not self.instalacion_nueva:
+            self._ventana_novedades(versiones)
+        try:
+            NOVEDADES_VISTAS.parent.mkdir(parents=True, exist_ok=True)
+            NOVEDADES_VISTAS.write_text(versiones[0][0], encoding="utf-8")
+        except OSError as e:
+            log(f"Novedades: no se pudo guardar que ya se vieron ({e}).")
+
+    def _ventana_novedades(self, versiones: list[tuple[str, list[str]]]):
         ventana = tk.Toplevel(self.root)
         ventana.withdraw()
         ventana.title(f"{NOMBRE} · Novedades")
@@ -842,27 +855,41 @@ class Interfaz:
         v = ttk.Frame(ventana, padding=(22, 18, 22, 14))
         v.pack(fill="both", expand=True)
         ttk.Label(v, text=f"{NOMBRE} se actualizó", style="Titulo.TLabel").pack(anchor="w")
-        # Si estuvo mucho sin abrirse, solo las tres últimas versiones: la ventana no debe pasar del alto de la pantalla.
-        for titulo, cambios in versiones[:3]:
-            ttk.Label(v, text=titulo, style="Negrita.TLabel").pack(anchor="w", pady=(12, 2))
+        # Si pasó mucho sin actualizarse, la lista puede no caber en la pantalla: va en un recuadro con barra.
+        recuadro = ttk.Frame(v)
+        recuadro.pack(fill="both", expand=True)
+        lienzo = tk.Canvas(recuadro, background=FONDO, highlightthickness=0)
+        lista = ttk.Frame(lienzo)
+        lienzo.create_window(0, 0, window=lista, anchor="nw")
+        for titulo, cambios in versiones:
+            ttk.Label(lista, text=titulo, style="Negrita.TLabel").pack(anchor="w", pady=(12, 2))
             for cambio in cambios:
-                ttk.Label(v, text=f"•  {cambio}", wraplength=400, justify="left").pack(anchor="w", pady=1)
+                ttk.Label(lista, text=f"•  {cambio}", wraplength=400, justify="left").pack(anchor="w", pady=1)
         boton = ttk.Button(v, text="Entendido", style="Acento.TButton", command=ventana.destroy)
         boton.pack(anchor="e", pady=(14, 0))
         for tecla in ("<Return>", "<KP_Enter>"):
             ventana.bind(tecla, lambda _: ventana.destroy())
         ventana.update_idletasks()
         izquierda, arriba, derecha, abajo = area_de_trabajo(self.root)
+        ancho, alto = lista.winfo_reqwidth(), lista.winfo_reqheight()
+        # También deben caber el título, el botón, los márgenes y la barra de título de la ventana.
+        visible = min(alto, abajo - arriba - v.winfo_reqheight() - 60)
+        lienzo.configure(width=ancho, height=visible, scrollregion=(0, 0, ancho, alto))
+        lienzo.pack(side="left", fill="both", expand=True)
+        if visible < alto:
+            barra = ttk.Scrollbar(recuadro, orient="vertical", command=lienzo.yview)
+            barra.pack(side="right", fill="y")
+            lienzo.configure(yscrollcommand=barra.set)
+            # En X11 la rueda del ratón llega como los botones 4 y 5.
+            ventana.bind("<Button-4>", lambda _: lienzo.yview_scroll(-1, "units"))
+            ventana.bind("<Button-5>", lambda _: lienzo.yview_scroll(1, "units"))
+            ventana.bind("<MouseWheel>", lambda e: lienzo.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        ventana.update_idletasks()
         ventana.geometry(f"+{(izquierda + derecha - ventana.winfo_reqwidth()) // 2}"
                          f"+{max(arriba, (arriba + abajo - ventana.winfo_reqheight()) // 2)}")
         ventana.attributes("-topmost", True)
         ventana.deiconify()
         boton.focus_set()
-        try:
-            NOVEDADES_VISTAS.parent.mkdir(parents=True, exist_ok=True)
-            NOVEDADES_VISTAS.write_text(versiones[0][0], encoding="utf-8")
-        except OSError as e:
-            log(f"Novedades: no se pudo guardar que ya se vieron ({e}).")
 
     def _buscar_version(self):
         if actualizar.hay_version_nueva():
