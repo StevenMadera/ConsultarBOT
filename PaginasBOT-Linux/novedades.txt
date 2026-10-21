@@ -1,0 +1,8 @@
+# Lo que ve cada equipo en la ventana de novedades al actualizarse. Lo más nuevo arriba.
+# Cada versión empieza con una línea «== título ==» distinta; cada cambio, con «- ». Las líneas con # no se muestran.
+
+== 21 de octubre de 2026 ==
+- Si no tienes la fecha de expedición, escribe 0: se omiten Registraduría, RNMC e Inhabilidades y al final la ventanita te avisa cuáles se omitieron.
+- El RUNT carga primero, al abrir PaginasBOT y al empezar cada consulta, y guarda su caché: queda listo mucho antes.
+- Las páginas con captcha que ya estaban listas se aprovechan aunque el equipo esté ocupado, en vez de volver a cargarlas.
+- Después de cada actualización verás esta ventana con lo que cambió.

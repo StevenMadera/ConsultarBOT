@@ -544,6 +544,8 @@ async def consultar_contraloria(page, persona: dict) -> Path:
 
 async def consultar_rnmc(page, persona: dict) -> Path:
     tipo = tipo_para(TIPOS_RNMC, persona, "El RNMC")
+    if persona["fecha_expedicion"] is None and persona["tipo"] != "NIT":
+        raise ValueError("RNMC: sin fecha de expedición; se omite.")
     page = await cargar_pagina(page, URL_RNMC, lambda p: p.locator("#ctl00_ContentPlaceHolder3_ddlTipoDoc").wait_for(timeout=60000))
     await page.locator("#ctl00_ContentPlaceHolder3_ddlTipoDoc").select_option(tipo)
     fecha = page.locator("#txtFechaexp")
@@ -637,6 +639,8 @@ async def consultar_registraduria(page, persona: dict, preguntar, turnos: Turnos
     if persona["tipo"] != "CC":
         raise ValueError("La Registraduría solo certifica cédulas de ciudadanía; no aplica.")
     fecha = persona["fecha_expedicion"]
+    if fecha is None:
+        raise ValueError("Registraduría: sin fecha de expedición; se omite.")
     cedula = page.locator("#ContentPlaceHolder1_TextBox1")
     codigo = page.locator("#ContentPlaceHolder1_TextBox2")
     imagen = page.locator("#datos_contentplaceholder1_captcha1_CaptchaImage")
@@ -697,6 +701,8 @@ async def consultar_registraduria(page, persona: dict, preguntar, turnos: Turnos
 
 async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) -> Path:
     tipo = tipo_para(TIPOS_INHABILIDADES, persona, "Inhabilidades (Policía)")
+    if persona["fecha_expedicion"] is None:
+        raise ValueError("Inhabilidades (Policía): sin fecha de expedición; se omite.")
     terminos = page.locator("#cbCondiciones")
     recaptcha = page.locator("iframe[title='reCAPTCHA']").first
     lleno_en = 0.0
