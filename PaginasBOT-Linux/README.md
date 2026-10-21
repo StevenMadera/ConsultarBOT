@@ -20,3 +20,4 @@ Igual que en Windows: abre **PaginasBOT**, copia la fila en Excel o LibreOffice 
 - El registro de cada consulta está en `~/BOTs/PaginasBOT-Linux/log.txt` («Ver registro» en la ventanita).
 - Al abrir, si GitHub tiene una versión nueva de esta carpeta, se actualiza sola y vuelve a abrir.
 - Procuraduría, RUNT y SIMIT rechazan las conexiones por VPN, igual que en Windows.
+- Al abrir PaginasBOT, el RUNT (unos 12 MB de código) carga primero y solo, hasta 20 s; después cargan las otras ventanas de captcha, la lista de la ONU y EUR-Lex. Su caché queda en `~/.config/PaginasBOT/perfil_runt`; si hay dos PaginasBOT abiertos a la vez, el segundo carga el RUNT sin caché.
