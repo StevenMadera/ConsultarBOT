@@ -94,9 +94,9 @@ def dar_foco(hwnd: int):
     user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
 
 
-def excluir_de_capturas(hwnd: int) -> bool:
+def excluir_de_capturas(hwnd: int, excluir: bool = True) -> bool:
     """Se ve en el monitor pero no sale en las capturas de pantalla (FBI y Consilium), aunque esté encima."""
-    return bool(user32.SetWindowDisplayAffinity(hwnd, 0x11))  # WDA_EXCLUDEFROMCAPTURE
+    return bool(user32.SetWindowDisplayAffinity(hwnd, 0x11 if excluir else 0))  # WDA_EXCLUDEFROMCAPTURE / WDA_NONE
 
 
 def foto(png: bytes) -> tk.PhotoImage:
@@ -177,8 +177,10 @@ class Interfaz:
         self.root.deiconify()
         self.root.update_idletasks()
         self.hwnd = int(self.root.wm_frame(), 16)
-        if not excluir_de_capturas(self.hwnd):
+        self.excluida = excluir_de_capturas(self.hwnd)
+        if not self.excluida:
             log("Ventana: Windows no permitió excluirla de las capturas; podría salir en las de FBI y Consilium.")
+        self.root.bind("<F9>", lambda _: self._alternar_exclusion())
         self.entradas[0].focus_set()
 
         self.bucle = asyncio.new_event_loop()
@@ -190,6 +192,12 @@ class Interfaz:
             threading.Thread(target=self._buscar_version, daemon=True).start()
         self.root.after(200, self._atender)
         self.root.after(600, self._vigilar_portapapeles)
+
+    def _alternar_exclusion(self):
+        """F9: deja ver el bot por AnyDesk/Meet (pero saldría en las capturas de FBI y Consilium) o lo vuelve a ocultar."""
+        if excluir_de_capturas(self.hwnd, not self.excluida):
+            self.excluida = not self.excluida
+            log(f"Ventana: {'oculta de' if self.excluida else 'visible en'} capturas y escritorio remoto (F9).")
 
     # ---------- Aspecto ----------
 
