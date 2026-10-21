@@ -101,12 +101,15 @@ class Turnos:
         self._ocupado = False
         self._fila: list[tuple] = []
         self._orden = itertools.count()
+        # Se marca cuando alguna página ya está llena y recibe su turno de captcha.
+        self.repartido = asyncio.Event()
 
     def _repartir(self):
         if not self._ocupado and self._fila:
             entrada = min(self._fila)
             self._fila.remove(entrada)
             self._ocupado = True
+            self.repartido.set()
             entrada[2].set_result(None)
 
     def _soltar(self):

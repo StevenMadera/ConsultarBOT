@@ -15,6 +15,8 @@ ESPERA_CARGA = 120
 INTENTOS = 2
 # Una precarga más vieja ya no sirve: su captcha caduca a los 60 s.
 VIGENCIA_PRECARGA = 45
+# Con el equipo ocupado, comprobar el formulario precargado puede tardar; recargarlo tarda mucho más (RUNT: 60-140 s).
+ESPERA_REUTILIZAR = 20
 _precargadas: WeakKeyDictionary = WeakKeyDictionary()
 _cargadas_en: WeakKeyDictionary = WeakKeyDictionary()
 
@@ -66,7 +68,7 @@ async def _detener(page: Page):
     if page.is_closed():
         return
     try:
-        async with asyncio.timeout(3):
+        async with asyncio.timeout(10):
             cdp = await page.context.new_cdp_session(page)
             try:
                 await cdp.send("Page.stopLoading")
@@ -119,7 +121,7 @@ async def _cargar_pagina(page, url, lista, *, recargar, configurar, reutilizar, 
     if reutilizar and precarga and precarga[0] == url and time.monotonic() - precarga[1] < VIGENCIA_PRECARGA \
             and not page.is_closed():
         try:
-            await asyncio.wait_for(lista(page) if lista else page.wait_for_load_state("load"), 5)
+            await asyncio.wait_for(lista(page) if lista else page.wait_for_load_state("load"), ESPERA_REUTILIZAR)
             log("Carga inicial: se reutiliza el formulario precargado vigente.")
             return page
         except (PlaywrightError, TimeoutError):

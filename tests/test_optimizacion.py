@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import time
 import unittest
 from contextlib import ExitStack
 from datetime import date
@@ -29,9 +30,33 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
     async def test_sin_fecha_de_expedicion_omite_las_consultas_que_la_piden(self):
         await self.verificar_cola("Hombre", fecha_expedicion=None)
 
-    async def verificar_cola(self, formato, fecha_expedicion=date(2020, 1, 1)):
+    async def test_al_empezar_el_runt_carga_antes_que_las_demas_consultas(self):
+        async def runt(page, persona, preguntar, turnos, listo):
+            await asyncio.sleep(0.1)
+            self.turno_runt = time.monotonic()
+            async with turnos.turno("runt", time.monotonic, AsyncMock()):
+                pass
+            listo.set()
+            return Path("runt.png")
+
+        await self.verificar_cola("Hombre", consultar_runt=runt)
+        self.assertGreaterEqual(min(self.inicios), self.turno_runt)
+
+    async def test_si_el_runt_tarda_las_demas_no_lo_esperan_mas_de_su_prioridad(self):
+        async def runt(page, persona, preguntar, turnos, listo):
+            await asyncio.sleep(1)
+            listo.set()
+            return Path("runt.png")
+
+        desde = time.monotonic()
+        with patch.object(main, "PRIORIDAD_RUNT", 0.1):
+            await self.verificar_cola("Hombre", consultar_runt=runt)
+        self.assertLess(min(self.inicios) - desde, 0.6)
+
+    async def verificar_cola(self, formato, fecha_expedicion=date(2020, 1, 1), consultar_runt=None):
         activos, maximo = 0, 0
         iniciados = []
+        self.inicios = []
         govuk_listo = asyncio.Event()
 
         async def trabajo(clave, *args):
@@ -39,6 +64,7 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
             activos += 1
             maximo = max(maximo, activos)
             iniciados.append(clave)
+            self.inicios.append(time.monotonic())
             try:
                 if clave == "ofac":
                     await asyncio.wait_for(govuk_listo.wait(), 3)
@@ -87,7 +113,8 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
                 stack.enter_context(patch.object(main, nombre, side_effect=automatico))
             for modulo, nombre in ((main, "consultar_runt"), (documentos, "consultar_antecedentes"),
                                    (documentos, "consultar_registraduria"), (documentos, "consultar_inhabilidades")):
-                stack.enter_context(patch.object(modulo, nombre, side_effect=captcha))
+                propia = consultar_runt if nombre == "consultar_runt" and consultar_runt else captcha
+                stack.enter_context(patch.object(modulo, nombre, side_effect=propia))
             for nombre in ("log", "avisar", "abrir_paginas_chrome"):
                 stack.enter_context(patch.object(main, nombre))
             stack.enter_context(patch.object(rendimiento, "log"))
