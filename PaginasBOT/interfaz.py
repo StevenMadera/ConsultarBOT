@@ -903,26 +903,46 @@ class Interfaz:
         except Exception as e:
             self.eventos.put(("actualizado", {"error": primera_linea(e)}))
         finally:
-            # === REINICIO DE IP OPTIMIZADO PARA SALTAR LÍMITES ===
+            # === REINICIO DE IP AUTOMÁTICO SEGÚN EL ADAPTADOR ACTIVO ===
             try:
-                # NOTA: Cambia "Wi-Fi" por "Ethernet 2" si estás usando el cable de red
-                adaptador = "Ethernet" 
+                # 1. Detectar cuál interfaz tiene internet en este momento
+                comando_interfaces = subprocess.run(
+                    ["netsh", "interface", "ipv4", "show", "interfaces"], 
+                    capture_output=True, text=True, check=False, creationflags=0x08000000
+                )
                 
-                # 1. Liberamos la IP del adaptador específico
+                # Buscar el nombre del adaptador que esté conectado (estado "connected" o "conectado")
+                adaptador = None
+                lineas = comando_interfaces.stdout.splitlines()
+                for linea in lineas:
+                    # Filtramos líneas que muestren estado conectado y extraemos el nombre al final
+                    if "connected" in linea.lower() or "conectado" in linea.lower():
+                        # El nombre suele estar al final de la línea en el comando netsh
+                        partes = linea.split()
+                        if len(partes) > 4:
+                            # Unimos el nombre en caso de que tenga espacios (ej: "Ethernet 2")
+                            adaptador = " ".join(partes[4:])
+                            break
+                
+                # Si no detecta ninguno activo, usamos "Wi-Fi" por defecto por seguridad
+                if not adaptador:
+                    adaptador = "Wi-Fi"
+                    
+                # 2. Ejecutar el ciclo de reinicio en el adaptador detectado
+                # Liberamos la IP
                 subprocess.run(["ipconfig", "/release", adaptador], capture_output=True, check=False, creationflags=0x08000000)
                 
-                # 2. ESPERA CRÍTICA: 10 segundos para que el módem del ISP note la desconexión y asigne otra IP pública
+                # Espera de 10 segundos para que el módem del proveedor asigne una nueva IP pública
                 time.sleep(10) 
                 
-                # 3. Solicitamos la nueva IP al proveedor
+                # Solicitamos la nueva IP
                 subprocess.run(["ipconfig", "/renew", adaptador], capture_output=True, check=False, creationflags=0x08000000)
-                
-                # 4. Forzamos la limpieza de la memoria caché de red
                 subprocess.run(["ipconfig", "/flushdns"], capture_output=True, check=False, creationflags=0x08000000)
                 
             except Exception:
                 pass
-            # =====================================================
+            # ==========================================================
+
 
     def _al_actualizado(self, error: str | None):
         if self.estado != "actualizando":
