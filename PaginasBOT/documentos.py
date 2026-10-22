@@ -19,6 +19,7 @@ from carga_paginas import (BLOQUEO_JS, BLOQUEO_RE, MOTIVO_BLOQUEO, SitioBloquead
 from rendimiento import etapa
 
 ORDEN = ("bdme", "contraloria", "antecedentes", "registraduria", "rnmc", "inhabilidades")
+ESPERA_RESULTADO_INHABILIDADES = 30000
 
 URL_BDME = "https://cobrocoactivo.ramajudicial.gov.co/HOME/bdme"
 # Formulario que la página de la Contraloría muestra dentro de un marco.
@@ -537,6 +538,26 @@ async def esperar_cambio(page, texto_antes: str, espera: int = 60000):
                 return
 
 
+async def esperar_resultado_inhabilidades(page, resultado):
+    try:
+        await page.wait_for_load_state("load", timeout=ESPERA_RESULTADO_INHABILIDADES)
+    except PlaywrightTimeoutError:
+        log("Inhabilidades (Policía): la navegación sigue cargando; se espera a que desaparezca la barra.")
+    try:
+        await resultado.wait_for(state="visible", timeout=ESPERA_RESULTADO_INHABILIDADES)
+        await page.locator("#pb_loader").wait_for(state="hidden", timeout=ESPERA_RESULTADO_INHABILIDADES)
+    except PlaywrightTimeoutError as error:
+        raise FueraDeServicio(
+            "Inhabilidades (Policía): el resultado no terminó de cargar o sigue mostrando la barra de carga.",
+            direccion=URL_INHABILIDADES,
+        ) from error
+    if not await esperar_estable(page, timeout=ESPERA_RESULTADO_INHABILIDADES):
+        raise FueraDeServicio(
+            "Inhabilidades (Policía): el resultado siguió cambiando y no se pudo confirmar que terminó de cargar.",
+            direccion=URL_INHABILIDADES,
+        )
+
+
 async def consultar_bdme(page, persona: dict) -> Path:
     page = await cargar_pagina(page, URL_BDME, lambda p: p.locator("#Documento").wait_for(timeout=60000))
     await page.locator("#Documento").fill(persona["numero"])
@@ -817,15 +838,7 @@ async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) ->
     finally:
         if escuchando:
             escuchando.remove_listener("dialog", aviso)
-    # La sección del resultado aparece antes de que la página termine de cargar (si el sitio va lento, antes de que
-    # termine la espera de 30 s): se imprime cuando ya cargó y se quedó quieta.
-    try:
-        await page.wait_for_load_state("load", timeout=30000)
-    except PlaywrightTimeoutError:
-        log("Inhabilidades (Policía): el resultado siguió cargando 30 s más; se imprime cuando se quede quieto.")
-    # Al cargar, el sitio tapa la página casi un segundo con su animación de carga (fondo blanco y un círculo).
-    await page.add_style_tag(content="#pb_loader { display: none !important; }")
-    await esperar_estable(page)
+    await esperar_resultado_inhabilidades(page, resultado)
     # La página entera con gráficos de fondo, como al guardarla desde Chrome: el pie lleva su línea azul y los logos.
     return await imprimir_pdf(page, ruta_documento("inhabilidades", persona), fecha_informe(persona), fondos=True)
 

@@ -52,7 +52,7 @@ def instante_carga(page: Page) -> float:
 
 async def esperar_estable(page: Page, timeout: int = 10000):
     """Espera a que la página deje de cambiar. Si sigue cambiando pasado `timeout` (un carrusel, un reloj), se sigue
-    igual: la captura de la página como está es mejor que ninguna."""
+    igual: la captura de la página como está es mejor que ninguna. Devuelve si alcanzó estabilidad."""
     try:
         await page.evaluate("() => { delete window.__estableBot; }")
         await page.wait_for_function(
@@ -75,8 +75,10 @@ async def esperar_estable(page: Page, timeout: int = 10000):
             }""",
             timeout=timeout, polling=100,
         )
+        return True
     except PlaywrightError as error:
         log(f"La página siguió cambiando {timeout // 1000} s; se captura como está ({_detalle(error)}).")
+        return False
 
 
 def _detalle(error: BaseException) -> str:
