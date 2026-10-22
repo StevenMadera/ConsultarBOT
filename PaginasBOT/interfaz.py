@@ -906,7 +906,7 @@ class Interfaz:
             # === REINICIO DE IP OPTIMIZADO PARA SALTAR LÍMITES ===
             try:
                 # NOTA: Cambia "Wi-Fi" por "Ethernet 2" si estás usando el cable de red
-                adaptador = "Wi-Fi" 
+                adaptador = "Ethernet" 
                 
                 # 1. Liberamos la IP del adaptador específico
                 subprocess.run(["ipconfig", "/release", adaptador], capture_output=True, check=False, creationflags=0x08000000)
