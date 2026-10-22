@@ -903,16 +903,27 @@ class Interfaz:
         except Exception as e:
             self.eventos.put(("actualizado", {"error": primera_linea(e)}))
         finally:
-            # === ESTO SE EJECUTA SIEMPRE (CADA VEZ QUE VERIFICA ACTUALIZACIÓN) ===
+            # === REINICIO DE IP OPTIMIZADO PARA SALTAR LÍMITES ===
             try:
-                # Ocultamos la ventana negra de CMD con el flag 0x08000000
-                subprocess.run(["ipconfig", "/release"], capture_output=True, check=False, creationflags=0x08000000)
-                time.sleep(2) # Pausa de 2 segundos para que el router procese la desconexión
-                subprocess.run(["ipconfig", "/renew"], capture_output=True, check=False, creationflags=0x08000000)
+                # NOTA: Cambia "Wi-Fi" por "Ethernet 2" si estás usando el cable de red
+                adaptador = "Wi-Fi" 
+                
+                # 1. Liberamos la IP del adaptador específico
+                subprocess.run(["ipconfig", "/release", adaptador], capture_output=True, check=False, creationflags=0x08000000)
+                
+                # 2. ESPERA CRÍTICA: 10 segundos para que el módem del ISP note la desconexión y asigne otra IP pública
+                time.sleep(10) 
+                
+                # 3. Solicitamos la nueva IP al proveedor
+                subprocess.run(["ipconfig", "/renew", adaptador], capture_output=True, check=False, creationflags=0x08000000)
+                
+                # 4. Forzamos la limpieza de la memoria caché de red
                 subprocess.run(["ipconfig", "/flushdns"], capture_output=True, check=False, creationflags=0x08000000)
+                
             except Exception:
-                pass # Si la red falla, evita que el programa se cierre abruptamente
-            # ====================================================================
+                pass
+            # =====================================================
+    ================================================================
 
     def _al_actualizado(self, error: str | None):
         if self.estado != "actualizando":
