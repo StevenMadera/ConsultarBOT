@@ -1,6 +1,10 @@
 # Lo que ve cada equipo en la ventana de novedades al actualizarse. Lo más nuevo arriba.
 # Cada versión empieza con una línea «== título ==» distinta; cada cambio, con «- ». Las líneas con # no se muestran.
 
+== 22 de octubre de 2026 ==
+- FBI y Consilium vuelven a consultarse: fallaban con «Browser.setWindowBounds: To maximize a minimized or fullscreen window, restore it to normal state first».
+- La imagen del código del RUNT ya no sale en blanco en la ventanita.
+
 == 21 de octubre de 2026 (mejoras) ==
 - Nueva casilla Ciudad, después de Empresa.
 - Puedes copiar solo las primeras columnas de la fila (por ejemplo nombre, documento, empresa, ciudad y fecha de consulta): lo demás queda en blanco para escribirlo a mano.

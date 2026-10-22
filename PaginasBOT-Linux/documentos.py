@@ -62,16 +62,39 @@ MARGEN_RECARGA = 15
 ORDEN_TURNOS = ("runt", "registraduria", "antecedentes", "inhabilidades")
 
 
+# Lo que responde Chrome al pedirle maximizar o minimizar una ventana que aún no terminó de restaurarse; en Linux eso
+# tarda un momento, y se insiste hasta ESPERA_VENTANA segundos.
+RESTAURAR_ANTES = "normal state first"
+ESPERA_VENTANA = 3
+
+
 async def estado_ventana(page, estado: str):
     """Minimiza o maximiza la ventana de una página del navegador visible."""
     cdp = await page.context.new_cdp_session(page)
     try:
         ventana = (await cdp.send("Browser.getWindowForTarget"))["windowId"]
+
+        async def poner(nuevo: str):
+            await cdp.send("Browser.setWindowBounds", {"windowId": ventana, "bounds": {"windowState": nuevo}})
+
         actual = (await cdp.send("Browser.getWindowBounds", {"windowId": ventana}))["bounds"]["windowState"]
         if actual == "minimized" and estado != "minimized":
             # Chrome no pasa de minimizada a maximizada sin restaurarla antes.
-            await cdp.send("Browser.setWindowBounds", {"windowId": ventana, "bounds": {"windowState": "normal"}})
-        await cdp.send("Browser.setWindowBounds", {"windowId": ventana, "bounds": {"windowState": estado}})
+            await poner("normal")
+        fin = time.monotonic() + ESPERA_VENTANA
+        while True:
+            try:
+                await poner(estado)
+                return
+            except PlaywrightError as error:
+                # La ventana se restaura un momento después de pedirlo y, si se minimizó maximizada, Chrome la sigue
+                # contando como maximizada: se restaura y se insiste.
+                if RESTAURAR_ANTES not in str(error) or time.monotonic() > fin:
+                    raise
+                await poner("normal")
+                if estado != "minimized":
+                    await cdp.send("Page.bringToFront")
+                await asyncio.sleep(0.2)
     finally:
         await cdp.detach()
 

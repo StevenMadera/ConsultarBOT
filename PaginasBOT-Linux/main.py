@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import functools
 import os
 import re
@@ -773,6 +774,23 @@ async def captura_aviso_sobre_datos(page, ruta: Path, aviso):
         await cdp.detach()
 
 
+async def imagen_del_codigo(imagen) -> bytes:
+    """PNG del código del RUNT. Viene dentro de la página (data:image/...) y se toma de ahí: la captura de la ventana
+    recién restaurada salía en blanco en Linux. Si el sitio deja de incrustarla, se captura como antes."""
+    src = await imagen.get_attribute("src", timeout=5000) or ""
+    if src.startswith("data:image/") and ";base64," in src:
+        try:
+            with Image.open(io.BytesIO(base64.b64decode(src.split(",", 1)[1]))) as original:
+                # Sobre fondo blanco, como se ve en la página; la ventanita solo muestra PNG.
+                fondo = Image.new("RGBA", original.size, "white")
+                salida = io.BytesIO()
+                Image.alpha_composite(fondo, original.convert("RGBA")).convert("RGB").save(salida, "PNG")
+                return salida.getvalue()
+        except (ValueError, OSError) as e:
+            log(f"RUNT: no se pudo leer la imagen del código de la página ({e}); se captura.")
+    return await imagen.screenshot(timeout=5000)
+
+
 async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turnos, listo: asyncio.Event) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
     apellido = re.sub(r"[^\w\sñÑáéíóúÁÉÍÓÚüÜ]", "", primer_apellido(persona["nombre"]))
@@ -817,7 +835,7 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
             print("[CAPID] Intentando tomar captura...")
 
             try:
-                imagen = await imagen_captcha.screenshot(timeout=5000)
+                imagen = await imagen_del_codigo(imagen_captcha)
                 print(f"[CAPID] Captura obtenida: {len(imagen)} bytes")
             except PlaywrightError as e:
                 imagen = None
