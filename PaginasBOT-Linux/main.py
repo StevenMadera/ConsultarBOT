@@ -90,6 +90,7 @@ PRIORIDAD_RUNT = 20
 # Google pone la casilla «No soy un robot» cada vez más difícil y lenta en la misma ventana: cada RENOVAR_CADA consultas,
 # o si la casilla tardó, la ventana se cambia por una limpia.
 CON_CASILLA = ("antecedentes", "inhabilidades")
+SIN_PRECARGA = ("registraduria",)
 RENOVAR_CADA = 5
 # FBI y Consilium se capturan apenas su página lleva estos segundos a la vista (su JavaScript aplica la búsqueda
 # después de cargar); si no carga en ESPERA_CHROME s, después de los captchas.
@@ -1833,7 +1834,10 @@ async def abrir_navegadores(p) -> dict:
         "inhabilidades": (documentos.URL_INHABILIDADES, documentos.formulario_inhabilidades_listo),
     }
     for clave, (url, lista) in formularios.items():
-        r["precargas"][clave] = asyncio.create_task(precargar_limitada(clave, url, lista))
+        # La Registraduría no se precarga: la consulta casi nunca alcanza a usarla (vence a los 30 s) y cada visita de
+        # más acerca el «Acceso bloqueado» de su Cloudflare. Su formulario carga al empezar, mientras va el RUNT.
+        precarga = asyncio.sleep(0) if clave in SIN_PRECARGA else precargar_limitada(clave, url, lista)
+        r["precargas"][clave] = asyncio.create_task(precarga)
     r["formularios"] = formularios
 
     async def renovar(clave):

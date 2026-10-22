@@ -27,6 +27,10 @@ URL_BDME = "https://cobrocoactivo.ramajudicial.gov.co/HOME/bdme"
 URL_CONTRALORIA = "https://cfiscal.contraloria.gov.co/Certificados/CertificadoPersonaNatural.aspx"
 URL_ANTECEDENTES = "https://antecedentes.policia.gov.co:7005/WebJudicial/antecedentes.xhtml"
 URL_REGISTRADURIA = "https://certvigenciacedula.registraduria.gov.co/Datos.aspx?AspxAutoDetectCookieSupport=1"
+# Tras el «Acceso bloqueado» de su Cloudflare, cada visita alarga el bloqueo de la IP (que comparten los equipos de la
+# oficina): durante este tiempo, si su ventana sigue mostrando el aviso, se da por bloqueada sin volver a cargarla.
+PAUSA_BLOQUEO = 15 * 60
+_bloqueada_hasta = 0.0
 URL_RNMC = "https://srvcnpc.policia.gov.co/PSC/frm_cnp_consulta.aspx"
 URL_INHABILIDADES = "https://inhabilidades.policia.gov.co:8080/consulta"
 EMPRESA_INHABILIDADES = "Secap"
@@ -725,11 +729,24 @@ async def consultar_antecedentes(page, persona: dict, turnos: Turnos, listo) -> 
 
 
 async def consultar_registraduria(page, persona: dict, preguntar, turnos: Turnos, listo) -> Path:
+    global _bloqueada_hasta
     if persona["tipo"] != "CC":
         raise ValueError("La Registraduría solo certifica cédulas de ciudadanía; no aplica.")
-    fecha = persona["fecha_expedicion"]
-    if fecha is None:
+    if persona["fecha_expedicion"] is None:
         raise ValueError("Registraduría: sin fecha de expedición; se omite.")
+    if time.monotonic() < _bloqueada_hasta and await bloqueo_en_pagina(page):
+        log("Registraduría: su ventana sigue mostrando el bloqueo de hace un rato; no se carga de nuevo para no "
+            "alargarlo.")
+        raise SitioBloqueado
+    try:
+        return await _consultar_registraduria(page, persona, preguntar, turnos, listo)
+    except SitioBloqueado:
+        _bloqueada_hasta = time.monotonic() + PAUSA_BLOQUEO
+        raise
+
+
+async def _consultar_registraduria(page, persona: dict, preguntar, turnos: Turnos, listo) -> Path:
+    fecha = persona["fecha_expedicion"]
     cedula = page.locator("#ContentPlaceHolder1_TextBox1")
     codigo = page.locator("#ContentPlaceHolder1_TextBox2")
     imagen = page.locator("#datos_contentplaceholder1_captcha1_CaptchaImage")

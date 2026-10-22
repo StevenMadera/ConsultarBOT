@@ -260,7 +260,7 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "estado_ventana", new_callable=AsyncMock), \
                 patch.object(main, "abrir_perfil_runt", AsyncMock(return_value=None)), \
                 patch.object(main, "cargar_consolidado", cargar), \
-                patch.object(documentos, "precargar", side_effect=precargar), \
+                patch.object(documentos, "precargar", side_effect=precargar) as precargas, \
                 patch.object(main, "cargar_pagina", new_callable=AsyncMock), \
                 patch.object(main, "cerrar_aviso_simit", new_callable=AsyncMock), \
                 patch.object(main, "Documento") as documento, patch.object(rendimiento, "log"):
@@ -270,6 +270,10 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
                 carga_del_documento = documento.call_args_list[0].args[1]
                 await asyncio.wait_for(carga_del_documento(Mock()), 2)
                 self.assertTrue(cargado.is_set())
+                # La Registraduría no se precarga: cada visita de más acerca el bloqueo de su Cloudflare.
+                cargadas = {llamada.args[1] for llamada in precargas.call_args_list}
+                self.assertNotIn(documentos.URL_REGISTRADURIA, cargadas)
+                self.assertIn(documentos.URL_INHABILIDADES, cargadas)
             finally:
                 for tarea in r["precargas"].values():
                     tarea.cancel()

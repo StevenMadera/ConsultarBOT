@@ -133,5 +133,37 @@ class RnmcTests(unittest.IsolatedAsyncioTestCase):
                 await browser.close()
 
 
+class RegistraduriaBloqueoTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tras_el_bloqueo_no_se_vuelve_a_cargar_mientras_siga_el_aviso(self):
+        persona = {"tipo": "CC", "numero": "123456", "fecha_expedicion": date(2020, 2, 1)}
+        aviso = "<h1>Acceso bloqueado</h1><p>Cloudflare detectó tráfico sospechoso desde tu dirección IP.</p>"
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                consulta = AsyncMock(side_effect=documentos.SitioBloqueado)
+                with patch.object(documentos, "_consultar_registraduria", consulta), \
+                        patch.object(documentos, "_bloqueada_hasta", 0.0), patch.object(documentos, "log"):
+                    await page.set_content(aviso)
+                    with self.assertRaises(documentos.SitioBloqueado):
+                        await documentos.consultar_registraduria(page, persona, None, None, None)
+                    # La consulta siguiente, con el aviso aún en su ventana, no visita el sitio.
+                    with self.assertRaises(documentos.SitioBloqueado):
+                        await documentos.consultar_registraduria(page, persona, None, None, None)
+                    self.assertEqual(consulta.await_count, 1)
+                    # Si la ventana ya no muestra el aviso, o pasó la pausa, se consulta normal.
+                    consulta.side_effect = None
+                    consulta.return_value = Path("registraduria.pdf")
+                    await page.set_content("<form></form>")
+                    self.assertEqual(await documentos.consultar_registraduria(page, persona, None, None, None),
+                                     Path("registraduria.pdf"))
+                    await page.set_content(aviso)
+                    documentos._bloqueada_hasta = 0.0
+                    await documentos.consultar_registraduria(page, persona, None, None, None)
+                    self.assertEqual(consulta.await_count, 3)
+            finally:
+                await browser.close()
+
+
 if __name__ == "__main__":
     unittest.main()

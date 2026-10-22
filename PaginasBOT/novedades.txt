@@ -1,6 +1,10 @@
 # Lo que ve cada equipo en la ventana de novedades al actualizarse. Lo más nuevo arriba.
 # Cada versión empieza con una línea «== título ==» distinta; cada cambio, con «- ». Las líneas con # no se muestran.
 
+== 22 de octubre de 2026 (Registraduría) ==
+- La Registraduría ya no se carga al abrir PaginasBOT, solo al consultar: cada visita de más acerca su «Acceso bloqueado», que bloquea la conexión de toda la oficina.
+- Si la Registraduría bloqueó la conexión, durante 15 minutos no se vuelve a abrir (eso alarga el bloqueo): se marca Fuera de Servicio de una vez.
+
 == 22 de octubre de 2026 (captchas) ==
 - Antecedentes e Inhabilidades esperan a que la casilla «No soy un robot» termine de prepararse antes de pedirte marcarla: con el equipo ocupado, pulsarla antes la dejaba girando hasta que la página se recargaba.
 - Si la Registraduría muestra «Verifiquemos tu conexión» (Cloudflare), su ventana pasa al frente para que marques la casilla si aparece; el bot sigue solo y recuerda la verificación para las siguientes consultas.
