@@ -1,6 +1,21 @@
 # Lo que ve cada equipo en la ventana de novedades al actualizarse. Lo más nuevo arriba.
 # Cada versión empieza con una línea «== título ==» distinta; cada cambio, con «- ». Las líneas con # no se muestran.
 
+== 21 de octubre de 2026 (mejoras) ==
+- Nueva casilla Ciudad, después de Empresa.
+- Puedes copiar solo las primeras columnas de la fila (por ejemplo nombre, documento, empresa, ciudad y fecha de consulta): lo demás queda en blanco para escribirlo a mano.
+- Consilium Europa (EUR-Lex) ahora se busca por el nombre completo, no por el número de documento.
+- Al terminar cada consulta y al cerrar PaginasBOT se cierran las ventanas que quedaban abiertas en Chrome (FBI, lista UE de terroristas, libreta militar).
+- SIMIT queda cargado de antemano: la consulta tarda mucho menos.
+- Inhabilidades espera a que el resultado termine de cargar antes de guardarlo.
+- RNMC revisa que la fecha de expedición quedó bien escrita y, si el sitio la rechaza siendo correcta, consulta una vez más.
+- La primera consulta de cada día borra las imágenes y PDF de trabajo de días anteriores; los informes no se tocan.
+- Si empiezas la consulta un rato después de abrir PaginasBOT, el RUNT se carga de nuevo al empezar y no a mitad de la consulta (se ahorra hasta un minuto).
+- Antecedentes: si el sitio no responde a la consulta, se repite a los 30 s (antes esperaba un minuto).
+- FBI y Consilium se capturan apenas cargan, entre un captcha y otro, y no al final.
+- El código del RUNT aparece enseguida: FBI y Consilium se abren al empezar (antes retrasaban la pregunta) y, si la lectura automática tarda, se pide escribirlo sin esperarla.
+- Si Inhabilidades (u otro sitio con captcha) no abre mientras todo carga a la vez, se intenta una vez más antes de marcarlo fuera de servicio.
+
 == 21 de octubre de 2026 (captchas) ==
 - Las ventanas de captcha ahora son de Google Chrome y Google ya no las ve como un navegador automatizado: la casilla «No soy un robot» de Antecedentes e Inhabilidades debería pedir menos imágenes.
 - Cada 5 consultas, o si la casilla tardó más de un minuto, esas dos ventanas se cambian solas por unas nuevas, para que no se vuelvan lentas.

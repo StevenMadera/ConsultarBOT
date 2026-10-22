@@ -3,7 +3,8 @@ import sys
 import unittest
 from datetime import date
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
+from urllib.parse import parse_qs, urlsplit
 
 from playwright.async_api import async_playwright
 
@@ -52,15 +53,21 @@ class InhabilidadesRecargaTests(unittest.IsolatedAsyncioTestCase):
                     return True
 
                 listo = asyncio.Event()
+                orden = Mock()
                 with patch.object(documentos, "URL_INHABILIDADES", "https://bot.test/formulario"), \
                         patch.object(documentos, "TIPOS_INHABILIDADES", {"CC": "1"}), \
                         patch.object(documentos, "al_frente", new_callable=AsyncMock), \
                         patch.object(documentos, "esperar_recaptcha", side_effect=captcha), \
                         patch.object(documentos, "log"), \
+                        patch.object(documentos, "esperar_estable", new_callable=AsyncMock) as estable, \
                         patch.object(documentos, "imprimir_pdf", new_callable=AsyncMock,
-                                     return_value=Path("resultado.pdf")):
+                                     return_value=Path("resultado.pdf")) as imprimir:
+                    orden.attach_mock(estable, "estable")
+                    orden.attach_mock(imprimir, "imprimir")
                     resultado = await documentos.consultar_inhabilidades(page, persona, documentos.Turnos(), listo)
                 self.assertEqual(resultado, Path("resultado.pdf"))
+                # El resultado se imprime cuando la página ya cargó y se quedó quieta.
+                self.assertEqual([llamada[0] for llamada in orden.mock_calls], ["estable", "imprimir"])
                 self.assertEqual(len(datos), 2)
                 self.assertEqual(datos[0], datos[1])
                 self.assertEqual(datos[1], {
@@ -69,6 +76,57 @@ class InhabilidadesRecargaTests(unittest.IsolatedAsyncioTestCase):
                 })
                 self.assertEqual(cargas.count("https://bot.test/formulario"), 2)
                 self.assertTrue(listo.is_set())
+            finally:
+                await browser.close()
+
+
+class RnmcTests(unittest.IsolatedAsyncioTestCase):
+    async def test_revisa_la_fecha_escrita_y_repite_si_el_sitio_la_rechaza(self):
+        persona = {"tipo": "CC", "numero": "123456", "fecha_expedicion": date(2014, 3, 5)}
+        formulario = """
+            <form action="/consulta">
+                <select id="ctl00_ContentPlaceHolder3_ddlTipoDoc" name="tipo"><option value="55">CC</option></select>
+                <input id="txtFechaexp" name="fecha">
+                <input id="ctl00_ContentPlaceHolder3_txtExpediente" name="numero">
+                <button id="ctl00_ContentPlaceHolder3_btnConsultar2">Buscar</button>
+            </form>
+            <script>
+                // Como el selector de fecha del sitio: la primera vez que se sale de la casilla pone la fecha de hoy.
+                const f = document.querySelector('#txtFechaexp');
+                f.addEventListener('blur', () => {
+                    if (!sessionStorage.cambiada) { sessionStorage.cambiada = 1; f.value = '21/10/2026'; }
+                });
+            </script>
+        """
+        rechazo = """<div class="modal in"><div class="modal-body">La fecha de expedición de la Cedula de Ciudadania
+            no es correcta, por favor verifique.</div></div><button id="ctl00_ContentPlaceHolder3_btn_salir_modal">Salir
+            </button>"""
+        fechas = []
+
+        async def responder(route):
+            if "/consulta" in route.request.url:
+                fechas.append(parse_qs(urlsplit(route.request.url).query)["fecha"][0])
+                html = rechazo if len(fechas) == 1 else "<h1>Resultado RNMC</h1>"
+            else:
+                html = formulario
+            await route.fulfill(body=html, content_type="text/html")
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                contexto = await browser.new_context()
+                await contexto.route("https://bot.test/**", responder)
+                page = await contexto.new_page()
+                with patch.object(documentos, "URL_RNMC", "https://bot.test/formulario"), \
+                        patch.object(documentos, "log") as log, \
+                        patch.object(documentos, "imprimir_pdf", new_callable=AsyncMock,
+                                     return_value=Path("rnmc.pdf")) as imprimir:
+                    self.assertEqual(await documentos.consultar_rnmc(page, persona), Path("rnmc.pdf"))
+                self.assertEqual(fechas, ["05/03/2014", "05/03/2014"])
+                self.assertIn("Resultado RNMC", await imprimir.call_args.args[0].inner_text("body"))
+                avisos = " ".join(llamada.args[0] for llamada in log.call_args_list)
+                self.assertIn("se escribe otra vez", avisos)
+                self.assertIn("se consulta otra vez", avisos)
             finally:
                 await browser.close()
 

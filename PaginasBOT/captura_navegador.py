@@ -26,6 +26,9 @@ ESPERA_ESTABLE_MAXIMA = 12
 # La verificación automática de Consilium puede tardar más de 20 s antes de mostrar la página.
 ESPERA_MAXIMA = 60
 TITULOS_VERIFICACION = ("just a moment", "un momento", "verifying", "verificando")
+# Páginas del bot sin el título de su consulta: el FBI cuando responde «Page not found» y la libreta militar (que
+# Chrome vuelve a abrir con la sesión anterior si quedó abierta).
+OTROS_TITULOS_DEL_BOT = ("Federal Bureau of Investigation", "Reclutamiento | Ejercito Colombia")
 # Ventana principal de Chrome y Edge, y de Firefox.
 CLASES_NAVEGADOR = ("Chrome_WidgetWin_1", "MozillaWindowClass")
 _ENUM_VENTANAS = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -47,6 +50,12 @@ class _Colocacion(ctypes.Structure):
                 ("rcNormalPosition", wintypes.RECT)]
 # Pasos manuales ya hechos en esta sesión: Edge recuerda, por ejemplo, el consentimiento de cookies.
 _PASOS_HECHOS: set[str] = set()
+# Lo que el bot abrió en el navegador del usuario (con él cerrado, Chrome puede abrir además las ventanas de la sesión
+# anterior): las ventanas, los títulos y sitios que las reconocen si abren tarde, y las ventanas que ya había antes.
+# Al terminar cada consulta y al cerrar el bot no queda ninguna abierta.
+_ABIERTAS: set[int] = set()
+_MARCAS: set[str] = set()
+_PREVIAS: set[int] | None = None
 # Una captura necesita el foco y la pantalla: no puede coincidir con otra ni con una pregunta en la consola.
 # Quien lo tiene y pregunta al usuario debe hacerlo sin volver a pedirlo.
 PANTALLA = threading.Lock()
@@ -92,6 +101,7 @@ def _esperar_pagina(titulo: str, nombre: str, preguntar, antes: set[int], url: s
         nuevas = _ventanas_nuevas(antes)
         encontrada = next((v for v in nuevas if titulo in v.title), None)
         if encontrada:
+            _ABIERTAS.add(encontrada._hWnd)
             return encontrada, None
         verificando = next((v for v in nuevas if _es_verificacion(v.title)), None)
         if verificando and not avisado:
@@ -107,6 +117,7 @@ def _esperar_pagina(titulo: str, nombre: str, preguntar, antes: set[int], url: s
             caida_desde = time.time()
         elif time.time() - caida_desde >= 5:
             # Ese título no es un instante de la carga: la página de error se queda.
+            _ABIERTAS.add(caida._hWnd)
             return caida, "el navegador mostró que no se puede acceder al sitio"
         if reabrir and not avisado and time.time() - inicio > 10:
             reabrir = False
@@ -118,6 +129,7 @@ def _esperar_pagina(titulo: str, nombre: str, preguntar, antes: set[int], url: s
         otra = next((v for v in _ventanas_nuevas(solo_suyas) if v.title and not _es_verificacion(v.title)
                      and not re.match(r"(Sin título|Untitled)\b", v.title)), None)
         if otra:
+            _ABIERTAS.add(otra._hWnd)
             return otra, "el sitio no mostró la página de la consulta"
     raise RuntimeError(f"No se encontró la ventana del navegador con la página de {nombre}")
 
@@ -179,7 +191,11 @@ def abrir_en_ventanas(urls: list[str]) -> set[int] | None:
     ejecutable = _navegador_por_defecto()
     if not ejecutable:
         return None
+    global _PREVIAS
     antes = {v._hWnd for v in gw.getAllWindows()}
+    if _PREVIAS is None:
+        _PREVIAS = antes
+    _MARCAS.update(urlsplit(url).hostname for url in urls)
     for url in urls:
         subprocess.Popen([ejecutable, "--new-window", url])
     # Con el navegador cerrado puede tardar en abrirlas.
@@ -191,7 +207,14 @@ def abrir_en_ventanas(urls: list[str]) -> set[int] | None:
                 ventana.minimize()
                 minimizadas.add(ventana._hWnd)
         time.sleep(0.2)
+    _ABIERTAS.update(minimizadas)
     return antes
+
+
+def pagina_cargada(url: str, titulo: str, antes: set[int]) -> bool:
+    """La ventana abierta de antemano ya muestra la página o la de error del navegador; no toma la pantalla."""
+    error = re.compile(rf"{re.escape(urlsplit(url).hostname)}(\s|$)", re.I)
+    return any(titulo in v.title or error.match(v.title) for v in _ventanas_nuevas(antes))
 
 
 def _es_chromium(hwnd: int) -> bool:
@@ -338,15 +361,12 @@ def _cerrar_pestana(ventana, titulo: str):
         user32.keybd_event(tecla, 0, evento, 0)
 
 
-def _cerrar_ventanas_consultadas(ventana, titulo: str, antes: set[int]):
+def _cerrar_ventanas(ventanas: set[int], titulo: str):
     user32 = ctypes.windll.user32
-    ventanas = {v._hWnd for v in _ventanas_nuevas(antes)
-                if v._hWnd == ventana._hWnd or titulo in v.title}
-    if ventana._hWnd not in antes:
-        ventanas.add(ventana._hWnd)
+    # Solo ventanas del navegador que siguen abiertas: el número de una ventana cerrada puede pasar a otra.
+    ventanas = {hwnd for hwnd in ventanas if user32.IsWindow(hwnd) and _clase(hwnd) in CLASES_NAVEGADOR}
     for hwnd in ventanas:
-        if user32.IsWindow(hwnd):
-            user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+        user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
     fin = time.monotonic() + 3
     while ventanas and time.monotonic() < fin:
         ventanas = {hwnd for hwnd in ventanas if user32.IsWindow(hwnd)}
@@ -354,6 +374,29 @@ def _cerrar_ventanas_consultadas(ventana, titulo: str, antes: set[int]):
             time.sleep(0.1)
     if ventanas:
         log(f"{titulo}: el navegador no cerró las ventanas de la consulta {sorted(ventanas)}.")
+
+
+def _cerrar_ventanas_consultadas(ventana, titulo: str, antes: set[int]):
+    ventanas = {v._hWnd for v in _ventanas_nuevas(antes)
+                if v._hWnd == ventana._hWnd or titulo in v.title}
+    if ventana._hWnd not in antes:
+        ventanas.add(ventana._hWnd)
+    _cerrar_ventanas(ventanas, titulo)
+    _ABIERTAS.difference_update(ventanas)
+
+
+def cerrar_ventanas_abiertas():
+    """Cierra todo lo que el bot abrió en el navegador del usuario y siga abierto (una consulta cancelada, el FBI
+    abierto dos veces, una ventana de la sesión anterior de Chrome): al terminar cada consulta y al cerrar el bot."""
+    global _PREVIAS
+    ventanas = set(_ABIERTAS)
+    if _PREVIAS is not None:
+        marcas = [marca.lower() for marca in (*_MARCAS, *TITULOS_VERIFICACION, *OTROS_TITULOS_DEL_BOT)]
+        ventanas |= {v._hWnd for v in _ventanas_nuevas(_PREVIAS) if any(m in v.title.lower() for m in marcas)}
+    if ventanas:
+        _cerrar_ventanas(ventanas, "Chrome")
+    _ABIERTAS.clear()
+    _PREVIAS = None
 
 
 def capturar_navegador(
@@ -376,6 +419,7 @@ def capturar_navegador(
     """
     with PANTALLA:
         with etapa("captura"):
+            _MARCAS.add(titulo)
             return _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, preguntar, antes, zoom)
 
 

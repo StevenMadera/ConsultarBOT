@@ -6,6 +6,8 @@ from urllib.parse import quote
 from captura_navegador import capturar_navegador
 
 URL_CONSILIUM = "https://www.consilium.europa.eu/es/search/?query={nombre}"
+# Título de la página de resultados: la verificación previa del sitio ("Checking your browser") no lo tiene.
+TITULO_CONSILIUM = "Search - Consilium"
 
 
 def url_consilium(persona: dict) -> str:
@@ -15,8 +17,7 @@ def url_consilium(persona: dict) -> str:
 def consultar_consilium(persona: dict, preguntar=input, antes=None) -> Path:
     return capturar_navegador(
         url_consilium(persona),
-        # Título de la página de resultados: la verificación previa del sitio ("Checking your browser") no lo tiene.
-        "Search - Consilium",
+        TITULO_CONSILIUM,
         "Consilium",
         "consilium",
         persona["numero"],

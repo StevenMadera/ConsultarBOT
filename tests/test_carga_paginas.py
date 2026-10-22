@@ -116,6 +116,13 @@ class CargaPaginasTests(unittest.IsolatedAsyncioTestCase):
             await carga.cargar_pagina(self.page, URL, AsyncMock(), reutilizar=True)
         self.assertEqual(len(self.orden), 2)
 
+    async def test_precarga_que_caducaria_antes_de_su_turno_se_recarga_al_empezar(self):
+        # Con lo que tarda llenar el formulario, el turno del captcha la recargaría después, con todo cargando.
+        limite = main.documentos.VIGENCIA_CAPTCHA - main.documentos.MARGEN_RECARGA
+        carga._precargadas[self.page] = (URL, time.monotonic() - (limite - 10))
+        await carga.cargar_pagina(self.page, URL, AsyncMock(), reutilizar=True)
+        self.assertEqual(len(self.orden), 1)
+
     async def test_precarga_que_perdio_el_formulario_se_vuelve_a_cargar(self):
         carga.marcar_precarga(self.page, URL)
         lista = AsyncMock(side_effect=[PlaywrightError("formulario perdido"), None])

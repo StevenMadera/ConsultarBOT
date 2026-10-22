@@ -23,8 +23,8 @@ from playwright.async_api import async_playwright
 import comun
 from captura_navegador import PANTALLA
 from comun import NOMBRE, RAIZ, log
-from main import (CAMPOS, FORMATO, SEXOS, abrir_navegadores, carpeta_salidas, cerrar_navegadores, minutos, partir_fila,
-                  procesar, sin_fecha_expedicion, sitios_de, validar)
+from main import (CAMPOS, FORMATO, SEXOS, abrir_navegadores, carpeta_salidas, cerrar_navegadores, minutos, parece_fila,
+                  partir_fila, procesar, sin_fecha_expedicion, sitios_de, validar)
 
 # actualizar.py está en la carpeta que contiene las apps; si PaginasBOT se copió sola, no hay botón de actualizar.
 sys.path.append(str(RAIZ.parent))
@@ -71,7 +71,7 @@ ESTADOS = {
     "fuera_servicio": ("!", AMBAR),
 }
 TERMINADOS = {"listo", "error", "no_aplica", "fuera_servicio"}
-ETIQUETAS = ("Nombre", "Documento", "Empresa", "Fecha consulta", "Quién consulta", "Fecha expedición")
+ETIQUETAS = ("Nombre", "Documento", "Empresa", "Ciudad", "Fecha consulta", "Quién consulta", "Fecha expedición")
 # Lo que la ventana ya muestra de otra forma.
 OMITIDOS = re.compile(r"Captura |Tiempo|Datos:|PDF: [A-Za-z]:\\")
 NOVEDADES = RAIZ / "novedades.txt"
@@ -269,25 +269,26 @@ class Interfaz:
             entrada.grid(row=fila, column=1, sticky="we", pady=3)
             entrada.bind("<<Paste>>", self._pegar)
             self.entradas.append(entrada)
-        ttk.Label(v, text="Sexo", style="Suave.TLabel").grid(row=8, column=0, sticky="w", padx=(0, 14), pady=3)
+        fila = 2 + len(ETIQUETAS)
+        ttk.Label(v, text="Sexo", style="Suave.TLabel").grid(row=fila, column=0, sticky="w", padx=(0, 14), pady=3)
         self.sexo = tk.StringVar()
         opciones = ttk.Frame(v)
-        opciones.grid(row=8, column=1, sticky="w", pady=3)
+        opciones.grid(row=fila, column=1, sticky="w", pady=3)
         for valor, texto in (("H", "Hombre"), ("M", "Mujer")):
             ttk.Radiobutton(opciones, text=texto, value=valor, variable=self.sexo).pack(side="left", padx=(0, 18))
         self.error = ttk.Label(v, style="Error.TLabel", wraplength=360, justify="left")
-        self.error.grid(row=9, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.error.grid(row=fila + 1, column=0, columnspan=2, sticky="w", pady=(10, 0))
         self.error.grid_remove()
         ttk.Button(v, text="Consultar", style="Acento.TButton", command=self._consultar).grid(
-            row=10, column=1, sticky="e", pady=(14, 0))
+            row=fila + 2, column=1, sticky="e", pady=(14, 0))
         pie = ttk.Frame(v)
-        pie.grid(row=11, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        pie.grid(row=fila + 3, column=0, columnspan=2, sticky="w", pady=(12, 0))
         self.punto = tk.Label(pie, text="●", fg=AMBAR, bg=FONDO, font=LETRA_PEQUENA)
         self.punto.pack(side="left")
         self.texto_navegadores = ttk.Label(pie, text="Preparando los navegadores…", style="Pie.TLabel", wraplength=340)
         self.texto_navegadores.pack(side="left", padx=(4, 0))
         self.texto_version = ttk.Label(v, style="Error.TLabel", wraplength=360, justify="left")
-        self.texto_version.grid(row=12, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.texto_version.grid(row=fila + 4, column=0, columnspan=2, sticky="w", pady=(10, 0))
         self.texto_version.grid_remove()
         return v
 
@@ -479,13 +480,15 @@ class Interfaz:
     # ---------- Datos ----------
 
     def _pegar(self, _evento):
-        """Ctrl+V con la fila entera de Excel en cualquier casilla la reparte en todas."""
+        """Ctrl+V con una fila de Excel en cualquier casilla la reparte en todas: entera, o solo sus primeras columnas
+        (lo que falta se escribe a mano)."""
         try:
             texto = self.root.clipboard_get()
         except tk.TclError:
             return None
         campos = partir_fila(texto)
-        if len(campos) != len(CAMPOS) or not re.search(r"[\t;]", texto):
+        if not re.search(r"[\t;]", texto) or "\n" in texto.strip() or not (
+                len(campos) == len(CAMPOS) or parece_fila(campos)):
             return None
         self._llenar(campos)
         return "break"
@@ -515,25 +518,39 @@ class Interfaz:
             self._ultimo_error = "vacío"
             return False
         campos = partir_fila(texto)
-        if "\t" not in texto or len(campos) != len(CAMPOS):
-            if "\t" in texto:
-                log(f"Portapapeles: la fila copiada tiene {len(campos)} datos y se esperan {len(CAMPOS)}.")
+        # Una sola fila: entera, o sus primeras columnas (desde el nombre y el documento).
+        if "\t" not in texto or "\n" in texto.strip() or not (len(campos) == len(CAMPOS) or parece_fila(campos)):
+            if "\t" in texto and len(campos) > len(CAMPOS):
+                log(f"Portapapeles: la fila copiada tiene {len(campos)} datos y se esperan hasta {len(CAMPOS)}.")
             return True
         if self.estado == "resultado":
             self._nueva()
-        self._llenar(campos)
+        vacia = self._llenar(campos)
         if self.root.state() == "iconic":
             self.root.deiconify()
         dar_foco(self.hwnd)
         self.root.focus_force()
+        if vacia:
+            vacia.focus_set()
         return True
 
     def _llenar(self, campos: list[str]):
-        for entrada, valor in zip(self.entradas, campos):
+        """Reparte los datos en orden; las casillas que no vienen quedan en blanco para escribirlas a mano. Devuelve la
+        primera casilla vacía (None si están todas)."""
+        for entrada, valor in itertools.zip_longest(self.entradas, campos[:len(self.entradas)], fillvalue=""):
             entrada.delete(0, "end")
             entrada.insert(0, valor)
-        self.sexo.set(SEXOS.get(campos[-1].upper(), "")[:1])
-        self._validar()
+        sexo = campos[len(self.entradas)] if len(campos) > len(self.entradas) else ""
+        self.sexo.set(SEXOS.get(sexo.upper(), "")[:1])
+        vacia = next((entrada for entrada in self.entradas if not entrada.get()), None)
+        if vacia or not self.sexo.get():
+            # A medias no se marca como error lo que falta: se va a escribir.
+            self._mostrar_error("")
+            if vacia:
+                vacia.focus_set()
+        else:
+            self._validar()
+        return vacia
 
     def _validar(self) -> dict | None:
         campos = [" ".join(entrada.get().split()) for entrada in self.entradas] + [self.sexo.get()]

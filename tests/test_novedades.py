@@ -4,7 +4,7 @@ import tkinter as tk
 import unittest
 from pathlib import Path
 from tkinter import ttk
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "PaginasBOT"))
 try:
@@ -102,6 +102,39 @@ class NovedadesTests(unittest.TestCase):
         self.assertEqual(self._abrir(instalacion_nueva=True), [])
         self.assertEqual(self.vistas.read_text(encoding="utf-8"), "22 de octubre de 2026")
         self.assertEqual(interfaz.novedades_pendientes(), [])
+
+
+class PegarFilaTests(unittest.TestCase):
+    def setUp(self):
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        self.objeto = interfaz.Interfaz.__new__(interfaz.Interfaz)
+        self.objeto.root = root
+        self.objeto.entradas = [ttk.Entry(root) for _ in interfaz.ETIQUETAS]
+        self.objeto.sexo = tk.StringVar(root)
+        self.objeto._mostrar_error = Mock()
+        self.objeto._validar = Mock()
+
+    def test_fila_a_medias_llena_lo_que_trae_y_deja_el_resto_en_blanco(self):
+        self.objeto.sexo.set("M")
+        self.objeto.entradas[5].insert(0, "dato de la persona anterior")
+        campos = interfaz.partir_fila("Carlos David Gil Casas\t1000143171\tFALABELLA DE COLOMBIA S.A.\tBogota\t2026-10-20")
+        vacia = self.objeto._llenar(campos)
+        self.assertEqual([entrada.get() for entrada in self.objeto.entradas],
+                         ["Carlos David Gil Casas", "1000143171", "FALABELLA DE COLOMBIA S.A.", "Bogota", "2026-10-20",
+                          "", ""])
+        self.assertEqual(self.objeto.sexo.get(), "")
+        self.assertIs(vacia, self.objeto.entradas[5])
+        self.objeto._validar.assert_not_called()
+        self.objeto._mostrar_error.assert_called_once_with("")
+
+    def test_fila_entera_llena_todo_y_la_revisa(self):
+        campos = ["Persona Prueba", "1000858557", "EMPRESA", "Bogotá", "21/10/2026", "STEVEN", "25/06/2020", "H"]
+        self.assertIsNone(self.objeto._llenar(campos))
+        self.assertEqual([entrada.get() for entrada in self.objeto.entradas], campos[:7])
+        self.assertEqual(self.objeto.sexo.get(), "H")
+        self.objeto._validar.assert_called_once()
 
 
 if __name__ == "__main__":

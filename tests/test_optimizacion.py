@@ -53,7 +53,53 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
             await self.verificar_cola("Hombre", consultar_runt=runt)
         self.assertLess(min(self.inicios) - desde, 0.6)
 
-    async def verificar_cola(self, formato, fecha_expedicion=date(2020, 1, 1), consultar_runt=None):
+    async def test_fbi_y_consilium_se_capturan_apenas_cargan_sin_esperar_los_captchas(self):
+        bucle = asyncio.get_running_loop()
+        capturadas = asyncio.Event()
+        claves = []
+
+        def en_chrome(persona, preguntar, pedidas, antes, caidos):
+            claves.extend(pedidas)
+            if {"fbi", "consilium"} <= set(claves):
+                bucle.call_soon_threadsafe(capturadas.set)
+            return {clave: Path(f"{clave}.png") for clave in pedidas}
+
+        async def captcha_lento(*args):
+            # Un captcha que sigue cargando no detiene las capturas de Chrome.
+            await asyncio.wait_for(capturadas.wait(), 3)
+            return Path("captcha.pdf")
+
+        async def runt(*args):
+            return Path("runt.png")
+
+        await self.verificar_cola("Hombre", consultar_runt=runt, captcha=captcha_lento, consultas_edge=en_chrome)
+        self.assertEqual(sorted(claves), ["consilium", "fbi"])
+
+    async def test_si_la_precarga_no_abre_mientras_se_espera_se_carga_una_vez_mas(self):
+        async def precarga_caida():
+            await asyncio.sleep(0.05)
+            raise main.FueraDeServicio("la página no abrió ni recargándola")
+
+        def preparar(r):
+            r["precargas"]["inhabilidades"] = asyncio.create_task(precarga_caida())
+            r["formularios"] = {clave: ("https://sitio.test/", None) for clave in r["ventanas"]}
+
+        # Sin la carga extra, Inhabilidades quedaría fuera de servicio y la cola lo notaría.
+        with patch.object(documentos, "precargar", new_callable=AsyncMock) as precargar:
+            await self.verificar_cola("Hombre", preparar=preparar)
+        precargar.assert_awaited_once()
+
+    async def test_si_el_ocr_tarda_se_pide_el_codigo_sin_esperarlo(self):
+        with patch.object(main, "leer_captcha", side_effect=lambda imagen: time.sleep(0.5) or "abc12"), \
+                patch.object(main, "ESPERA_OCR", 0.1), patch.object(main, "log"):
+            desde = time.monotonic()
+            self.assertIsNone(await main.leer_captcha_a_tiempo(b"png"))
+            self.assertLess(time.monotonic() - desde, 0.4)
+        with patch.object(main, "leer_captcha", return_value="abc12"):
+            self.assertEqual(await main.leer_captcha_a_tiempo(b"png"), "abc12")
+
+    async def verificar_cola(self, formato, fecha_expedicion=date(2020, 1, 1), consultar_runt=None, captcha=None,
+                             consultas_edge=None, preparar=None):
         activos, maximo = 0, 0
         iniciados = []
         self.inicios = []
@@ -81,8 +127,10 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
         async def nueva(contexto, consulta, persona, clave):
             return await trabajo(clave)
 
-        async def captcha(*args):
+        async def captcha_listo(*args):
             return Path("captcha.pdf")
+
+        captcha = captcha or captcha_listo
 
         page = Mock()
         page.is_closed.return_value = False
@@ -94,12 +142,15 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
         r.update({clave: contexto for clave in ("grupo", "eeuu", "documentos", "gallagher")})
         r["navegadores"] = (contexto.browser, contexto.browser)
         r["ventanas"] = {clave: page for clave in documentos.ORDEN_TURNOS}
-        r["precargas"] = {clave: asyncio.create_task(asyncio.sleep(0)) for clave in r["ventanas"]}
+        r["precargas"] = {clave: asyncio.create_task(asyncio.sleep(0)) for clave in (*r["ventanas"], "simit")}
         r["usos"] = dict.fromkeys(main.CON_CASILLA, 0)
         r["renovar"] = AsyncMock()
+        r["precargar_simit"] = AsyncMock()
         for nombre in ("consolidado", "consolium"):
             r[nombre] = SimpleNamespace(clave=nombre, page=page,
                                        buscar=lambda persona, nombre=nombre: trabajo(nombre))
+        if preparar:
+            preparar(r)
 
         async def automatico(page, *args):
             return await trabajo("automatica")
@@ -119,6 +170,7 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
                 stack.enter_context(patch.object(modulo, nombre, side_effect=propia))
             for nombre in ("log", "avisar", "abrir_paginas_chrome"):
                 stack.enter_context(patch.object(main, nombre))
+            cerrar_ventanas = stack.enter_context(patch.object(main, "cerrar_ventanas_abiertas"))
             stack.enter_context(patch.object(rendimiento, "log"))
             stack.enter_context(patch.object(main, "limite_concurrencia", return_value=2))
             stack.enter_context(patch.object(main, "con_caida", side_effect=con_caida))
@@ -126,7 +178,9 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(main, "capturar_sin_ventana", side_effect=eeuu))
             stack.enter_context(patch.object(main, "consultar_insight", side_effect=insight))
             stack.enter_context(patch.object(main, "estado_ventana", new_callable=AsyncMock))
-            stack.enter_context(patch.object(main, "consultas_edge",
+            stack.enter_context(patch.object(main, "pagina_cargada", return_value=True))
+            stack.enter_context(patch.object(main, "MARGEN_CHROME", 0))
+            stack.enter_context(patch.object(main, "consultas_edge", side_effect=consultas_edge,
                                             return_value={"fbi": Path("fbi.png"), "consilium": Path("consilium.png")}))
             capturas, caidos = await asyncio.wait_for(main.consultar_persona(
                 {"formato": formato, "sexo": "Hombre", "nombre": "Prueba", "tipo": "CC",
@@ -146,6 +200,9 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
             esperadas -= {"registraduria", "rnmc", "inhabilidades"}
             self.assertNotIn("rnmc", iniciados)
         self.assertEqual(set(capturas), esperadas)
+        # Al terminar: no queda nada abierto en el Chrome del usuario y SIMIT se deja listo para la siguiente.
+        cerrar_ventanas.assert_called_once()
+        r["precargar_simit"].assert_called_once()
 
     async def test_precargas_esperan_al_runt_un_tiempo_y_luego_van_de_dos_en_dos(self):
         runt_liberado = asyncio.Event()
@@ -164,10 +221,15 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 activos -= 1
 
+        async def cargar(page, url, lista, **_):
+            await precargar(page, url, lista)
+
         with patch.object(main, "PRIORIDAD_RUNT", 0.3), \
                 patch.object(main, "estado_ventana", new_callable=AsyncMock), \
                 patch.object(main, "abrir_perfil_runt", AsyncMock(return_value=None)), \
                 patch.object(documentos, "precargar", side_effect=precargar), \
+                patch.object(main, "cargar_pagina", side_effect=cargar) as cargar_pagina, \
+                patch.object(main, "cerrar_aviso_simit", new_callable=AsyncMock), \
                 patch.object(main, "Documento"), patch.object(rendimiento, "log"):
             r = await main.abrir_navegadores(self._playwright_falso())
             try:
@@ -183,6 +245,8 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
                     tarea.cancel()
                 await asyncio.gather(*r["precargas"].values(), return_exceptions=True)
         self.assertEqual(maximo, 2)
+        # SIMIT también queda listo de antemano, dentro del mismo límite.
+        self.assertEqual(cargar_pagina.call_args.args[1:], (main.URL_SIMIT, main.formulario_simit_listo))
 
     async def test_precargas_y_documentos_siguen_apenas_termina_el_runt(self):
         cargado = asyncio.Event()
@@ -197,6 +261,8 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "abrir_perfil_runt", AsyncMock(return_value=None)), \
                 patch.object(main, "cargar_consolidado", cargar), \
                 patch.object(documentos, "precargar", side_effect=precargar), \
+                patch.object(main, "cargar_pagina", new_callable=AsyncMock), \
+                patch.object(main, "cerrar_aviso_simit", new_callable=AsyncMock), \
                 patch.object(main, "Documento") as documento, patch.object(rendimiento, "log"):
             r = await main.abrir_navegadores(self._playwright_falso())
             try:
@@ -261,6 +327,8 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "estado_ventana", new_callable=AsyncMock), \
                 patch.object(main, "abrir_perfil_runt", AsyncMock(return_value=None)), \
                 patch.object(documentos, "precargar", side_effect=precargar), \
+                patch.object(main, "cargar_pagina", new_callable=AsyncMock), \
+                patch.object(main, "cerrar_aviso_simit", new_callable=AsyncMock), \
                 patch.object(main, "Documento"), patch.object(rendimiento, "log"):
             r = await main.abrir_navegadores(p)
             await asyncio.wait_for(asyncio.gather(*r["precargas"].values()), 2)
@@ -330,6 +398,23 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EstabilidadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_busqueda_en_documento_como_ctrl_f(self):
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                await page.set_content("""<p>12. CARLOS DAVID GIL CASÁS (alias El Gil), nacido en 1980.</p>
+                    <p>Carlos   David\n Gil Casas, Bogotá.</p><p>GIL CASAS, Carlos David</p>
+                    <table><tr><td>1000143171</td><td>10001431710</td></tr></table>""")
+                self.assertEqual(await page.evaluate(main.BUSCAR_EN_DOCUMENTO_JS, "Carlos David Gil Casas"), 2)
+                self.assertEqual(await page.evaluate("CSS.highlights.get('buscar').size"), 2)
+                # Al buscar otra persona se quita la búsqueda anterior.
+                self.assertEqual(await page.evaluate(main.BUSCAR_EN_DOCUMENTO_JS, "1000143171"), 2)
+                self.assertEqual(await page.locator("#barra-buscar-bot").count(), 1)
+                self.assertEqual(await page.evaluate(main.BUSCAR_EN_DOCUMENTO_JS, "Persona (Prueba)"), 0)
+            finally:
+                await browser.close()
+
     async def test_casilla_lenta_o_sin_resolver_marca_su_ventana(self):
         html = """<textarea name="g-recaptcha-response"></textarea>
             <iframe srcdoc="<div id='recaptcha-anchor' style='width:20px;height:20px'></div>"></iframe>

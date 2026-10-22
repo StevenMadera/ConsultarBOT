@@ -23,6 +23,7 @@ class CierreNavegadorTests(unittest.TestCase):
         user32.IsWindow.side_effect = lambda hwnd: hwnd in abiertas
         user32.PostMessageW.side_effect = lambda hwnd, *_: abiertas.discard(hwnd)
         with patch.object(captura.ctypes.windll, "user32", user32), \
+                patch.object(captura, "_clase", return_value="Chrome_WidgetWin_1"), \
                 patch.object(captura, "_ventanas_nuevas", return_value=[ventana, duplicada, consilium]):
             captura._cerrar_ventanas_consultadas(ventana, "Fugitives", {1})
         self.assertEqual(abiertas, {1, 4})
@@ -39,12 +40,40 @@ class CierreNavegadorTests(unittest.TestCase):
     def test_registra_si_el_navegador_no_cierra(self):
         ventana = SimpleNamespace(_hWnd=2, title="Fugitives")
         with patch.object(captura.ctypes.windll, "user32") as user32, \
+                patch.object(captura, "_clase", return_value="Chrome_WidgetWin_1"), \
                 patch.object(captura, "_ventanas_nuevas", return_value=[ventana]), \
                 patch.object(captura.time, "monotonic", side_effect=[0, 4]), \
                 patch.object(captura, "log") as log:
             user32.IsWindow.return_value = True
             captura._cerrar_ventanas_consultadas(ventana, "Fugitives", {1})
         log.assert_called_once()
+
+    def test_al_terminar_cierra_lo_que_el_bot_abrio_y_las_reabiertas_de_la_sesion_anterior(self):
+        abiertas = {1, 2, 3, 4, 5, 6, 7}
+        nuevas = [SimpleNamespace(_hWnd=hwnd, title=titulo) for hwnd, titulo in (
+            (3, "Federal Bureau of Investigation - Google Chrome"), (4, "Reclutamiento | Ejercito Colombia"),
+            (5, "Gmail - Google Chrome"), (6, "www.consilium.europa.eu - Google Chrome"))]
+        user32 = Mock()
+        user32.IsWindow.side_effect = lambda hwnd: hwnd in abiertas
+        user32.PostMessageW.side_effect = lambda hwnd, *_: abiertas.discard(hwnd)
+        clases = {7: "Notepad"}
+        with patch.object(captura.ctypes.windll, "user32", user32), \
+                patch.object(captura, "_clase", side_effect=lambda hwnd: clases.get(hwnd, "Chrome_WidgetWin_1")), \
+                patch.object(captura, "_ventanas_nuevas", return_value=nuevas), \
+                patch.object(captura, "_ABIERTAS", {2, 7}), \
+                patch.object(captura, "_MARCAS", {"www.consilium.europa.eu", "Search - Consilium"}), \
+                patch.object(captura, "_PREVIAS", {1}):
+            captura.cerrar_ventanas_abiertas()
+            self.assertEqual(captura._ABIERTAS, set())
+            self.assertIsNone(captura._PREVIAS)
+        # La 7 es el número de una ventana del bot que ya se cerró y ahora es de otro programa: no se toca.
+        self.assertEqual(abiertas, {1, 5, 7})
+
+    def test_sin_nada_abierto_no_toca_ninguna_ventana(self):
+        with patch.object(captura.ctypes.windll, "user32") as user32, \
+                patch.object(captura, "_ABIERTAS", set()), patch.object(captura, "_PREVIAS", None):
+            captura.cerrar_ventanas_abiertas()
+        user32.PostMessageW.assert_not_called()
 
     def test_cierra_si_falla_el_paso_manual(self):
         ventana = SimpleNamespace(_hWnd=2, title="Search - Consilium")

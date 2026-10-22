@@ -13,8 +13,9 @@ from rendimiento import etapa
 # Segundos por intento: con todas las páginas cargando a la vez, el RUNT (unos 12 MB) puede tardar más de un minuto.
 ESPERA_CARGA = 120
 INTENTOS = 2
-# Una precarga más vieja ya no sirve: su captcha caduca a los 60 s.
-VIGENCIA_PRECARGA = 45
+# Una precarga más vieja no sirve: tras llenar el formulario llegaría a su turno pasados los 45 s en que el captcha
+# se recarga (caduca a los 60 s), y esa recarga ya no tendría la prioridad del inicio.
+VIGENCIA_PRECARGA = 30
 # Con el equipo ocupado, comprobar el formulario precargado puede tardar; recargarlo tarda mucho más (RUNT: 60-140 s).
 ESPERA_REUTILIZAR = 20
 _precargadas: WeakKeyDictionary = WeakKeyDictionary()
@@ -60,7 +61,10 @@ async def esperar_estable(page: Page, timeout: int = 10000):
 
 def _detalle(error: BaseException) -> str:
     lineas = str(error).splitlines()
-    return lineas[0] if lineas and lineas[0] else "tiempo agotado"
+    detalle = lineas[0] if lineas and lineas[0] else "tiempo agotado"
+    # Qué parte del formulario no apareció (el sitio o, por ejemplo, la casilla de Google).
+    esperando = next((linea.strip(" -") for linea in lineas if "waiting for locator(" in linea), None)
+    return f"{detalle} {esperando}" if esperando else detalle
 
 
 async def _detener(page: Page):
@@ -103,22 +107,23 @@ async def cargar_pagina(
     recargar: bool = False,
     configurar: Callable[[Page], Awaitable[object]] | None = None,
     reutilizar: bool = False,
+    vigencia: float = VIGENCIA_PRECARGA,
     espera: float | None = None,
     intentos: int | None = None,
 ) -> Page:
     with etapa("carga"):
         return await _cargar_pagina(page, url, lista, recargar=recargar, configurar=configurar,
-                                   reutilizar=reutilizar, espera=espera or ESPERA_CARGA,
+                                   reutilizar=reutilizar, vigencia=vigencia, espera=espera or ESPERA_CARGA,
                                    intentos=intentos or INTENTOS)
 
 
-async def _cargar_pagina(page, url, lista, *, recargar, configurar, reutilizar, espera, intentos):
+async def _cargar_pagina(page, url, lista, *, recargar, configurar, reutilizar, vigencia, espera, intentos):
     """Solo navega y verifica el formulario (`lista`). Nunca rellena ni envía una consulta o un captcha.
 
     Cada intento espera hasta `espera` segundos; si la página no abre, se detiene su carga y se recarga. Sin
     respuesta tras `intentos`, el sitio está fuera de servicio."""
     precarga = _precargadas.pop(page, None)
-    if reutilizar and precarga and precarga[0] == url and time.monotonic() - precarga[1] < VIGENCIA_PRECARGA \
+    if reutilizar and precarga and precarga[0] == url and time.monotonic() - precarga[1] < vigencia \
             and not page.is_closed():
         try:
             await asyncio.wait_for(lista(page) if lista else page.wait_for_load_state("load"), ESPERA_REUTILIZAR)

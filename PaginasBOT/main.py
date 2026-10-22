@@ -20,16 +20,16 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 from win32com.shell import shell
 
-from captura_navegador import PAGINA_REFERENCIA, PANTALLA, abrir_en_ventanas
+from captura_navegador import PAGINA_REFERENCIA, PANTALLA, abrir_en_ventanas, cerrar_ventanas_abiertas, pagina_cargada
 from comun import CAPTURAS, NOMBRE, FueraDeServicio, avisar, leer_respuesta, log
 import documentos
 from documentos import estado_ventana
-from consulta_consilium import consultar_consilium, url_consilium
-from consulta_fbi import consultar_fbi, url_fbi
+from consulta_consilium import TITULO_CONSILIUM, consultar_consilium, url_consilium
+from consulta_fbi import TITULO_FBI, consultar_fbi, url_fbi
 from consulta_justicia import TITULO_JUSTICIA, consultar_justicia, url_justicia
 from consulta_terroristas import TITULO_TERRORISTAS, consultar_terroristas, url_terroristas
 from ocr import buscar_tesseract
-from carga_paginas import cargar_pagina, esperar_estable, instante_carga
+from carga_paginas import cargar_pagina, esperar_estable, instante_carga, marcar_precarga
 from rendimiento import capturar_pantalla, etapa, medir_sitio
 
 
@@ -42,6 +42,9 @@ ESPERA_PROCURADURIA = 240
 SEGUNDA_PROCURADURIA = 50
 URL_RUNT = "https://portalpublico.runt.gov.co/#/consulta-ciudadano-documento/consulta/consulta-ciudadano-documento"
 URL_SIMIT = "https://www.fcm.org.co/simit/#/home-public"
+# SIMIT tarda en abrir (20-45 s con el equipo ocupado): su formulario se deja listo al abrir y después de cada
+# consulta, y la siguiente lo usa si se cargó hace menos de estos segundos.
+VIGENCIA_SIMIT = 600
 URL_LIBRETA = "https://definicion.libretamilitar.mil.co/consulta-estado-situacion-militar"
 URL_OFAC = "https://sanctionssearch.ofac.treas.gov/"
 URL_GOVUK = "https://www.gov.uk/"
@@ -72,6 +75,14 @@ PRIORIDAD_RUNT = 20
 # o si la casilla tardó, la ventana se cambia por una limpia.
 CON_CASILLA = ("antecedentes", "inhabilidades")
 RENOVAR_CADA = 5
+# FBI y Consilium se capturan apenas su página lleva estos segundos a la vista (su JavaScript aplica la búsqueda
+# después de cargar); si no carga en ESPERA_CHROME s, después de los captchas.
+MARGEN_CHROME = 5
+ESPERA_CHROME = 60
+# El OCR del RUNT tarda 0,4-2 s; con el equipo saturado llegó a 15-30 s, con el captcha ya a la vista.
+ESPERA_OCR = 5
+# Si la precarga de un captcha no abrió (con todo cargando a la vez, aunque el sitio funcione), una carga más.
+ESPERA_REPETIR = 90
 # Sin la marca de navegador automatizado (navigator.webdriver), que también le hace poner la casilla más difícil.
 SIN_AUTOMATIZACION = {"args": ["--start-maximized", "--disable-blink-features=AutomationControlled"],
                       "ignore_default_args": ["--enable-automation"]}
@@ -192,18 +203,29 @@ def leer_captcha(imagen):
         return None
 
 
+async def leer_captcha_a_tiempo(imagen) -> str | None:
+    """La lectura automática del código; si tarda, se pide a la persona sin esperarla."""
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(leer_captcha, imagen), ESPERA_OCR)
+    except TimeoutError:
+        log(f"RUNT: la lectura automática del código tardó más de {ESPERA_OCR} s; se pide escribirlo.")
+        return None
+
+
 
 def sin_tildes(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
 
 
-CAMPOS = ("nombre", "documento", "empresa", "fecha consulta", "quien consulta", "fecha expedicion", "sexo")
+CAMPOS = ("nombre", "documento", "empresa", "ciudad", "fecha consulta", "quien consulta", "fecha expedicion", "sexo")
 FORMATO = (
-    "Copia la fila de Excel con: nombre, documento, empresa, fecha consulta, quien consulta, fecha expedicion, sexo "
-    "(ej. Santiago Flores Alonso | 1000858557 | FALABELLA CEDI | 16/09/2026 | STEVEN | 25/06/2020 | H). "
+    "Copia la fila de Excel con: nombre, documento, empresa, ciudad, fecha consulta, quien consulta, fecha expedicion, "
+    "sexo (ej. Santiago Flores Alonso | 1000858557 | FALABELLA CEDI | Bogotá | 16/09/2026 | STEVEN | 25/06/2020 | H). "
     "Fecha expedicion: 0 si no se tiene. Sexo: H (hombre) o M (mujer). A mano, separa los datos con ;"
 )
 SEXOS = {"H": "Hombre", "HOMBRE": "Hombre", "M": "Mujer", "MUJER": "Mujer"}
+# Si no se indica el tipo de documento, es cédula de ciudadanía.
+DOCUMENTO_RE = re.compile(r"(?:([A-Za-z.]+)\s*)?([\d.,\s]+)")
 
 
 def leer_fecha(texto: str, campo: str, ayuda: str = "Usa dd/mm/aaaa.") -> date:
@@ -231,6 +253,12 @@ def parsear(linea: str) -> dict:
     return validar(partir_fila(linea))
 
 
+def parece_fila(campos: list[str]) -> bool:
+    """Lo copiado son las primeras columnas de una fila (o la fila entera): un nombre sin números y un documento."""
+    return (2 <= len(campos) <= len(CAMPOS) and not re.search(r"\d", campos[0])
+            and DOCUMENTO_RE.fullmatch(campos[1]) is not None)
+
+
 def validar(campos: list[str]) -> dict:
     """Los datos de la persona a partir de los campos, en el orden de CAMPOS."""
     if len(campos) != len(CAMPOS):
@@ -238,13 +266,12 @@ def validar(campos: list[str]) -> dict:
     for campo, valor in zip(CAMPOS, campos):
         if not valor:
             raise ValueError(f"Falta el dato '{campo}'. {FORMATO}")
-    nombre, documento, empresa, fecha_consulta, consultor, fecha_expedicion, sexo = campos
+    nombre, documento, empresa, ciudad, fecha_consulta, consultor, fecha_expedicion, sexo = campos
     if re.search(r"\d", nombre):
         raise ValueError(f"El nombre no puede tener números: {nombre!r}. {FORMATO}")
     if sexo.upper() not in SEXOS:
         raise ValueError(f"Sexo no válido: {sexo!r}; usa H (hombre) o M (mujer). {FORMATO}")
-    # Si no se indica el tipo de documento, es cédula de ciudadanía.
-    m = re.fullmatch(r"(?:([A-Za-z.]+)\s*)?([\d.,\s]+)", documento)
+    m = DOCUMENTO_RE.fullmatch(documento)
     tipo = (m[1] or "CC").replace(".", "").upper() if m else ""
     numero = re.sub(r"\D", "", m[2]) if m else ""
     if tipo not in ("CC", "CE", "PEP", "PPT", "NIT", "TI") or not numero:
@@ -254,6 +281,7 @@ def validar(campos: list[str]) -> dict:
         "tipo": tipo,
         "numero": numero,
         "empresa": empresa,
+        "ciudad": ciudad,
         "fecha_consulta": leer_fecha(fecha_consulta, "fecha de consulta"),
         "consultor": consultor,
         # «0»: no se tiene; las consultas que la piden se omiten.
@@ -603,6 +631,30 @@ def carpeta_salidas() -> Path:
     return carpeta
 
 
+_capturas_revisadas: date | None = None
+
+
+def borrar_capturas_viejas():
+    """Una vez al día borra las imágenes y PDF de capturas/ de días anteriores: ya están dentro de sus informes y
+    llenarían el disco. Los informes (Documentos/PAGINAS) no se tocan."""
+    global _capturas_revisadas
+    hoy = date.today()
+    if _capturas_revisadas == hoy:
+        return
+    _capturas_revisadas = hoy
+    borradas = 0
+    for archivo in CAPTURAS.glob("*"):
+        try:
+            if archivo.suffix.lower() in (".png", ".pdf", ".jpg", ".jpeg") \
+                    and date.fromtimestamp(archivo.stat().st_mtime) < hoy:
+                archivo.unlink()
+                borradas += 1
+        except OSError:
+            pass
+    if borradas:
+        log(f"Capturas: se borraron {borradas} imágenes y PDF de días anteriores.")
+
+
 def insertar_en_pdf(capturas: dict[str, Path], persona: dict, caidos: set[str] = frozenset()) -> Path:
     """`caidos`: sitios fuera de servicio; su captura es la página caída."""
     formato = persona["formato"]
@@ -757,7 +809,7 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
 
             pedido = time.monotonic()
             # La lectura automática se prueba solo la primera vez: si falló, el código lo escribe la persona.
-            captcha = await asyncio.to_thread(leer_captcha, imagen) if imagen and not intento else None
+            captcha = await leer_captcha_a_tiempo(imagen) if imagen and not intento else None
 
             if captcha:
                 respuesta = captcha
@@ -898,26 +950,36 @@ async def seleccionar_persona_simit(page, persona: dict, pedir_seleccion):
     await dialogo.wait_for(state="hidden", timeout=120000)
 
 
-async def consultar_simit(page, persona: dict, pedir_seleccion=None) -> Path:
-    numero = re.sub(r"\D", "", persona["numero"])
-    # Una sola carga completa: si la página ya está en SIMIT, goto solo cambia el hash de la SPA y hay que recargar.
-    async def lista(p):
-        await p.locator("#txtBusqueda").wait_for(timeout=60000)
-        validacion = p.locator("#whcModal")
+async def formulario_simit_listo(p):
+    await p.locator("#txtBusqueda").wait_for(timeout=60000)
+    validacion = p.locator("#whcModal")
+    # Recién abierta la página, su validación de seguridad aparece un momento después del formulario.
+    if await p.evaluate("performance.now()") < 20000:
         try:
             await validacion.wait_for(state="visible", timeout=5000)
         except PlaywrightTimeoutError:
             pass
-        await validacion.wait_for(state="hidden", timeout=60000)
+    await validacion.wait_for(state="hidden", timeout=60000)
 
-    page = await cargar_pagina(
-        page, URL_SIMIT, lista,
-        recargar=page.url.startswith(URL_SIMIT.split("#")[0]),
-    )
+
+async def cerrar_aviso_simit(page):
+    """El aviso que SIMIT muestra al abrir; recién abierta la página puede tardar unos segundos en salir."""
     try:
-        await page.locator("button.close:visible").first.click(timeout=5000)
+        espera = 5000 if await page.evaluate("performance.now()") < 20000 else 500
+        await page.locator("button.close:visible").first.click(timeout=espera)
     except PlaywrightTimeoutError:
         pass
+
+
+async def consultar_simit(page, persona: dict, pedir_seleccion=None) -> Path:
+    numero = re.sub(r"\D", "", persona["numero"])
+    # Una sola carga completa: si la página ya está en SIMIT, goto solo cambia el hash de la SPA y hay que recargar.
+    # Si quedó lista de antemano (al abrir o tras la consulta anterior), se usa esa.
+    page = await cargar_pagina(
+        page, URL_SIMIT, formulario_simit_listo,
+        recargar=page.url.startswith(URL_SIMIT.split("#")[0]), reutilizar=True, vigencia=VIGENCIA_SIMIT,
+    )
+    await cerrar_aviso_simit(page)
     await page.locator("#txtBusqueda").fill(numero)
     await page.locator("#consultar").click(timeout=120000)
     await page.wait_for_url("**/estado-cuenta", timeout=30000)
@@ -1053,19 +1115,25 @@ async def capturar_sin_ventana(page, persona: dict, clave: str, url: str, titulo
     return ruta
 
 
-# El documento queda cargado entre consultas: primero se quita la búsqueda anterior.
-BUSCAR_EN_DOCUMENTO_JS = """q => {
+# El documento queda cargado entre consultas: primero se quita la búsqueda anterior. Como Ctrl+F: sin distinguir
+# mayúsculas ni tildes, y entre palabras vale cualquier espacio.
+BUSCAR_EN_DOCUMENTO_JS = r"""q => {
     document.getElementById('barra-buscar-bot')?.remove();
     document.getElementById('estilo-buscar-bot')?.remove();
     CSS.highlights.clear();
     window.scrollTo(0, 0);
+    const tildes = {a: 'aáàâäã', e: 'eéèêë', i: 'iíìîï', o: 'oóòôöõ', u: 'uúùûü', n: 'nñ', c: 'cç'};
+    const patron = q.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim().split(/\s+/)
+        .map(palabra => [...palabra].map(c => tildes[c] ? `[${tildes[c]}]` : c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+            .join(''))
+        .join('\\s+');
+    const buscar = new RegExp(patron, 'gi');
     const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    const rangos = []; let n;
+    const rangos = []; let n, m;
     while ((n = w.nextNode())) {
-        let i = n.nodeValue.indexOf(q);
-        while (i !== -1) {
-            const r = new Range(); r.setStart(n, i); r.setEnd(n, i + q.length); rangos.push(r);
-            i = n.nodeValue.indexOf(q, i + q.length);
+        buscar.lastIndex = 0;
+        while ((m = buscar.exec(n.nodeValue))) {
+            const r = new Range(); r.setStart(n, m.index); r.setEnd(n, m.index + m[0].length); rangos.push(r);
         }
     }
     const estilo = document.createElement('style');
@@ -1101,21 +1169,23 @@ async def cargar_consolidado(page):
 
 
 async def cargar_eurlex(page):
-    """Diario Oficial L 25/2022, donde se busca el número como con Ctrl+F."""
+    """Diario Oficial L 25/2022, donde se busca el nombre como con Ctrl+F."""
     await page.set_viewport_size({"width": 1600, "height": round(1600 * proporcion_zona("consolium", "Hombre"))})
     return await cargar_pagina(page, URL_EURLEX, lambda p: p.get_by_text("Diario Oficial").first.wait_for(timeout=60000))
 
 
 class Documento:
-    """Documento fijo que se carga al iniciar y queda abierto; en cada consulta solo se busca el número."""
+    """Documento fijo que se carga al iniciar y queda abierto; en cada consulta solo se busca el número de documento
+    (o, con `por_nombre`, el nombre completo)."""
 
-    def __init__(self, page, cargar, clave: str, nombre: str):
+    def __init__(self, page, cargar, clave: str, nombre: str, por_nombre: bool = False):
         self.page, self.cargar, self.clave, self.nombre = page, cargar, clave, nombre
+        self.por_nombre = por_nombre
         self.carga = asyncio.create_task(cargar(page))
         self.reintentar = False
 
     async def buscar(self, persona: dict) -> Path:
-        """Equivale a buscar el número con Ctrl+F: resalta las coincidencias y muestra la barra de búsqueda."""
+        """Equivale a buscar con Ctrl+F: resalta las coincidencias y muestra la barra de búsqueda."""
         if self.reintentar:
             self.carga = asyncio.create_task(self.cargar(self.page))
             self.reintentar = False
@@ -1132,11 +1202,12 @@ class Documento:
                 await self.carga
         page = self.page
         numero = re.sub(r"\D", "", persona["numero"])
+        buscado = " ".join(persona["nombre"].split()) if self.por_nombre else numero
         # El recuadro cambia de alto según la plantilla; el ancho se mantiene para no reacomodar el documento.
         alto = round(1600 * proporcion_zona(self.clave, persona["formato"]))
         await page.set_viewport_size({"width": 1600, "height": alto})
-        coincidencias = await page.evaluate(BUSCAR_EN_DOCUMENTO_JS, numero)
-        log(f"{self.nombre}: {coincidencias} coincidencias para {numero}")
+        coincidencias = await page.evaluate(BUSCAR_EN_DOCUMENTO_JS, buscado)
+        log(f"{self.nombre}: {coincidencias} coincidencias para {buscado}")
         await esperar_estable(page)
 
         CAPTURAS.mkdir(exist_ok=True)
@@ -1733,6 +1804,7 @@ async def abrir_navegadores(p) -> dict:
     }
     for clave, (url, lista) in formularios.items():
         r["precargas"][clave] = asyncio.create_task(precargar_limitada(clave, url, lista))
+    r["formularios"] = formularios
 
     async def renovar(clave):
         """Cambia la ventana del sitio por una limpia (sin las cookies de Google) y deja su formulario listo."""
@@ -1745,9 +1817,28 @@ async def abrir_navegadores(p) -> dict:
         await precargar_limitada(clave, *formularios[clave])
 
     r["renovar"] = renovar
+
+    async def precargar_simit():
+        """Deja el formulario de SIMIT listo para la próxima consulta."""
+        with medir_sitio("precarga_simit"):
+            with etapa("cola"):
+                await esperar_al_runt()
+                await limite_precarga.acquire()
+            try:
+                page = r["simit"]
+                await cargar_pagina(page, URL_SIMIT, formulario_simit_listo,
+                                    recargar=page.url.startswith(URL_SIMIT.split("#")[0]))
+                await cerrar_aviso_simit(page)
+                marcar_precarga(page, URL_SIMIT)
+            finally:
+                limite_precarga.release()
+
+    r["precargas"]["simit"] = asyncio.create_task(precargar_simit())
+    r["precargar_simit"] = precargar_simit
     r["consolidado"] = Documento(await onu.new_page(), despues_del_runt(cargar_consolidado), "consolidado",
                                  "Documento consolidado")
-    r["consolium"] = Documento(await eurlex.new_page(), despues_del_runt(cargar_eurlex), "consolium", "EUR-Lex")
+    r["consolium"] = Documento(await eurlex.new_page(), despues_del_runt(cargar_eurlex), "consolium", "EUR-Lex",
+                               por_nombre=True)
     return r
 
 
@@ -1945,6 +2036,18 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
     async def automatica(clave: str, funcion, page, *args):
         await en_cupo(clave, lambda: con_caida(page, clave, persona, funcion(page, *args)))
 
+    async def simit(page, *args):
+        # Su formulario se deja cargado de antemano: si aún está cargando, se espera (si falló, se carga aquí).
+        precarga = r["precargas"]["simit"]
+        esperada = not precarga.done()
+        with etapa("carga"):
+            await asyncio.gather(precarga, return_exceptions=True)
+        error = None if precarga.cancelled() else precarga.exception()
+        # Si no abrió mientras se la esperaba, el sitio está caído: no se espera otra carga.
+        if esperada and isinstance(error, FueraDeServicio):
+            raise error
+        return await consultar_simit(page, *args)
+
     async def en_cupo(clave, crear):
         async def ejecutar():
             with etapa("cola"):
@@ -1991,10 +2094,19 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
             esperada = not precarga.done()
             with etapa("carga"):
                 await asyncio.gather(precarga, return_exceptions=True)
-            # Si el sitio no respondió a la precarga mientras se la esperaba, ya está caído: no se espera otra carga.
+            # Si el sitio no respondió a la precarga mientras se la esperaba, se prueba una sola carga más, con tope.
             error = None if precarga.cancelled() else precarga.exception()
             caido = esperada and (isinstance(error, FueraDeServicio)
                                   or isinstance(error, PlaywrightTimeoutError) and str(error).startswith("Page.goto:"))
+            if caido and not r["ventanas"][clave].is_closed():
+                log(f"{clave}: no abrió mientras se esperaba; se intenta una vez más.")
+                try:
+                    with etapa("carga"):
+                        await asyncio.wait_for(documentos.precargar(r["ventanas"][clave], *r["formularios"][clave]),
+                                               ESPERA_REPETIR)
+                    caido = False
+                except (FueraDeServicio, PlaywrightError, TimeoutError):
+                    pass
             for intento in range(2):
                 page = r["ventanas"][clave]
                 if page.is_closed():
@@ -2045,22 +2157,54 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
             await contexto.close()
 
     async def edge():
-        # Empieza cuando ya se enviaron todos los captchas; uno que haya que repetir y ya esté en la fila pasa antes.
-        await asyncio.gather(*(evento.wait() for evento in listos.values()))
-        log(f"Tiempo: captchas enviados a los {minutos(time.monotonic() - inicio)}")
-        await asyncio.gather(apertura_chrome, eeuu, return_exceptions=True)
-        async with turnos.pantalla():
-            desde = time.monotonic()
-            claves = ["fbi", "consilium", *a_chrome]
-            avisar("capturando", claves=claves)
-            try:
-                # Las que no se pudieron abrir de antemano se abren al capturarlas, como antes.
-                capturas.update(await asyncio.to_thread(consultas_edge, persona, preguntar_edge, claves, antes_chrome,
-                                                        caidos))
-            finally:
-                avisar("capturando", claves=[])
-            log(f"Tiempo: capturas en Chrome {minutos(time.monotonic() - desde)}")
-            if persona["formato"] == "Gallagher":
+        async def enviados():
+            await asyncio.gather(*(evento.wait() for evento in listos.values()))
+
+        async def en_chrome(claves):
+            async with turnos.pantalla():
+                avisar("capturando", claves=claves)
+                try:
+                    capturas.update(await asyncio.to_thread(consultas_edge, persona, preguntar_edge, claves,
+                                                            antes_chrome, caidos))
+                finally:
+                    avisar("capturando", claves=[])
+
+        async def cargada(url, titulo) -> bool:
+            vista, fin = None, time.monotonic() + ESPERA_CHROME
+            while time.monotonic() < fin:
+                if await asyncio.to_thread(pagina_cargada, url, titulo, antes_chrome):
+                    vista = vista or time.monotonic()
+                    if time.monotonic() - vista >= MARGEN_CHROME:
+                        return True
+                else:
+                    vista = None
+                await asyncio.sleep(1)
+            return False
+
+        async def abierta(clave, url, titulo):
+            # Apenas carga su ventana se captura, en el primer hueco sin captchas esperando la pantalla. Si no carga
+            # (o no se pudo abrir de antemano), se captura después de los captchas para no hacerlos esperar.
+            await apertura_chrome
+            if antes_chrome is None or not await cargada(url, titulo):
+                await enviados()
+            await en_chrome([clave])
+
+        async def respaldo():
+            # State.gov y Justice, si no cargaron en el navegador automático: se abren al capturarlas.
+            await asyncio.gather(eeuu, enviados(), return_exceptions=True)
+            if a_chrome:
+                await en_chrome(list(a_chrome))
+
+        async def tiempo_captchas():
+            await enviados()
+            log(f"Tiempo: captchas enviados a los {minutos(time.monotonic() - inicio)}")
+
+        await asyncio.gather(abierta("fbi", url_fbi(persona), TITULO_FBI),
+                             abierta("consilium", url_consilium(persona), TITULO_CONSILIUM),
+                             respaldo(), tiempo_captchas())
+        log(f"Tiempo: capturas en Chrome listas a los {minutos(time.monotonic() - inicio)}")
+        if persona["formato"] == "Gallagher":
+            async with turnos.pantalla():
                 await registrar("insight", insight())
 
     async def fase(nombre: str, *tareas):
@@ -2076,15 +2220,17 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
     # El RUNT, primer captcha, va solo hasta que le toca su turno: con todo a la vez, su página y las de los demás
     # captchas tardaban más de un minuto en abrir. Lo demás carga mientras se escribe su código.
     primero = asyncio.create_task(con_captcha(*captchas[0]))
+    # FBI y Consilium se abren ya: abrirlas toma la pantalla unos segundos y así no retrasan la pregunta del RUNT.
+    apertura_chrome = asyncio.create_task(abrir_en_chrome())
     turno = asyncio.create_task(turnos.repartido.wait())
     try:
         await asyncio.wait([primero, turno], timeout=PRIORIDAD_RUNT, return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
         primero.cancel()
+        apertura_chrome.cancel()
         raise
     finally:
         turno.cancel()
-    apertura_chrome = asyncio.create_task(abrir_en_chrome())
     eeuu = asyncio.create_task(grupo_eeuu())
 
     # Las más largas primero: el límite deja esperando a las últimas en un equipo débil.
@@ -2092,7 +2238,7 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
         fase(
             "consultas automáticas listas",
             automatica("procuraduria", consultar_procuraduria, r["procuraduria"], persona),
-            automatica("simit", consultar_simit, r["simit"], persona, preguntar),
+            automatica("simit", simit, r["simit"], persona, preguntar),
             *(en_cupo(doc.clave, lambda doc=doc: fijo(doc)) for doc in (r["consolidado"], r["consolium"])),
             *(nueva(clave, consulta, r["grupo"]) for clave, consulta in (
                 ("ofac", consultar_ofac), ("govuk", consultar_govuk), ("eumostwanted", consultar_eumostwanted))),
@@ -2112,7 +2258,10 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
         *(con_captcha(*captcha) for captcha in captchas[1:]),
         edge(),
     )
+    # FBI y Consilium se abren en ventanas nuevas en cada consulta: no queda ninguna abierta.
+    await asyncio.to_thread(cerrar_ventanas_abiertas)
     renovar_ventanas(r, omitidos)
+    r["precargas"]["simit"] = asyncio.create_task(r["precargar_simit"]())
     return capturas, caidos
 
 
@@ -2134,10 +2283,11 @@ def renovar_ventanas(r: dict, omitidos: set[str]):
 async def procesar(persona: dict, apertura: asyncio.Task, preguntar, preguntar_edge) -> Path | None:
     """Consulta a la persona en todos los sitios y arma su informe; devuelve el PDF (None si no hubo capturas)."""
     inicio = time.monotonic()
+    await asyncio.to_thread(borrar_capturas_viejas)
     expedicion = persona["fecha_expedicion"]
     log(
         f"Datos: {persona['nombre']} | {persona['tipo']} {persona['numero']} | {persona['empresa']} | "
-        f"consulta {persona['fecha_consulta']:%d/%m/%Y} por {persona['consultor']} | "
+        f"{persona['ciudad']} | consulta {persona['fecha_consulta']:%d/%m/%Y} por {persona['consultor']} | "
         + (f"expedición {expedicion:%d/%m/%Y}" if expedicion else "sin fecha de expedición")
         + f" | {persona['sexo']} | apellido RUNT: {primer_apellido(persona['nombre'])}"
     )
@@ -2151,6 +2301,7 @@ async def procesar(persona: dict, apertura: asyncio.Task, preguntar, preguntar_e
 
 async def cerrar_navegadores(apertura: asyncio.Task):
     apertura.cancel()
+    await asyncio.to_thread(cerrar_ventanas_abiertas)
     recursos = (await asyncio.gather(apertura, return_exceptions=True))[0]
     if isinstance(recursos, dict):
         for tarea in (recursos["consolidado"].carga, recursos["consolium"].carga, *recursos["precargas"].values()):
@@ -2176,7 +2327,7 @@ async def principal():
             while True:
                 linea = await asyncio.to_thread(
                     leer_respuesta,
-                    "\nPega la fila de Excel (nombre, documento, empresa, fecha consulta, quien consulta, "
+                    "\nPega la fila de Excel (nombre, documento, empresa, ciudad, fecha consulta, quien consulta, "
                     "fecha expedicion, sexo H/M) o Enter para salir: ",
                 )
                 if not linea.strip():
