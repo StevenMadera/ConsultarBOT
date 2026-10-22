@@ -1,6 +1,9 @@
 # Lo que ve cada equipo en la ventana de novedades al actualizarse. Lo más nuevo arriba.
 # Cada versión empieza con una línea «== título ==» distinta; cada cambio, con «- ». Las líneas con # no se muestran.
 
+== 22 de octubre de 2026 ==
+- Si la Registraduría (u otro sitio) muestra «Acceso bloqueado» por tráfico sospechoso desde tu IP, el informe lo marca Fuera de Servicio con ese aviso en vez de tomarlo como el certificado, y el sitio no se vuelve a cargar en esa consulta (recargar alarga el bloqueo). Espera unos minutos antes de consultarlo de nuevo.
+
 == 21 de octubre de 2026 (mejoras) ==
 - Nueva casilla Ciudad, después de Empresa.
 - Puedes copiar solo las primeras columnas de la fila (por ejemplo nombre, documento, empresa, ciudad y fecha de consulta): lo demás queda en blanco para escribirlo a mano.

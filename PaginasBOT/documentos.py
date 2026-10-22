@@ -14,7 +14,8 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from comun import CAPTURAS, FueraDeServicio, avisar, log
-from carga_paginas import cargar_pagina, esperar_estable, instante_carga, marcar_precarga
+from carga_paginas import (BLOQUEO_JS, BLOQUEO_RE, MOTIVO_BLOQUEO, SitioBloqueado, bloqueo_en_pagina, cargar_pagina,
+                           esperar_estable, instante_carga, marcar_precarga)
 from rendimiento import etapa
 
 ORDEN = ("bdme", "contraloria", "antecedentes", "registraduria", "rnmc", "inhabilidades")
@@ -376,13 +377,16 @@ ESTADO_HTTP_JS = "() => performance.getEntriesByType('navigation')[0]?.responseS
 
 
 async def caida_en_pagina(page) -> str | None:
-    """Motivo si la página es la de error del navegador o un error del servidor (5xx); None si no."""
+    """Motivo si la página es la de error del navegador, un error del servidor (5xx) o el aviso de bloqueo; None si
+    no."""
     if page.url.startswith("chrome-error://"):
         return "el navegador no pudo abrir el sitio"
     try:
         estado = await page.evaluate(ESTADO_HTTP_JS)
     except PlaywrightError:
         return None
+    if await bloqueo_en_pagina(page):
+        return MOTIVO_BLOQUEO
     return f"el sitio respondió con el error {estado}" if estado >= 500 else None
 
 
@@ -713,6 +717,8 @@ async def consultar_registraduria(page, persona: dict, preguntar, turnos: Turnos
         # Mientras el sitio responde ya se puede resolver el captcha siguiente.
         listo.set()
         await esperar_cambio(page, antes, espera=30000)
+        if await bloqueo_en_pagina(page):
+            raise SitioBloqueado
         if not await codigo.is_visible():
             break
         log(f"Registraduría: código incorrecto o sin resultado, intento {intento + 1}/3")
@@ -843,6 +849,12 @@ async def formulario_antecedentes_listo(page):
 
 
 async def formulario_registraduria_listo(page):
+    # Con el aviso de bloqueo el formulario no llegará: se reconoce de una vez, sin esperar ni recargar.
+    await page.wait_for_function(
+        f"(patron) => document.querySelector('#ContentPlaceHolder1_TextBox1') || ({BLOQUEO_JS})(patron)",
+        arg=BLOQUEO_RE, timeout=60000, polling=500)
+    if await bloqueo_en_pagina(page):
+        raise SitioBloqueado
     await page.locator("#ContentPlaceHolder1_TextBox1").wait_for(timeout=60000)
     await page.locator("#datos_contentplaceholder1_captcha1_CaptchaImage").wait_for(timeout=60000)
 

@@ -128,6 +128,25 @@ def explicar(detalle: str) -> str:
         return "no se pudo conectar con el sitio"
     return detalle if len(detalle) <= 110 else detalle[:109] + "…"
 
+def reiniciar_conexion_red():
+    """Libera y renueva la IP de Windows para saltar límites de descarga."""
+    try:
+        log("Reiniciando dirección IP para refrescar límites...")
+        # Liberar la IP de forma global (aplica a lo que esté conectado)
+        subprocess.run(["ipconfig", "/release"], capture_output=True, text=True, check=False, creationflags=subprocess.CREATE_NO_WINDOW)
+        
+        # Pequeña pausa para asegurar que el router procese la desconexión
+        time.sleep(2)
+        
+        # Solicitar la nueva IP pública/local
+        subprocess.run(["ipconfig", "/renew"], capture_output=True, text=True, check=False, creationflags=subprocess.CREATE_NO_WINDOW)
+        
+        # Limpiar caché DNS por si acaso
+        subprocess.run(["ipconfig", "/flushdns"], capture_output=True, text=True, check=False, creationflags=subprocess.CREATE_NO_WINDOW)
+        log("IP reiniciada correctamente.")
+    except Exception as e:
+        log(f"No se pudo reiniciar la red de forma automática: {e}")
+
 
 def novedades_pendientes() -> list[tuple[str, list[str]]]:
     """Las versiones de novedades.txt que este equipo aún no vio, la más nueva primero."""
@@ -880,6 +899,19 @@ class Interfaz:
     def _hilo_actualizar(self):
         try:
             actualizar.aplicar()
+            
+            # === REINICIO DE IP JUSTO DESPUÉS DE ACTUALIZAR ===
+            try:
+                # Ejecuta la liberación de IP de forma silenciosa
+                subprocess.run(["ipconfig", "/release"], capture_output=True, check=False, creationflags=0x08000000) # 0x08000000 evita que se abra una ventana negra de CMD
+                time.sleep(2) # Pausa de 2 segundos para asegurar la desconexión
+                # Solicita la nueva IP pública/privada
+                subprocess.run(["ipconfig", "/renew"], capture_output=True, check=False, creationflags=0x08000000)
+                subprocess.run(["ipconfig", "/flushdns"], capture_output=True, check=False, creationflags=0x08000000)
+            except Exception:
+                pass # Si falla el reinicio de red, que no afecte el flujo del programa
+            # ==================================================
+
             self.eventos.put(("actualizado", {"error": None}))
         except Exception as e:
             self.eventos.put(("actualizado", {"error": primera_linea(e)}))

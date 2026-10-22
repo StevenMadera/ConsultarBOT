@@ -20,6 +20,26 @@ VIGENCIA_PRECARGA = 30
 ESPERA_REUTILIZAR = 20
 _precargadas: WeakKeyDictionary = WeakKeyDictionary()
 _cargadas_en: WeakKeyDictionary = WeakKeyDictionary()
+# Aviso con que el sitio (su Cloudflare) rechaza por un tiempo todo lo que llega desde esta dirección IP. Recargar
+# solo alarga el bloqueo: no se repite la carga.
+BLOQUEO_RE = r"Acceso bloqueado|tr[aá]fico sospechoso|you have been blocked"
+BLOQUEO_JS = "(patron) => new RegExp(patron, 'i').test(document.body?.innerText ?? '')"
+MOTIVO_BLOQUEO = ("el sitio bloqueó por un tiempo las consultas desde esta conexión (Cloudflare: «tráfico sospechoso "
+                  "desde tu dirección IP»). Espera unos minutos sin consultarlo; si sigue, apaga la VPN o usa otra red")
+
+
+class SitioBloqueado(FueraDeServicio):
+    """El sitio rechaza por un tiempo esta conexión: no se vuelve a cargar en esta consulta."""
+
+    def __init__(self, captura=None):
+        super().__init__(MOTIVO_BLOQUEO, captura)
+
+
+async def bloqueo_en_pagina(page: Page) -> bool:
+    try:
+        return await page.evaluate(BLOQUEO_JS, BLOQUEO_RE)
+    except PlaywrightError:
+        return False
 
 
 def marcar_precarga(page: Page, url: str):
@@ -91,6 +111,8 @@ async def _abrir(page: Page, url: str, lista, recargar: bool, espera: float):
         respuesta = await page.reload(wait_until="domcontentloaded", timeout=milisegundos)
     else:
         respuesta = await page.goto(url, wait_until="domcontentloaded", timeout=milisegundos)
+    if await bloqueo_en_pagina(page):
+        raise SitioBloqueado
     if respuesta and respuesta.status >= 400:
         raise PlaywrightError(f"el sitio respondió HTTP {respuesta.status}")
     if lista:

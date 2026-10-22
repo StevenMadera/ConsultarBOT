@@ -801,6 +801,8 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
             print("[CAPID] Intentando tomar captura...")
 
             try:
+                # Espera explícitamente a que el captcha esté visible y estable
+                await imagen_captcha.wait_for(state="visible", timeout=5000)
                 imagen = await imagen_captcha.screenshot(timeout=5000)
                 print(f"[CAPID] Captura obtenida: {len(imagen)} bytes")
             except PlaywrightError as e:
@@ -826,8 +828,17 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
             if not await campo_captcha.count():
                 log("RUNT: la página cambió mientras se escribía el captcha; se carga de nuevo.")
                 continue
+
+            # SOLUCIÓN GUI: Forzar el foco del elemento antes de escribir
+            await campo_captcha.scroll_into_view_if_needed()
+            await campo_captcha.click()  # Esto obliga al navegador a enfocar el input
             await campo_captcha.fill(respuesta)
+            # Opcional: Si .fill() sigue fallando, usa focus de manera asíncrona:
+            # await campo_captcha.focus()
+            # await page.keyboard.type(respuesta)
+
             log(f"RUNT: se escribió el CAPTCHA: {respuesta}")
+
             await page.get_by_role("button", name="Consultar Información").click()
         # Mientras el sitio responde ya se puede resolver el captcha siguiente.
         listo.set()
@@ -2098,7 +2109,8 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
             error = None if precarga.cancelled() else precarga.exception()
             caido = esperada and (isinstance(error, FueraDeServicio)
                                   or isinstance(error, PlaywrightTimeoutError) and str(error).startswith("Page.goto:"))
-            if caido and not r["ventanas"][clave].is_closed():
+            # Un sitio que bloqueó la conexión no se vuelve a cargar: eso alarga el bloqueo.
+            if caido and not isinstance(error, documentos.SitioBloqueado) and not r["ventanas"][clave].is_closed():
                 log(f"{clave}: no abrió mientras se esperaba; se intenta una vez más.")
                 try:
                     with etapa("carga"):
