@@ -9,3 +9,5 @@ __pycache__/
 capturas/
 salidas/
 log.txt
+# Verificación de Cloudflare pasada (cookie de sesión del navegador)
+cookies_cloudflare.json

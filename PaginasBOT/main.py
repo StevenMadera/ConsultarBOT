@@ -29,7 +29,8 @@ from consulta_fbi import TITULO_FBI, consultar_fbi, url_fbi
 from consulta_justicia import TITULO_JUSTICIA, consultar_justicia, url_justicia
 from consulta_terroristas import TITULO_TERRORISTAS, consultar_terroristas, url_terroristas
 from ocr import buscar_tesseract
-from carga_paginas import cargar_pagina, esperar_estable, instante_carga, marcar_precarga
+from carga_paginas import (VISIBLES, cargar_cookies_cloudflare, cargar_pagina, esperar_estable, instante_carga,
+                           marcar_precarga)
 from rendimiento import capturar_pantalla, etapa, medir_sitio
 
 
@@ -84,8 +85,9 @@ ESPERA_OCR = 5
 # Si la precarga de un captcha no abrió (con todo cargando a la vez, aunque el sitio funcione), una carga más.
 ESPERA_REPETIR = 90
 # Sin la marca de navegador automatizado (navigator.webdriver), que también le hace poner la casilla más difícil.
+# Con el sandbox de Chrome: sin él Playwright agrega --no-sandbox, otra señal de navegador automatizado (Cloudflare).
 SIN_AUTOMATIZACION = {"args": ["--start-maximized", "--disable-blink-features=AutomationControlled"],
-                      "ignore_default_args": ["--enable-automation"]}
+                      "ignore_default_args": ["--enable-automation"], "chromium_sandbox": True}
 PLANTILLAS = {
     "Hombre": Path(__file__).parent / "Plantilla" / "Hombre.pdf",
     # Igual a la de hombre, sin la página de la libreta militar.
@@ -1731,7 +1733,11 @@ async def abrir_visible(p):
     except PlaywrightError as e:
         log(f"Ventanas de captcha: no abrió Google Chrome ({(str(e).splitlines() or [''])[0]}); se usa el Chromium "
             "del bot.")
+    try:
         return await p.chromium.launch(headless=False, **SIN_AUTOMATIZACION)
+    except PlaywrightError:
+        # Hay equipos donde el sandbox no arranca: mejor la marca --no-sandbox que quedarse sin ventanas.
+        return await p.chromium.launch(headless=False, **{**SIN_AUTOMATIZACION, "chromium_sandbox": False})
 
 
 async def abrir_navegadores(p) -> dict:
@@ -1770,7 +1776,11 @@ async def abrir_navegadores(p) -> dict:
     # Sitios con captcha: cada uno en su ventana, minimizada mientras se llena; sale al frente en su turno.
     async def nueva_ventana():
         # Con el user agent propio del navegador: si no coincide con su versión real, Google desconfía.
-        return await (await visible.new_context(no_viewport=True, ignore_https_errors=True)).new_page()
+        contexto = await visible.new_context(no_viewport=True, ignore_https_errors=True)
+        # Las verificaciones de Cloudflare ya pasadas: con su cookie vigente no la vuelve a pedir.
+        await cargar_cookies_cloudflare(contexto)
+        VISIBLES.add(contexto)
+        return await contexto.new_page()
 
     async def ventana_minimizada(clave):
         if clave == "runt" and perfil_runt:

@@ -14,8 +14,9 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from comun import CAPTURAS, FueraDeServicio, avisar, log
-from carga_paginas import (BLOQUEO_JS, BLOQUEO_RE, MOTIVO_BLOQUEO, SitioBloqueado, bloqueo_en_pagina, cargar_pagina,
-                           esperar_estable, instante_carga, marcar_precarga)
+from carga_paginas import (BLOQUEO_JS, BLOQUEO_RE, MOTIVO_BLOQUEO, VERIFICACION_JS, SitioBloqueado, bloqueo_en_pagina,
+                           cargar_pagina, esperar_estable, instante_carga, marcar_precarga, pasar_verificacion,
+                           revisar_verificacion, verificacion_en_pagina)
 from rendimiento import etapa
 
 ORDEN = ("bdme", "contraloria", "antecedentes", "registraduria", "rnmc", "inhabilidades")
@@ -740,6 +741,11 @@ async def consultar_registraduria(page, persona: dict, preguntar, turnos: Turnos
         await esperar_cambio(page, antes, espera=30000)
         if await bloqueo_en_pagina(page):
             raise SitioBloqueado
+        if await verificacion_en_pagina(page):
+            # Cloudflare también puede pedirla al enviar: pasada, se repite la consulta con un código nuevo.
+            await pasar_verificacion(page, "Registraduría")
+            if await codigo.count():
+                continue
         if not await codigo.is_visible():
             break
         log(f"Registraduría: código incorrecto o sin resultado, intento {intento + 1}/3")
@@ -862,12 +868,14 @@ async def formulario_antecedentes_listo(page):
 
 
 async def formulario_registraduria_listo(page):
-    # Con el aviso de bloqueo el formulario no llegará: se reconoce de una vez, sin esperar ni recargar.
+    # Con el aviso de bloqueo o la verificación de Cloudflare el formulario no llegará: se reconocen de una vez.
     await page.wait_for_function(
-        f"(patron) => document.querySelector('#ContentPlaceHolder1_TextBox1') || ({BLOQUEO_JS})(patron)",
+        f"(patron) => document.querySelector('#ContentPlaceHolder1_TextBox1') || ({BLOQUEO_JS})(patron)"
+        f" || ({VERIFICACION_JS})()",
         arg=BLOQUEO_RE, timeout=60000, polling=500)
     if await bloqueo_en_pagina(page):
         raise SitioBloqueado
+    await revisar_verificacion(page)
     await page.locator("#ContentPlaceHolder1_TextBox1").wait_for(timeout=60000)
     await page.locator("#datos_contentplaceholder1_captcha1_CaptchaImage").wait_for(timeout=60000)
 
