@@ -1,6 +1,10 @@
 # Lo que ve cada equipo en la ventana de novedades al actualizarse. Lo más nuevo arriba.
 # Cada versión empieza con una línea «== título ==» distinta; cada cambio, con «- ». Las líneas con # no se muestran.
 
+== 22 de octubre de 2026 (captchas) ==
+- Antecedentes e Inhabilidades esperan a que la casilla «No soy un robot» termine de prepararse antes de pedirte marcarla: con el equipo ocupado, pulsarla antes la dejaba girando hasta que la página se recargaba.
+- Si la Registraduría muestra «Verifiquemos tu conexión» (Cloudflare), su ventana pasa al frente para que marques la casilla si aparece; el bot sigue solo y recuerda la verificación para las siguientes consultas.
+
 == 22 de octubre de 2026 ==
 - Si la Registraduría (u otro sitio) muestra «Acceso bloqueado» por tráfico sospechoso desde tu IP, el informe lo marca Fuera de Servicio con ese aviso en vez de tomarlo como el certificado, y el sitio no se vuelve a cargar en esa consulta (recargar alarga el bloqueo). Espera unos minutos antes de consultarlo de nuevo.
 - Inhabilidades espera a que desaparezca la barra de carga y se estabilice el resultado; si no termina, no guarda una captura prematura y marca el sitio como Fuera de Servicio.

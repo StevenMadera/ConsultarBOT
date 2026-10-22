@@ -439,6 +439,69 @@ class EstabilidadTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await browser.close()
 
+    async def test_formulario_espera_a_que_el_captcha_termine_de_prepararse(self):
+        casilla = """<select id="tipo"><option>CC</option></select>
+            <iframe title="reCAPTCHA" srcdoc="<div id='recaptcha-anchor' style='width:20px;height:20px'></div>"></iframe>"""
+        # Como Google: el recuadro de las imágenes llega después de que ya se ve la casilla.
+        desafio = """<script>setTimeout(() => {
+                const f = document.createElement('iframe');
+                f.src = 'https://bot.test/recaptcha/api2/bframe';
+                f.srcdoc = "<input type='hidden' id='recaptcha-token'>";
+                f.style = 'visibility: hidden; position: absolute; top: -10000px';
+                document.body.append(f);
+            }, 1000)</script>"""
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                with patch.object(documentos, "log") as log:
+                    await page.set_content(casilla + desafio)
+                    inicio = time.monotonic()
+                    await documentos.formulario_inhabilidades_listo(page)
+                    self.assertGreater(time.monotonic() - inicio, 0.5)
+                    self.assertEqual(await page.locator(documentos.DESAFIO).count(), 1)
+                    log.assert_not_called()
+                    # Si no llega, tras el límite la casilla se muestra igual y queda en el registro.
+                    await page.set_content(casilla)
+                    with patch.object(documentos, "ESPERA_CAPTCHA_LISTO", 0.3):
+                        await documentos.formulario_inhabilidades_listo(page)
+                    self.assertIn("no terminó de prepararse", log.call_args.args[0])
+            finally:
+                await browser.close()
+
+    async def test_casilla_atascada_dice_en_que_paso_se_quedo(self):
+        girando = """<textarea name="g-recaptcha-response"></textarea>
+            <iframe srcdoc="<div id='recaptcha-anchor' style='width:20px;height:20px'>
+                <div class='recaptcha-checkbox-spinner'></div></div>"></iframe>"""
+        desafio = """<iframe src="https://bot.test/recaptcha/api2/bframe" srcdoc="<p>.</p>"
+            style="visibility: hidden; position: absolute; top: -10000px"></iframe>"""
+        pulsada = "<script>setTimeout(() => fetch('https://bot.test/recaptcha/api2/reload', {method: 'POST'}), 200)</script>"
+        casos = (
+            (girando, "el captcha de Google no terminó de prepararse"),
+            (girando + desafio, "la casilla no llegó a consultar a Google"),
+            (girando + desafio + pulsada, "Google no respondió al pulsarla"),
+        )
+
+        async def sin_respuesta(route):
+            pass
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                with patch.object(documentos, "log"), patch.object(documentos, "avisar"), \
+                        patch.object(documentos, "ESPERA_CASILLA", 1):
+                    for html, motivo in casos:
+                        contexto = await browser.new_context()
+                        await contexto.route("https://bot.test/recaptcha/api2/reload", sin_respuesta)
+                        page = await contexto.new_page()
+                        await page.set_content(html)
+                        with self.assertRaises(documentos.FueraDeServicio) as error:
+                            await documentos.esperar_recaptcha(page, "Prueba", page.locator("iframe").first)
+                        self.assertIn(motivo, str(error.exception))
+                        await contexto.close()
+            finally:
+                await browser.close()
+
     async def test_espera_resultado_y_no_espera_trafico_de_analitica(self):
         async with async_playwright() as p:
             browser = await p.chromium.launch()

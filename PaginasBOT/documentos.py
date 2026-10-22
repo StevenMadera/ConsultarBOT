@@ -56,6 +56,12 @@ DESAFIO_VISIBLE_JS = """() => [...document.querySelectorAll('iframe[src*="/bfram
     const r = f.getBoundingClientRect();
     return getComputedStyle(f).visibility === 'visible' && r.height > 100 && r.bottom > 0;
 })"""
+# Ese recuadro se crea 1-3 s después de que se ve la casilla (con el equipo ocupado, mucho después) y, hasta que carga,
+# la casilla pulsada se queda girando. Con su código (#recaptcha-token) cargado, responde al pulsarla.
+DESAFIO = 'iframe[src*="/bframe"]'
+ESPERA_CAPTCHA_LISTO = 45
+# Lo que la casilla envía a Google al pulsarla y al resolver las imágenes.
+ENVIO_CASILLA_RE = re.compile(r"/recaptcha/(?:api2|enterprise)/(?:reload|userverify)")
 # Segundos que un captcha aguanta cargado: después el código cambia o Google da la casilla por caducada.
 VIGENCIA_CAPTCHA = 60
 # Mientras espera su turno, la página se recarga cuando le quedan estos segundos de vigencia.
@@ -460,6 +466,16 @@ async def pdf_del_sitio_o_captura(page, boton, ruta: Path) -> Path:
     return await pagina_a_pdf(page, ruta)
 
 
+async def esperar_captcha_listo(page, sitio: str):
+    """Espera a que el captcha de Google termine de prepararse: su casilla se ve antes y, pulsada antes de tiempo, se
+    queda girando. Si no termina en ESPERA_CAPTCHA_LISTO s se muestra igual (si la casilla se atasca, se recarga)."""
+    try:
+        await page.locator(DESAFIO).first.content_frame.locator("#recaptcha-token").wait_for(
+            state="attached", timeout=ESPERA_CAPTCHA_LISTO * 1000)
+    except PlaywrightTimeoutError:
+        log(f"{sitio}: el captcha de Google no terminó de prepararse en {ESPERA_CAPTCHA_LISTO} s; se muestra igual.")
+
+
 async def casilla_atascada(page, recuadro) -> bool:
     """True si la casilla de Google no se puede marcar: no terminó de cargar, o gira sin abrir las imágenes."""
     casilla = recuadro.content_frame.locator("#recaptcha-anchor")
@@ -484,6 +500,19 @@ async def _esperar_recaptcha(page, sitio: str, recuadro) -> bool:
     inicio = time.monotonic()
     limite = inicio + ESPERA_CAPTCHA / 1000
     atascada_desde = None
+    # Para saber, si la casilla se atasca, si llegó a consultar a Google y si Google respondió.
+    envios = {"enviados": 0, "respondidos": 0}
+
+    def enviado(peticion):
+        if ENVIO_CASILLA_RE.search(peticion.url):
+            envios["enviados"] += 1
+
+    def respondido(respuesta):
+        if ENVIO_CASILLA_RE.search(respuesta.url):
+            envios["respondidos"] += 1
+
+    page.on("request", enviado)
+    page.on("response", respondido)
     avisar("accion", titulo=sitio, texto="Marca «No soy un robot» en la ventana del navegador. Sigue solo al marcarla.")
     try:
         while time.monotonic() < limite:
@@ -502,6 +531,13 @@ async def _esperar_recaptcha(page, sitio: str, recuadro) -> bool:
             elif time.monotonic() - atascada_desde >= ESPERA_CASILLA:
                 motivo = f"la casilla «No soy un robot» no terminó de cargar en {ESPERA_CASILLA} s"
                 with contextlib.suppress(PlaywrightError):
+                    if not await page.locator(DESAFIO).count():
+                        motivo += " (el captcha de Google no terminó de prepararse)"
+                    elif envios["enviados"] > envios["respondidos"]:
+                        motivo += " (Google no respondió al pulsarla)"
+                    elif not envios["enviados"]:
+                        motivo += " (la casilla no llegó a consultar a Google)"
+                with contextlib.suppress(PlaywrightError):
                     if re.search(r"cuota|quota", await recuadro.content_frame.locator("body").inner_text(timeout=2000), re.I):
                         motivo += " (Google avisa que el sitio superó su cuota gratuita de reCAPTCHA)"
                 raise FueraDeServicio(motivo)
@@ -509,6 +545,8 @@ async def _esperar_recaptcha(page, sitio: str, recuadro) -> bool:
         casillas_lentas.add(page.context)
         raise ValueError(f"{sitio}: no se resolvió el captcha en {ESPERA_CAPTCHA // 60000} minutos.")
     finally:
+        page.remove_listener("request", enviado)
+        page.remove_listener("response", respondido)
         avisar("accion_fin")
 
 
@@ -809,10 +847,10 @@ async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) ->
                 log("Inhabilidades (Policía): marca 'No soy un robot' en la ventana que quedó al frente.")
                 try:
                     resuelto = await esperar_recaptcha(page, "Inhabilidades (Policía)", recaptcha)
-                except FueraDeServicio:
+                except FueraDeServicio as error:
                     if intento == 2:
                         raise
-                    log("Inhabilidades (Policía): el captcha quedó cargando; se recarga y se rellenan los datos.")
+                    log(f"Inhabilidades (Policía): {error}; se recarga y se rellenan los datos.")
                     continue
                 if not resuelto:
                     log("Inhabilidades (Policía): Google dio la casilla por caducada; se carga de nuevo la página.")
@@ -854,6 +892,7 @@ async def formulario_inhabilidades_listo(page):
     recaptcha = page.locator("iframe[title='reCAPTCHA']").first
     await recaptcha.wait_for(state="visible", timeout=60000)
     await recaptcha.content_frame.locator("#recaptcha-anchor").wait_for(state="visible", timeout=60000)
+    await esperar_captcha_listo(page, "Inhabilidades (Policía)")
 
 
 async def formulario_antecedentes_listo(page):
@@ -865,6 +904,7 @@ async def formulario_antecedentes_listo(page):
         await page.locator("#continuarBtn").click(timeout=60000)
     await cedula.wait_for(state="visible", timeout=60000)
     await page.locator("#captchaAntecedentes iframe").first.wait_for(state="visible", timeout=60000)
+    await esperar_captcha_listo(page, "Antecedentes (Policía)")
 
 
 async def formulario_registraduria_listo(page):

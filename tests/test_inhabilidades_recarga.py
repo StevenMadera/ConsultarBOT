@@ -26,6 +26,8 @@ class InhabilidadesRecargaTests(unittest.IsolatedAsyncioTestCase):
                 <input type="checkbox" id="cbCondiciones">
                 <label for="cbCondiciones">Acepto</label>
                 <iframe title="reCAPTCHA" srcdoc="<input type='checkbox' id='recaptcha-anchor'>"></iframe>
+                <iframe src="https://bot.test/recaptcha/api2/bframe" srcdoc="<input type='hidden' id='recaptcha-token'>"
+                    style="visibility: hidden; position: absolute; top: -10000px"></iframe>
                 <button id="btnConsultar">Consultar</button>
             </form>
         """
