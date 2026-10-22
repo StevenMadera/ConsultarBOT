@@ -304,6 +304,16 @@ def abrir_en_ventanas(urls: list[str]) -> dict[str, str] | None:
     return {url: objetivo for url, (_, objetivo) in abiertas.items()}
 
 
+def pagina_cargada(url: str, titulo: str, antes: dict[str, str]) -> bool:
+    """La ventana abierta de antemano ya muestra la página o la de error del navegador; no toma la pantalla."""
+    pagina = _pagina(_puerto(), antes[url]) if url in antes else None
+    if pagina is None:
+        return False
+    actual = pagina.get("title", "")
+    return (titulo in actual or re.match(rf"{re.escape(urlsplit(url).hostname)}(\s|$)", actual, re.I) is not None
+            or pagina.get("url", "").startswith("chrome-error:"))
+
+
 def _esperar_pagina(puerto: int | None, objetivo: str, titulo: str, nombre: str, preguntar, url: str,
                     precargada: bool) -> tuple[int, str, str | None]:
     """(puerto, página, motivo): la página cuando su título contiene `titulo` (motivo None); si sale la verificación,

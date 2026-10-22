@@ -6,6 +6,7 @@ from urllib.parse import quote
 from captura_navegador import capturar_navegador
 
 URL_FBI = "https://www.fbi.gov/wanted/fugitives?SearchableText={nombre}"
+TITULO_FBI = "Fugitives"
 
 
 def url_fbi(persona: dict) -> str:
@@ -15,7 +16,7 @@ def url_fbi(persona: dict) -> str:
 def consultar_fbi(persona: dict, preguntar=input, antes=None) -> Path:
     # El filtro de búsqueda se aplica con JavaScript después de cargar: necesita más margen.
     return capturar_navegador(
-        url_fbi(persona), "Fugitives", "FBI", "fbi", persona["numero"],
+        url_fbi(persona), TITULO_FBI, "FBI", "fbi", persona["numero"],
         espera_minima=5, preguntar=preguntar, antes=antes, zoom=2 / 3,
     )
 

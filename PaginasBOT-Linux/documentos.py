@@ -14,7 +14,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from comun import CAPTURAS, FueraDeServicio, avisar, log
-from carga_paginas import cargar_pagina, instante_carga, marcar_precarga
+from carga_paginas import cargar_pagina, esperar_estable, instante_carga, marcar_precarga
 from rendimiento import etapa
 
 ORDEN = ("bdme", "contraloria", "antecedentes", "registraduria", "rnmc", "inhabilidades")
@@ -555,24 +555,39 @@ async def consultar_rnmc(page, persona: dict) -> Path:
     tipo = tipo_para(TIPOS_RNMC, persona, "El RNMC")
     if persona["fecha_expedicion"] is None and persona["tipo"] != "NIT":
         raise ValueError("RNMC: sin fecha de expedición; se omite.")
-    page = await cargar_pagina(page, URL_RNMC, lambda p: p.locator("#ctl00_ContentPlaceHolder3_ddlTipoDoc").wait_for(timeout=60000))
-    await page.locator("#ctl00_ContentPlaceHolder3_ddlTipoDoc").select_option(tipo)
-    fecha = page.locator("#txtFechaexp")
-    try:
-        await fecha.wait_for(state="visible", timeout=15000)
-        await fecha.fill(f"{persona['fecha_expedicion']:%d/%m/%Y}")
-        buscar = page.locator("#ctl00_ContentPlaceHolder3_btnConsultar2")
-    except PlaywrightTimeoutError:
-        # El NIT no pide fecha de expedición.
-        buscar = page.locator("#ctl00_ContentPlaceHolder3_btnConsultar")
-    await page.locator("#ctl00_ContentPlaceHolder3_txtExpediente").fill(persona["numero"])
-    antes = await page.evaluate("document.body.innerText")
-    await buscar.click()
-    await esperar_cambio(page, antes)
-    error = page.locator("#ctl00_ContentPlaceHolder3_btn_salir_modal")
-    if await error.is_visible():
-        mensaje = await page.locator(".modal.in .modal-body, .modal.show .modal-body").first.inner_text()
-        raise ValueError(f"RNMC: {' '.join(mensaje.split())}")
+    for intento in range(2):
+        page = await cargar_pagina(page, URL_RNMC, lambda p: p.locator("#ctl00_ContentPlaceHolder3_ddlTipoDoc").wait_for(timeout=60000))
+        await page.locator("#ctl00_ContentPlaceHolder3_ddlTipoDoc").select_option(tipo)
+        fecha = page.locator("#txtFechaexp")
+        expediente = page.locator("#ctl00_ContentPlaceHolder3_txtExpediente")
+        texto_fecha = None
+        try:
+            await fecha.wait_for(state="visible", timeout=15000)
+            texto_fecha = f"{persona['fecha_expedicion']:%d/%m/%Y}"
+            await fecha.fill(texto_fecha)
+            buscar = page.locator("#ctl00_ContentPlaceHolder3_btnConsultar2")
+        except PlaywrightTimeoutError:
+            # El NIT no pide fecha de expedición.
+            buscar = page.locator("#ctl00_ContentPlaceHolder3_btnConsultar")
+        await expediente.fill(persona["numero"])
+        # El selector de fecha del sitio puede cambiar la casilla después de llenarla: se revisa antes de enviar.
+        for _ in range(3):
+            if texto_fecha is None or await fecha.input_value() == texto_fecha:
+                break
+            log(f"RNMC: la casilla de la fecha quedó en {await fecha.input_value()!r}; se escribe otra vez.")
+            await fecha.fill(texto_fecha)
+            await expediente.focus()
+        antes = await page.evaluate("document.body.innerText")
+        await buscar.click()
+        await esperar_cambio(page, antes)
+        error = page.locator("#ctl00_ContentPlaceHolder3_btn_salir_modal")
+        if not await error.is_visible():
+            break
+        mensaje = " ".join((await page.locator(".modal.in .modal-body, .modal.show .modal-body").first.inner_text()).split())
+        # A veces el sitio rechaza una fecha que sí es la correcta y a la siguiente consulta la acepta.
+        if intento or not re.search(r"fecha.*no es correcta", mensaje, re.I):
+            raise ValueError(f"RNMC: {mensaje}")
+        log(f"RNMC: el sitio respondió «{mensaje}» con la fecha {texto_fecha}; se consulta otra vez.")
     # El botón Imprimir del sitio solo abre la impresión del navegador: se imprime la página igual, con sus franjas azules.
     return await imprimir_pdf(page, ruta_documento("rnmc", persona), fecha_informe(persona), fondos=True)
 
@@ -616,7 +631,8 @@ async def consultar_antecedentes(page, persona: dict, turnos: Turnos, listo) -> 
                 continue
             try:
                 # El resultado llega en una página nueva; si el sitio rechaza la casilla, vuelve el formulario con un aviso.
-                async with page.expect_navigation(timeout=60000):
+                # Responde en 2-9 s: sin respuesta en 30 s, la consulta se repite.
+                async with page.expect_navigation(timeout=30000):
                     await page.locator("#j_idt17").click()
                     # Mientras el sitio responde ya se puede resolver el captcha siguiente.
                     turno.soltar()
@@ -795,8 +811,15 @@ async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) ->
     finally:
         if escuchando:
             escuchando.remove_listener("dialog", aviso)
+    # La sección del resultado aparece antes de que la página termine de cargar (si el sitio va lento, antes de que
+    # termine la espera de 30 s): se imprime cuando ya cargó y se quedó quieta.
+    try:
+        await page.wait_for_load_state("load", timeout=30000)
+    except PlaywrightTimeoutError:
+        log("Inhabilidades (Policía): el resultado siguió cargando 30 s más; se imprime cuando se quede quieto.")
     # Al cargar, el sitio tapa la página casi un segundo con su animación de carga (fondo blanco y un círculo).
     await page.add_style_tag(content="#pb_loader { display: none !important; }")
+    await esperar_estable(page)
     # La página entera con gráficos de fondo, como al guardarla desde Chrome: el pie lleva su línea azul y los logos.
     return await imprimir_pdf(page, ruta_documento("inhabilidades", persona), fecha_informe(persona), fondos=True)
 
