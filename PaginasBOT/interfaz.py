@@ -923,7 +923,6 @@ class Interfaz:
             except Exception:
                 pass
             # =====================================================
-    ================================================================
 
     def _al_actualizado(self, error: str | None):
         if self.estado != "actualizando":
