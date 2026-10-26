@@ -19,7 +19,8 @@ from rendimiento import etapa
 
 ORDEN = ("bdme", "contraloria", "antecedentes", "registraduria", "rnmc", "inhabilidades")
 
-URL_BDME = "https://cobrocoactivo.ramajudicial.gov.co/HOME/bdme"
+URL_BDME = "https://cobrocoactivonew.ramajudicial.gov.co/BDME_Publica2_list.php"
+CAMPO_BDME = "#BDME_Consulta_Doc_SancionadoId"
 # Formulario que la página de la Contraloría muestra dentro de un marco.
 URL_CONTRALORIA = "https://cfiscal.contraloria.gov.co/Certificados/CertificadoPersonaNatural.aspx"
 URL_ANTECEDENTES = "https://antecedentes.policia.gov.co:7005/WebJudicial/antecedentes.xhtml"
@@ -557,11 +558,13 @@ async def esperar_cambio(page, texto_antes: str, espera: int = 60000):
 
 
 async def consultar_bdme(page, persona: dict) -> Path:
-    page = await cargar_pagina(page, URL_BDME, lambda p: p.locator("#Documento").wait_for(timeout=60000))
-    await page.locator("#Documento").fill(persona["numero"])
+    page = await cargar_pagina(page, URL_BDME, lambda p: p.locator(CAMPO_BDME).wait_for(timeout=60000))
+    await page.locator(CAMPO_BDME).fill(persona["numero"])
     antes = await page.evaluate("document.body.innerText")
-    await page.locator("#button").click()
+    await page.locator("#Consulta_BDME_6").click()
     await esperar_cambio(page, antes)
+    # Tras consultar, la página vacía el campo: se vuelve a escribir el número para que se vea en el PDF.
+    await page.locator(CAMPO_BDME).fill(persona["numero"])
     return await pagina_a_pdf(page, ruta_documento("bdme", persona))
 
 
