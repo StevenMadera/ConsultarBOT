@@ -80,6 +80,8 @@ SALIDAS = Path(shell.SHGetKnownFolderPath(shell.FOLDERID_Documents)) / "PAGINAS"
 PERFIL_RUNT = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / NOMBRE / "perfil_runt"
 # Buster: extensión que resuelve el reto de audio de la casilla «No soy un robot» (Antecedentes e Inhabilidades).
 EXTENSION_BUSTER = Path(__file__).resolve().parent / "buster-extension"
+URL_BUSTER = ("https://github.com/dessant/buster/releases/download/v3.4.0/"
+              "buster_captcha_solver_for_humans-3.4.0-chrome.zip")
 PERFIL_BUSTER = Path(__file__).resolve().parent / "perfil_buster"
 # Buster reconoce el audio dentro del navegador («managed» con servicios locales: Whisper). Sus servicios remotos
 # fallan («Something went wrong»: la clave de Wit ya no sirve). Se escribe después de su configuración inicial, que
@@ -1988,9 +1990,24 @@ async def abrir_perfil_runt(p, opciones: dict):
         return None
 
 
+def descargar_buster():
+    # No va en el repositorio: GitHub rechaza su código por una clave de API que trae incluida.
+    import io
+    import urllib.request
+    import zipfile
+    with urllib.request.urlopen(URL_BUSTER, timeout=120) as respuesta:
+        zipfile.ZipFile(io.BytesIO(respuesta.read())).extractall(EXTENSION_BUSTER)
+    log(f"Buster: extensión descargada en {EXTENSION_BUSTER}.")
+
+
 async def abrir_buster(p):
     """Chromium con perfil propio y la extensión Buster para la casilla de Antecedentes e Inhabilidades; None si no
     abre o la extensión no carga (esos sitios siguen en las ventanas de siempre, con la casilla a mano)."""
+    if not (EXTENSION_BUSTER / "manifest.json").is_file():
+        try:
+            await asyncio.to_thread(descargar_buster)
+        except Exception as e:
+            log(f"Buster: no se pudo descargar la extensión ({e}).")
     if not (EXTENSION_BUSTER / "manifest.json").is_file():
         log(f"Buster: no está la extensión en {EXTENSION_BUSTER}; la casilla se marca a mano.")
         return None
