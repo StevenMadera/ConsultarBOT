@@ -1,4 +1,0 @@
-paso: 16600
-epoca: 23
-acierto_real: 0.9600
-fecha: 2026-10-26 20:10:34

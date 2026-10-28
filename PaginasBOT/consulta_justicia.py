@@ -25,7 +25,4 @@ def consultar_justicia(persona: dict, preguntar=input, antes=None) -> Path:
         preguntar=preguntar,
         antes=antes,
         zoom=2 / 3,
-        # Justice.gov a veces pone una cuenta regresiva de un minuto; reabrir la página la reinicia.
-        espera=120,
-        reabrir=False,
     )

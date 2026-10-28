@@ -81,8 +81,7 @@ def _ventanas_nuevas(antes: set[int]) -> list:
             and "Visual Studio Code" not in v.title]
 
 
-def _esperar_pagina(titulo: str, nombre: str, preguntar, antes: set[int], url: str, precargada: bool,
-                    espera: float = ESPERA_MAXIMA, reabrir: bool = True):
+def _esperar_pagina(titulo: str, nombre: str, preguntar, antes: set[int], url: str, precargada: bool):
     """(ventana, motivo): la ventana nueva cuyo título contiene `titulo` (motivo None); si sale la verificación, pide
     pasarla.
 
@@ -93,11 +92,11 @@ def _esperar_pagina(titulo: str, nombre: str, preguntar, antes: set[int], url: s
     """
     pagina_de_error = re.compile(rf"{re.escape(urlsplit(url).hostname)}(\s|$)", re.I)
     inicio = time.time()
-    fin = inicio + espera
+    fin = inicio + ESPERA_MAXIMA
     avisado, caida_desde = False, None
     # Las ventanas que había cuando se abrió la de este sitio: las nuevas desde entonces son solo suyas.
     solo_suyas = None if precargada else antes
-    reabrir = precargada and reabrir
+    reabrir = precargada
     while time.time() < fin:
         nuevas = _ventanas_nuevas(antes)
         encontrada = next((v for v in nuevas if titulo in v.title), None)
@@ -110,7 +109,7 @@ def _esperar_pagina(titulo: str, nombre: str, preguntar, antes: set[int], url: s
             log(f"{nombre}: verificación de Cloudflare detectada")
             _encima(verificando)
             preguntar(f"{nombre}: pasa la verificación en el navegador y pulsa Enter... ")
-            fin = time.time() + espera
+            fin = time.time() + ESPERA_MAXIMA
         caida = next((v for v in nuevas if pagina_de_error.match(v.title)), None)
         if caida is None:
             caida_desde = None
@@ -411,8 +410,6 @@ def capturar_navegador(
     preguntar=input,
     antes: set[int] | None = None,
     zoom: float = 1,
-    espera: float = ESPERA_MAXIMA,
-    reabrir: bool = True,
 ) -> Path:
     """Abre `url` en una ventana nueva del navegador por defecto y la captura cuando su título contiene `titulo`.
 
@@ -423,12 +420,10 @@ def capturar_navegador(
     with PANTALLA:
         with etapa("captura"):
             _MARCAS.add(titulo)
-            return _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, preguntar, antes, zoom,
-                             espera, reabrir)
+            return _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, preguntar, antes, zoom)
 
 
-def _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, preguntar, antes, zoom,
-              espera=ESPERA_MAXIMA, reabrir=True) -> Path:
+def _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, preguntar, antes, zoom) -> Path:
     numero = re.sub(r"\D", "", numero)
     precargada = antes is not None
     if precargada:
@@ -442,7 +437,7 @@ def _capturar(url, titulo, nombre, prefijo, numero, paso_manual, espera_minima, 
         webbrowser.open(url, new=2)
         antes = set()
         time.sleep(1)  # La pestaña nueva tarda un instante en tomar el foco.
-    ventana, caida = _esperar_pagina(titulo, nombre, preguntar, antes, url, precargada, espera, reabrir)
+    ventana, caida = _esperar_pagina(titulo, nombre, preguntar, antes, url, precargada)
 
     def mostrar():
         if propia:
