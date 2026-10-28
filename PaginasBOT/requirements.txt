@@ -5,6 +5,3 @@ pygetwindow
 pytesseract
 Pillow
 pywin32
-onnxruntime
-numpy
-ddddocr

@@ -10,7 +10,6 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 
 from comun import RAIZ, FueraDeServicio, avisar, log
-import equipo
 from rendimiento import etapa
 
 # Segundos por intento: con todas las páginas cargando a la vez, el RUNT (unos 12 MB) puede tardar más de un minuto.
@@ -23,24 +22,6 @@ VIGENCIA_PRECARGA = 30
 ESPERA_REUTILIZAR = 20
 _precargadas: WeakKeyDictionary = WeakKeyDictionary()
 _cargadas_en: WeakKeyDictionary = WeakKeyDictionary()
-# Carga de respaldo: las ventanas de los captchas registran cómo abrir otra para el mismo sitio. Si su formulario no
-# abre a tiempo, se carga a la vez en la otra sin cortar la primera, y vale la que abra antes (como la segunda consulta
-# de la Procuraduría): antes se esperaba hasta 60-120 s y se recargaba, perdiendo lo que ya había cargado. El tiempo se
-# adapta al equipo: RESPALDO_VECES lo que tardó la última carga buena del sitio, entre ESPERA_RESPALDO_MINIMA y
-# ESPERA_RESPALDO_MAXIMA s (ESPERA_RESPALDO si aún no hay ninguna).
-ESPERA_RESPALDO = 50
-ESPERA_RESPALDO_MINIMA = 30
-ESPERA_RESPALDO_MAXIMA = 60
-RESPALDO_VECES = 2.5
-# Abrir la otra ventana puede tardar con el equipo ocupado.
-ESPERA_VENTANA_RESPALDO = 30
-_respaldos: WeakKeyDictionary = WeakKeyDictionary()
-_reemplazos: WeakKeyDictionary = WeakKeyDictionary()
-_duraciones: dict[str, float] = {}
-# Aplicaciones de una sola página que vuelven a su formulario sin recargarse (RUNT: 12 MB de código; su formulario
-# vacío y un captcha nuevo llegan en 1-2 s). Si el atajo falla, se carga como siempre.
-ESPERA_ATAJO = 15
-_atajos: dict[str, Callable[[Page], Awaitable[object]]] = {}
 # Aviso con que el sitio (su Cloudflare) rechaza por un tiempo todo lo que llega desde esta dirección IP. Recargar
 # solo alarga el bloqueo: no se repite la carga.
 BLOQUEO_RE = r"Acceso bloqueado|tr[aá]fico sospechoso|you have been blocked"
@@ -217,59 +198,6 @@ def instante_carga(page: Page) -> float:
     return _cargadas_en.get(page, time.monotonic())
 
 
-def edad_precarga(page: Page, url: str) -> float | None:
-    """Segundos desde que se dejó listo el formulario de `url` en `page`; None si no hay uno sin usar."""
-    precarga = _precargadas.get(page)
-    if not precarga or precarga[0] != url or page.is_closed():
-        return None
-    return time.monotonic() - precarga[1]
-
-
-def con_respaldo(page: Page, crear: Callable[[], Awaitable[Page]]):
-    """`crear()` abre otra ventana para el sitio de `page`: si su formulario se demora, se carga también ahí."""
-    _respaldos[page] = crear
-
-
-def vigente(page: Page) -> Page:
-    """La página que reemplazó a `page` porque su carga de respaldo abrió antes (o `page`, si no la reemplazó otra)."""
-    while page in _reemplazos:
-        page = _reemplazos[page]
-    return page
-
-
-def con_atajo(url: str, atajo: Callable[[Page], Awaitable[object]]):
-    """`atajo(page)` deja el formulario de `url` listo sin recargar la aplicación ya abierta en `page`."""
-    _atajos[url] = atajo
-
-
-def _sitio(url: str) -> str:
-    return urlsplit(url).netloc
-
-
-def _espera_respaldo(url: str) -> float:
-    ultima = _duraciones.get(_sitio(url))
-    if ultima is None:
-        return ESPERA_RESPALDO
-    return min(ESPERA_RESPALDO_MAXIMA, max(ESPERA_RESPALDO_MINIMA, RESPALDO_VECES * ultima))
-
-
-def _misma_aplicacion(page: Page, url: str) -> bool:
-    """`page` ya tiene abierta la aplicación de una sola página de `url` (la dirección solo cambia tras el #)."""
-    return "#" in url and page.url.split("#")[0] == url.split("#")[0]
-
-
-async def cerrar_ventana(page: Page):
-    """Cierra una ventana que sobra. La única de su contexto cierra el contexto, salvo si es de un perfil propio (RUNT,
-    Buster): su navegador se cerraría con ella."""
-    try:
-        if len(page.context.pages) > 1:
-            await page.close()
-        elif page.context.browser is not None:
-            await page.context.close()
-    except PlaywrightError:
-        pass
-
-
 async def esperar_estable(page: Page, timeout: int = 10000):
     """Espera a que la página deje de cambiar. Si sigue cambiando pasado `timeout` (un carrusel, un reloj), se sigue
     igual: la captura de la página como está es mejor que ninguna. Devuelve si alcanzó estabilidad."""
@@ -376,71 +304,6 @@ async def cargar_pagina(
                                    intentos=intentos or INTENTOS)
 
 
-async def _abrir_con_respaldo(page: Page, url: str, lista, recargar: bool, espera: float, configurar) -> Page:
-    """Primer intento de una página con respaldo: si no abre en _espera_respaldo(url) s, se carga a la vez en otra
-    ventana sin cortar la primera. Devuelve la que abrió antes; la otra se cierra. Con el procesador saturado no se
-    abre otra: la carga va lenta por falta de equipo, no trabada, y otra carga más haría todo más lento."""
-    inicio = time.monotonic()
-    limite = inicio + espera
-    original = asyncio.create_task(_abrir(page, url, lista, recargar, espera))
-    tareas = {original: (page, inicio)}
-    ganadora, error = None, None
-    try:
-        aguante = min(espera, _espera_respaldo(url))
-        await asyncio.wait({original}, timeout=aguante)
-        avisado = False
-        while not original.done() and time.monotonic() < limite:
-            if not equipo.saturado():
-                try:
-                    otra = await asyncio.wait_for(_respaldos[page](), ESPERA_VENTANA_RESPALDO)
-                    _respaldos[otra] = _respaldos[page]
-                    if configurar:
-                        await configurar(otra)
-                    log(f"{url}: no abrió en {time.monotonic() - inicio:.0f} s; se carga a la vez en otra ventana, "
-                        "sin cortar la primera.")
-                    tareas[asyncio.create_task(_abrir(otra, url, lista, False, espera))] = (otra, time.monotonic())
-                except (PlaywrightError, TimeoutError) as falla:
-                    log(f"{url}: no se pudo abrir otra ventana para cargarla ({_detalle(falla)}); se sigue esperando "
-                        "la primera.")
-                break
-            if not avisado:
-                log(f"{url}: no abrió en {aguante:.0f} s, con el equipo saturado: se sigue esperando, sin cargarla "
-                    "además en otra ventana.")
-                avisado = True
-            await asyncio.wait({original}, timeout=2 * equipo.MUESTRA)
-        pendientes = set(tareas)
-        while pendientes and ganadora is None:
-            hechas, pendientes = await asyncio.wait(pendientes, timeout=max(0.0, limite - time.monotonic()),
-                                                    return_when=asyncio.FIRST_COMPLETED)
-            if not hechas:
-                break
-            for tarea in hechas:
-                falla = tarea.exception()
-                if falla is None:
-                    ganadora, desde = tareas[tarea]
-                    _duraciones[_sitio(url)] = time.monotonic() - desde
-                    break
-                # La verificación de Cloudflare en la primera ventana se resuelve como siempre.
-                if isinstance(falla, VerificacionPendiente) and tareas[tarea][0] is page:
-                    raise falla
-                error = falla
-    finally:
-        # También si se cancela (al cerrar el bot): no queda ninguna carga suelta.
-        for tarea in tareas:
-            tarea.cancel()
-        await asyncio.gather(*tareas, return_exceptions=True)
-        for pagina, _ in tareas.values():
-            if pagina is not page and pagina is not ganadora:
-                await cerrar_ventana(pagina)
-    if ganadora is None:
-        raise error or TimeoutError()
-    if ganadora is not page:
-        _reemplazos[page] = ganadora
-        log(f"{url}: abrió antes la carga de respaldo; se sigue en esa ventana.")
-        await cerrar_ventana(page)
-    return ganadora
-
-
 async def _cargar_pagina(page, url, lista, *, recargar, configurar, reutilizar, vigencia, espera, intentos):
     """Solo navega y verifica el formulario (`lista`). Nunca rellena ni envía una consulta o un captcha.
 
@@ -463,16 +326,6 @@ async def _cargar_pagina(page, url, lista, *, recargar, configurar, reutilizar, 
                 log("Carga inicial: tras la verificación el formulario no está listo; se vuelve a cargar.")
         except (PlaywrightError, TimeoutError):
             log("Carga inicial: la precarga ya no está lista; se vuelve a cargar.")
-    atajo = _atajos.get(url)
-    if atajo and not page.is_closed() and _misma_aplicacion(page, url):
-        try:
-            await asyncio.wait_for(atajo(page), ESPERA_ATAJO)
-            _cargadas_en[page] = time.monotonic()
-            return page
-        except (PlaywrightError, TimeoutError) as error:
-            log(f"{url}: no volvió al formulario sin recargar ({_detalle(error)}); se carga de nuevo.")
-    # Con la aplicación ya abierta, ir a su dirección solo cambiaría el #: se recarga.
-    recargar = recargar or _misma_aplicacion(page, url)
     if configurar:
         await configurar(page)
     errores = []
@@ -480,13 +333,8 @@ async def _cargar_pagina(page, url, lista, *, recargar, configurar, reutilizar, 
         if intento:
             log(f"{url}: no abrió ({errores[-1]}); se recarga.")
             await _detener(page)
-        inicio = time.monotonic()
         try:
-            if not intento and page in _respaldos:
-                page = await _abrir_con_respaldo(page, url, lista, recargar, espera, configurar)
-            else:
-                await asyncio.wait_for(_abrir(page, url, lista, recargar or intento > 0, espera), espera)
-                _duraciones[_sitio(url)] = time.monotonic() - inicio
+            await asyncio.wait_for(_abrir(page, url, lista, recargar or intento > 0, espera), espera)
         except VerificacionPendiente:
             try:
                 await _tras_verificacion(page, lista, espera)

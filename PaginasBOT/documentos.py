@@ -3,7 +3,6 @@ import asyncio
 import base64
 import contextlib
 import itertools
-import random
 import re
 import time
 import weakref
@@ -15,10 +14,9 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from comun import CAPTURAS, FueraDeServicio, avisar, log
-from captcha_registraduria import JS_IMAGEN_CAPTCHA, imagen_desde_data_url, lecturas, leer_captcha
-from carga_paginas import (BLOQUEO_JS, BLOQUEO_RE, MOTIVO_BLOQUEO, VERIFICACION_JS, VIGENCIA_PRECARGA, SitioBloqueado,
-                           bloqueo_en_pagina, cargar_pagina, esperar_estable, instante_carga, marcar_precarga,
-                           pasar_verificacion, revisar_verificacion, verificacion_en_pagina)
+from carga_paginas import (BLOQUEO_JS, BLOQUEO_RE, MOTIVO_BLOQUEO, VERIFICACION_JS, SitioBloqueado, bloqueo_en_pagina,
+                           cargar_pagina, esperar_estable, instante_carga, marcar_precarga, pasar_verificacion,
+                           revisar_verificacion, verificacion_en_pagina)
 from rendimiento import etapa
 
 ORDEN = ("bdme", "contraloria", "antecedentes", "registraduria", "rnmc", "inhabilidades")
@@ -50,11 +48,6 @@ ESPERA_CAPTCHA = 180000
 # Segundos que la casilla de Google puede seguir sin dejarse marcar (sin terminar de cargar, o girando tras pulsarla
 # sin abrir las imágenes) antes de dar el sitio por fuera de servicio. Funcionando, responde en 1-3 s.
 ESPERA_CASILLA = 30
-# Con el aviso de Google de que el sitio superó su cuota gratuita de reCAPTCHA, la casilla que no avanza en estos
-# segundos ya no va a avanzar: se recarga de una vez (antes se perdían 50-65 s esperando).
-ESPERA_CON_CUOTA = 6
-CUOTA_RE = re.compile(r"cuota|quota", re.I)
-MOTIVO_CUOTA = " (Google avisa que el sitio superó su cuota gratuita de reCAPTCHA)"
 # Si la casilla tardó más que esto en marcarse, o no se marcó, su contexto queda en casillas_lentas y main cambia
 # esa ventana por una limpia: Google la endurece cada vez más en la misma ventana.
 CASILLA_LENTA = 60
@@ -72,63 +65,15 @@ DESAFIO_VISIBLE_JS = """() => [...document.querySelectorAll('iframe[src*="/bfram
 # la casilla pulsada se queda girando. Con su código (#recaptcha-token) cargado, responde al pulsarla.
 DESAFIO = 'iframe[src*="/bframe"]'
 ESPERA_CAPTCHA_LISTO = 45
-# Buster (extensión que resuelve el reto de audio de Google), para Antecedentes e Inhabilidades.
-# Contextos con la extensión cargada: los marca main al abrirlos.
-contextos_buster = weakref.WeakSet()
-# Si Google bloquea el audio para esta red, no se vuelve a intentar con Buster hasta reiniciar el bot.
-audio_bloqueado = False
-BOTON_BUSTER = ".help-button-holder"
-BLOQUEO_AUDIO = ".rc-doscaptcha-body"
-AUDIO_JS = "html => html.querySelector('audio#audio-source')?.src ?? ''"
-# Segundos entre pulsaciones de Buster (mientras trabaja ignora las pulsaciones, así que pulsar seguido no lo
-# interrumpe: apenas falla un intento empieza el siguiente), rondas de audio como máximo, tiempo total, y tras cuánto
-# se vuelve a pulsar la casilla si el reto se cerró sin marcarla.
-REINTENTO_BUSTER = 2
-RONDAS_BUSTER = 5
-ESPERA_BUSTER = 90
-REINTENTO_CASILLA_BUSTER = 15
 # Lo que la casilla envía a Google al pulsarla y al resolver las imágenes.
 ENVIO_CASILLA_RE = re.compile(r"/recaptcha/(?:api2|enterprise)/(?:reload|userverify)")
-# Segundos que un captcha aguanta cargado: después el código cambia o el sitio pierde la sesión. Medido: la sesión de
-# Antecedentes seguía vigente a los 111 s y había vencido a los 122 s; Inhabilidades seguía sirviendo a los 4 minutos.
+# Segundos que un captcha aguanta cargado: después el código cambia o Google da la casilla por caducada.
 VIGENCIA_CAPTCHA = 60
-VIGENCIAS = {"antecedentes": 100, "inhabilidades": 180}
-# Registraduría: envíos con el código leído por el bot antes de pedirlo en la consola, e imágenes que se piden
-# (sin enviar nada) cuando una lectura no es confiable.
-INTENTOS_AUTO_REGISTRADURIA = 3
-INTENTOS_LECTURA_REGISTRADURIA = 3
-# RUNT y Registraduría se llenan a ritmo de persona para no parecer automatizados: segundos entre pasos y entre
-# teclas.
-PAUSA_HUMANA = (0.2, 0.5)
-TECLA_HUMANA = (0.03, 0.08)
 # Mientras espera su turno, la página se recarga cuando le quedan estos segundos de vigencia.
 MARGEN_RECARGA = 15
 # Cuando hay varios captchas listos: los dos de texto seguidos en la ventanita y el RUNT primero, porque su
 # resultado es el que más tarda en procesarse; después las casillas de la Policía.
 ORDEN_TURNOS = ("runt", "registraduria", "antecedentes", "inhabilidades")
-
-
-def vigencia(clave: str) -> float:
-    """Segundos que aguanta cargado el formulario con captcha del sitio."""
-    return VIGENCIAS.get(clave, VIGENCIA_CAPTCHA)
-
-
-def vigencia_precarga(clave: str) -> float:
-    """Edad máxima de una precarga para usarla al empezar la consulta: con el mismo margen de los demás sitios (llenar
-    el formulario y esperar el turno), su captcha no vence antes de resolverlo."""
-    return vigencia(clave) - (VIGENCIA_CAPTCHA - VIGENCIA_PRECARGA)
-
-
-async def pausa_humana(minimo: float = PAUSA_HUMANA[0], maximo: float = PAUSA_HUMANA[1]):
-    await asyncio.sleep(random.uniform(minimo, maximo))
-
-
-async def escribir_despacio(campo, texto: str):
-    """Escribe tecla por tecla, con un ritmo irregular, en vez de pegar el texto de golpe."""
-    await campo.fill("")
-    for letra in texto:
-        await campo.press_sequentially(letra)
-        await asyncio.sleep(random.uniform(*TECLA_HUMANA))
 
 
 async def estado_ventana(page, estado: str):
@@ -175,33 +120,15 @@ class Turnos:
         self._ocupado = False
         self._fila: list[tuple] = []
         self._orden = itertools.count()
-        # Formularios con captcha ya llenos (o que no llegarán a estarlo): el escalonado de la consulta los espera.
-        self._preparados: dict[str, asyncio.Event] = {}
-
-    def _preparado(self, clave: str) -> asyncio.Event:
-        return self._preparados.setdefault(clave, asyncio.Event())
-
-    def preparado(self, clave: str):
-        """El formulario del sitio ya está lleno (o falló): lo que esperaba a los formularios puede empezar."""
-        self._preparado(clave).set()
-
-    async def esperar_preparados(self, claves, segundos: float) -> bool:
-        """True si los formularios de `claves` quedan llenos antes de `segundos`."""
-        esperas = [asyncio.ensure_future(self._preparado(clave).wait()) for clave in claves]
-        if not esperas:
-            return True
-        try:
-            _, pendientes = await asyncio.wait(esperas, timeout=segundos)
-            return not pendientes
-        finally:
-            for espera in esperas:
-                espera.cancel()
+        # Se marca cuando alguna página ya está llena y recibe su turno de captcha.
+        self.repartido = asyncio.Event()
 
     def _repartir(self):
         if not self._ocupado and self._fila:
             entrada = min(self._fila)
             self._fila.remove(entrada)
             self._ocupado = True
+            self.repartido.set()
             entrada[2].set_result(None)
 
     def _soltar(self):
@@ -235,12 +162,10 @@ class Turnos:
     @contextlib.asynccontextmanager
     async def turno(self, clave: str, lleno_en, llenar):
         """El turno de la página `clave`: si va a caducar mientras espera, se recarga fuera de la fila."""
-        # Quien pide turno ya tiene su formulario lleno.
-        self.preparado(clave)
         prioridad = ORDEN_TURNOS.index(clave)
         while True:
-            restante = vigencia(clave) - MARGEN_RECARGA - (time.monotonic() - lleno_en())
-            if restante > 0 and await self._esperar(prioridad, restante):
+            vigencia = VIGENCIA_CAPTCHA - MARGEN_RECARGA - (time.monotonic() - lleno_en())
+            if vigencia > 0 and await self._esperar(prioridad, vigencia):
                 break
             try:
                 await llenar()
@@ -433,22 +358,9 @@ async def _imprimir_pdf(page, ruta: Path, fecha_consulta: str, fondos: bool = Fa
     cdp = await page.context.new_cdp_session(page)
     try:
         await reducir_recortados(cdp, page)
-        opciones = {"paperWidth": 8.27, "paperHeight": 11.69, "printBackground": fondos}
-        try:
-            datos = await cdp.send("Page.printToPDF", opciones)
-        except PlaywrightError:
-            # Chrome a veces falla la impresión mientras otra ventana tiene el foco; un reintento basta.
-            await page.wait_for_timeout(1500)
-            try:
-                datos = await cdp.send("Page.printToPDF", opciones)
-            except PlaywrightError:
-                datos = None
+        datos = await cdp.send("Page.printToPDF", {"paperWidth": 8.27, "paperHeight": 11.69, "printBackground": fondos})
     finally:
-        with contextlib.suppress(PlaywrightError):
-            await cdp.detach()
-    if datos is None:
-        log(f"{ruta.stem}: la impresión de la página falló; se guarda su captura en PDF.")
-        return imagen_a_pdf(await page.screenshot(full_page=True, timeout=15000), ruta)
+        await cdp.detach()
     ruta.write_bytes(base64.b64decode(datos["data"]))
     return ruta
 
@@ -474,8 +386,6 @@ async def pdf_de_pagina(page, ruta: Path) -> Path:
 
 # No dicen nada del sitio: la navegación se cortó por otra o este equipo se quedó sin internet.
 ERRORES_LOCALES = ("ERR_ABORTED", "ERR_INTERNET_DISCONNECTED", "ERR_NETWORK_CHANGED", "ERR_NETWORK_IO_SUSPENDED")
-# La página no contesta (ni siquiera para revisarla): con el equipo saturado, a veces es la ventana y no el sitio.
-SIN_RESPUESTA = "el sitio no respondió"
 ESTADO_HTTP_JS = "() => performance.getEntriesByType('navigation')[0]?.responseStatus ?? 0"
 
 
@@ -511,7 +421,7 @@ async def motivo_caida(page, error: Exception) -> tuple[str | None, str | None]:
         return await asyncio.wait_for(caida_en_pagina(page), 10), None
     except TimeoutError:
         # Un envío de formulario sigue sin respuesta: hasta cortarlo, la página no contesta.
-        return SIN_RESPUESTA, page.url
+        return "el sitio no respondió", page.url
 
 
 async def detener_carga(page):
@@ -551,54 +461,13 @@ async def descargar(page, accion, ruta: Path, espera: int = 60000) -> Path:
     return ruta
 
 
-async def descargar_pdf_resultado(page, boton, ruta: Path, espera: int = 30000) -> Path:
-    resultado = asyncio.get_running_loop().create_future()
-
-    async def recibir(route):
-        if route.request.resource_type not in ("document", "xhr", "fetch", "other"):
-            await route.continue_()
-            return
-        try:
-            respuesta = await route.fetch(timeout=espera)
-            tipo = respuesta.headers.get("content-type", "").lower()
-            datos = await respuesta.body() if "pdf" in tipo or "octet-stream" in tipo else b""
-            await route.fulfill(response=respuesta)
-            if b"%PDF-" in datos[:1024] and not resultado.done():
-                resultado.set_result(datos)
-        except PlaywrightError as error:
-            if not resultado.done():
-                resultado.set_exception(error)
-            with contextlib.suppress(PlaywrightError):
-                await route.abort()
-
-    await page.context.route("**/*", recibir)
-    try:
-        await boton.click(no_wait_after=True, timeout=espera)
-        datos = await asyncio.wait_for(resultado, espera / 1000)
-        ruta.write_bytes(datos)
-        validar_pdf(ruta)
-        return ruta
-    finally:
-        await page.context.unroute("**/*", recibir)
-        if not resultado.done():
-            resultado.cancel()
-
-
-async def pdf_del_sitio_o_captura(page, boton, ruta: Path, exigir_pdf: bool = False) -> Path:
+async def pdf_del_sitio_o_captura(page, boton, ruta: Path) -> Path:
     """El PDF que entrega el sitio al pulsar `boton`; si no entrega ninguno, la página capturada como PDF."""
-    boton = boton.filter(visible=True)
-    if await boton.count():
+    if await boton.count() and await boton.first.is_visible():
         try:
-            if exigir_pdf:
-                return await descargar_pdf_resultado(page, boton.first, ruta)
             return await descargar(page, boton.first.click, ruta, espera=30000)
-        except (PlaywrightTimeoutError, TimeoutError, ValueError) as e:
-            if exigir_pdf:
-                raise ValueError("Registraduría: no se pudo descargar el PDF del certificado; no se guardará "
-                                 "la página como resultado.") from e
+        except (PlaywrightTimeoutError, ValueError) as e:
             log(f"{ruta.stem}: el sitio no entregó un PDF ({str(e).splitlines()[0]}); se guarda la página.")
-    if exigir_pdf:
-        raise ValueError("Registraduría: no apareció el enlace de descarga del certificado.")
     return await pagina_a_pdf(page, ruta)
 
 
@@ -622,82 +491,6 @@ async def casilla_atascada(page, recuadro) -> bool:
         return not await page.evaluate(DESAFIO_VISIBLE_JS)
     except PlaywrightError:
         return True
-
-
-async def aviso_de_cuota(recuadro) -> bool:
-    """True si la casilla de Google muestra el aviso de que el sitio superó su cuota gratuita de reCAPTCHA."""
-    try:
-        return bool(CUOTA_RE.search(await recuadro.content_frame.locator("body").inner_text(timeout=1500)))
-    except PlaywrightError:
-        return False
-
-
-async def resolver_con_buster(page, sitio: str, recuadro) -> bool:
-    """Marca la casilla y pulsa Buster en el reto de audio. True si quedó resuelta; False para seguir a mano (sin
-    Buster en esta ventana, Google bloqueó el audio, RONDAS_BUSTER rondas sin éxito, sin botón o tiempo agotado).
-    FueraDeServicio si la casilla no avanza y Google avisa que el sitio superó su cuota: se recarga de una vez."""
-    global audio_bloqueado
-    if audio_bloqueado or page.context not in contextos_buster:
-        return False
-    casilla = recuadro.content_frame.locator("#recaptcha-anchor")
-    marco = page.locator(DESAFIO).first
-    try:
-        await esperar_captcha_listo(page, sitio)
-        log(f"{sitio}: Buster marca 'No soy un robot'.")
-        await casilla.click(timeout=10000)
-        inicio = ultimo_clic_casilla = time.monotonic()
-        ultimo_clic_buster = revisada_cuota = 0.0
-        audio_visto = None
-        avisado = False
-        rondas = 0
-        while (ahora := time.monotonic()) < inicio + ESPERA_BUSTER:
-            if await page.evaluate(RECAPTCHA_RESUELTO_JS):
-                log(f"{sitio}: captcha resuelto con Buster en {ahora - inicio:.0f} s.")
-                return True
-            if await page.evaluate(DESAFIO_VISIBLE_JS):
-                desafio = marco.content_frame
-                if await desafio.locator(BLOQUEO_AUDIO).is_visible():
-                    audio_bloqueado = True
-                    log(f"{sitio}: Google bloqueó el audio para esta red; hasta reiniciar el bot, la casilla se "
-                        "marca a mano.")
-                    return False
-                audio = await desafio.locator("html").evaluate(AUDIO_JS)
-                if audio != audio_visto:
-                    audio_visto = audio
-                    ultimo_clic_buster = 0.0
-                    rondas += bool(audio)
-                    avisado = False
-                if rondas > RONDAS_BUSTER:
-                    log(f"{sitio}: Buster no lo resolvió en {RONDAS_BUSTER} rondas de audio; se marca a mano.")
-                    return False
-                if ahora - ultimo_clic_buster > REINTENTO_BUSTER:
-                    boton = desafio.locator(BOTON_BUSTER).first
-                    if not await boton.is_visible():
-                        log(f"{sitio}: no aparece el botón de Buster en el reto; se marca a mano.")
-                        return False
-                    if not avisado:
-                        log(f"{sitio}: pulsando Buster (ronda {rondas})." if audio else f"{sitio}: pulsando Buster.")
-                        avisado = True
-                    with contextlib.suppress(PlaywrightTimeoutError):
-                        await boton.click(timeout=5000)
-                    ultimo_clic_buster = ahora
-            elif await casilla.get_attribute("aria-checked") == "false":
-                # Pulsada, sin marcarse ni abrir el reto: con el aviso de cuota de Google no va a avanzar.
-                if ahora - ultimo_clic_casilla > ESPERA_CON_CUOTA and ahora - revisada_cuota > 3:
-                    revisada_cuota = ahora
-                    if await aviso_de_cuota(recuadro):
-                        raise FueraDeServicio(f"la casilla «No soy un robot» no avanzó en "
-                                              f"{ahora - ultimo_clic_casilla:.0f} s{MOTIVO_CUOTA}")
-                if ahora - ultimo_clic_casilla > REINTENTO_CASILLA_BUSTER:
-                    log(f"{sitio}: Buster marca de nuevo 'No soy un robot'.")
-                    await casilla.click(timeout=10000)
-                    ultimo_clic_casilla = ahora
-                    audio_visto = None
-            await asyncio.sleep(0.5)
-        log(f"{sitio}: Buster no lo resolvió en {ESPERA_BUSTER} s; se marca a mano.")
-    except PlaywrightError as e:
-        log(f"{sitio}: Buster no pudo seguir ({(str(e).splitlines() or [''])[0]}); se marca a mano.")
-    return False
 
 
 async def esperar_recaptcha(page, sitio: str, recuadro) -> bool:
@@ -740,9 +533,8 @@ async def _esperar_recaptcha(page, sitio: str, recuadro) -> bool:
                 atascada_desde = None
             elif atascada_desde is None:
                 atascada_desde = time.monotonic()
-            elif (atascada := time.monotonic() - atascada_desde) >= ESPERA_CASILLA or (
-                    atascada >= ESPERA_CON_CUOTA and await aviso_de_cuota(recuadro)):
-                motivo = f"la casilla «No soy un robot» no terminó de cargar en {atascada:.0f} s"
+            elif time.monotonic() - atascada_desde >= ESPERA_CASILLA:
+                motivo = f"la casilla «No soy un robot» no terminó de cargar en {ESPERA_CASILLA} s"
                 with contextlib.suppress(PlaywrightError):
                     if not await page.locator(DESAFIO).count():
                         motivo += " (el captcha de Google no terminó de prepararse)"
@@ -750,8 +542,9 @@ async def _esperar_recaptcha(page, sitio: str, recuadro) -> bool:
                         motivo += " (Google no respondió al pulsarla)"
                     elif not envios["enviados"]:
                         motivo += " (la casilla no llegó a consultar a Google)"
-                if await aviso_de_cuota(recuadro):
-                    motivo += MOTIVO_CUOTA
+                with contextlib.suppress(PlaywrightError):
+                    if re.search(r"cuota|quota", await recuadro.content_frame.locator("body").inner_text(timeout=2000), re.I):
+                        motivo += " (Google avisa que el sitio superó su cuota gratuita de reCAPTCHA)"
                 raise FueraDeServicio(motivo)
             await asyncio.sleep(0.5)
         casillas_lentas.add(page.context)
@@ -881,14 +674,12 @@ async def consultar_antecedentes(page, persona: dict, turnos: Turnos, listo) -> 
     async def llenar():
         nonlocal lleno_en, page, acepto, cedula, recuadro, primera_carga
         reutilizar, primera_carga = primera_carga, False
-        page = await cargar_pagina(page, URL_ANTECEDENTES, formulario_antecedentes_listo, reutilizar=reutilizar,
-                                   vigencia=vigencia_precarga("antecedentes"))
+        page = await cargar_pagina(page, URL_ANTECEDENTES, formulario_antecedentes_listo, reutilizar=reutilizar)
         acepto = page.locator("[id='aceptaOption:0']")
         cedula = page.locator("#cedulaInput")
         recuadro = page.locator("#captchaAntecedentes iframe").first
         await page.locator("#cedulaTipo").select_option(tipo)
-        await pausa_humana()
-        await escribir_despacio(cedula, persona["numero"])
+        await cedula.fill(persona["numero"])
         lleno_en = instante_carga(page)
 
     await llenar()
@@ -899,31 +690,19 @@ async def consultar_antecedentes(page, persona: dict, turnos: Turnos, listo) -> 
             await llenar()
         async with turnos.turno("antecedentes", lambda: lleno_en, llenar) as turno:
             # La página pudo cambiar mientras esperaba su turno (o no se pudo recargar a tiempo).
-            if not await recuadro.count() or not await cedula.count() \
-                    or time.monotonic() - lleno_en > vigencia("antecedentes"):
+            if not await recuadro.count() or not await cedula.count() or time.monotonic() - lleno_en > VIGENCIA_CAPTCHA:
                 await llenar()
             await al_frente(page)
             # Al centro de la ventana, por encima de la consola, que ocupa la parte baja de la pantalla.
             await page.locator("#captchaAntecedentes").evaluate("e => e.scrollIntoView({block: 'center'})")
             log("Antecedentes (Policía): marca 'No soy un robot' en la ventana que quedó al frente.")
-            try:
-                resuelto = await resolver_con_buster(page, "Antecedentes (Policía)", recuadro) \
-                    or await esperar_recaptcha(page, "Antecedentes (Policía)", recuadro)
-            except FueraDeServicio as error:
-                # Como en Inhabilidades: la casilla atascada suele funcionar al recargar.
-                if intento == 2:
-                    raise
-                log(f"Antecedentes (Policía): {error}; se recarga y se llenan los datos.")
-                caida = None
-                continue
-            if not resuelto:
+            if not await esperar_recaptcha(page, "Antecedentes (Policía)", recuadro):
                 log("Antecedentes (Policía): Google dio la casilla por caducada; se carga de nuevo la página.")
                 caida = None
                 continue
             try:
                 # El resultado llega en una página nueva; si el sitio rechaza la casilla, vuelve el formulario con un aviso.
                 # Responde en 2-9 s: sin respuesta en 30 s, la consulta se repite.
-                await pausa_humana()
                 async with page.expect_navigation(timeout=30000):
                     await page.locator("#j_idt17").click()
                     # Mientras el sitio responde ya se puede resolver el captcha siguiente.
@@ -980,89 +759,18 @@ async def _consultar_registraduria(page, persona: dict, preguntar, turnos: Turno
     async def llenar():
         nonlocal lleno_en, page, cedula, codigo, imagen, primera_carga
         reutilizar, primera_carga = primera_carga, False
-        for vuelta in range(2):
-            page = await cargar_pagina(page, URL_REGISTRADURIA, formulario_registraduria_listo,
-                                       reutilizar=reutilizar and not vuelta)
-            cedula = page.locator("#ContentPlaceHolder1_TextBox1")
-            codigo = page.locator("#ContentPlaceHolder1_TextBox2")
-            imagen = page.locator("#datos_contentplaceholder1_captcha1_CaptchaImage")
-            try:
-                await escribir_despacio(cedula, persona["numero"])
-                await pausa_humana()
-                await page.locator("#ContentPlaceHolder1_DropDownList1").select_option(f"{fecha.day:02d}", timeout=10000)
-                await pausa_humana()
-                await page.locator("#ContentPlaceHolder1_DropDownList2").select_option(f"{fecha.month:02d}", timeout=10000)
-                await pausa_humana()
-                await page.locator("#ContentPlaceHolder1_DropDownList3").select_option(str(fecha.year), timeout=10000)
-                break
-            except PlaywrightError as e:
-                # La página cambió a medio llenar (recarga del sitio o pestaña reutilizada): se carga de nuevo.
-                if vuelta or await bloqueo_en_pagina(page):
-                    raise
-                log(f"Registraduría: el formulario cambió mientras se llenaba ({e.message.splitlines()[0]}); "
-                    "se carga de nuevo.")
+        page = await cargar_pagina(page, URL_REGISTRADURIA, formulario_registraduria_listo, reutilizar=reutilizar)
+        cedula = page.locator("#ContentPlaceHolder1_TextBox1")
+        codigo = page.locator("#ContentPlaceHolder1_TextBox2")
+        imagen = page.locator("#datos_contentplaceholder1_captcha1_CaptchaImage")
+        await cedula.fill(persona["numero"])
+        await page.locator("#ContentPlaceHolder1_DropDownList1").select_option(f"{fecha.day:02d}")
+        await page.locator("#ContentPlaceHolder1_DropDownList2").select_option(f"{fecha.month:02d}")
+        await page.locator("#ContentPlaceHolder1_DropDownList3").select_option(str(fecha.year))
         lleno_en = instante_carga(page)
 
-    async def leer_codigo() -> str:
-        """Lee el código sin enviar nada; si no hay lectura confiable, pide otra imagen (hasta 3)."""
-        for vuelta in range(INTENTOS_LECTURA_REGISTRADURIA):
-            try:
-                if vuelta:
-                    await page.locator('a[title="Change the code"]').click(timeout=5000)
-                    await page.wait_for_timeout(1200)
-                await page.wait_for_function("e => e && e.complete && e.naturalWidth > 0",
-                                             arg=await imagen.element_handle(timeout=10000), timeout=10000)
-                foto = imagen_desde_data_url(await imagen.evaluate(JS_IMAGEN_CAPTCHA))
-                (modelo, ocr), texto = await asyncio.to_thread(lambda: (lecturas(foto), leer_captcha(foto)))
-            except Exception as e:
-                log(f"Registraduría: no se pudo leer el código automáticamente ({e}).")
-                return ""
-            log(f"Registraduría: lecturas del código: modelo={modelo} ocr={ocr} -> {texto or '(sin lectura confiable)'}")
-            if texto:
-                return texto
-        return ""
-
-    async def automatico() -> bool:
-        """Hasta 3 envíos con el código leído por el bot, sin la consola. True si ya hay resultado."""
-        nonlocal enviado
-        for intento in range(INTENTOS_AUTO_REGISTRADURIA):
-            if intento or not await codigo.count() or time.monotonic() - lleno_en > VIGENCIA_CAPTCHA:
-                await llenar()
-            texto = await leer_codigo()
-            if not texto:
-                return False
-            await escribir_despacio(codigo, texto)
-            antes = await page.evaluate("document.body.innerText")
-            await pausa_humana()
-            # Si el código no es válido, el sitio muestra una alerta de JS: Playwright la cierra sola.
-            await page.locator("#ContentPlaceHolder1_Button1").click()
-            enviado = True
-            listo.set()
-            await esperar_cambio(page, antes, espera=30000)
-            if await bloqueo_en_pagina(page):
-                raise SitioBloqueado
-            if await verificacion_en_pagina(page):
-                await pasar_verificacion(page, "Registraduría")
-                if await codigo.count():
-                    continue
-            if not await codigo.is_visible():
-                log(f"Registraduría: código resuelto automáticamente ({texto}).")
-                return True
-            log(f"Registraduría: el código leído ({texto}) no fue aceptado, intento automático "
-                f"{intento + 1}/{INTENTOS_AUTO_REGISTRADURIA}")
-        return False
-
     await llenar()
-    # Lee y envía el código sin turno: con el formulario lleno, lo que esperaba a los captchas ya puede empezar.
-    turnos.preparado("registraduria")
-    enviado = False
-    resuelto = await automatico()
-    if not resuelto:
-        log("Registraduría: no se resolvió el código automáticamente; se pide escribirlo.")
-        # Tras un envío fallido el formulario se carga de nuevo, como entre intentos manuales.
-        if enviado:
-            await llenar()
-    for intento in range(0 if resuelto else 3):
+    for intento in range(3):
         if intento:
             await llenar()
         async with turnos.turno("registraduria", lambda: lleno_en, llenar):
@@ -1083,9 +791,8 @@ async def _consultar_registraduria(page, persona: dict, preguntar, turnos: Turno
             if not await codigo.count():
                 log("Registraduría: la página cambió mientras se escribía el código; se carga de nuevo.")
                 continue
-            await escribir_despacio(codigo, respuesta)
+            await codigo.fill(respuesta)
             antes = await page.evaluate("document.body.innerText")
-            await pausa_humana()
             await page.locator("#ContentPlaceHolder1_Button1").click()
         # Mientras el sitio responde ya se puede resolver el captcha siguiente.
         listo.set()
@@ -1101,18 +808,11 @@ async def _consultar_registraduria(page, persona: dict, preguntar, turnos: Turno
             break
         log(f"Registraduría: código incorrecto o sin resultado, intento {intento + 1}/3")
     else:
-        if not resuelto:
-            raise ValueError("Registraduría: no se obtuvo resultado tras 3 intentos.")
+        raise ValueError("Registraduría: no se obtuvo resultado tras 3 intentos.")
     boton = page.get_by_role("button", name=re.compile(r"descargar|imprimir|generar|certificado", re.I)).or_(
         page.locator("input[type=submit][value*='escargar' i], input[type=submit][value*='mprimir' i]")
-    ).or_(
-        page.get_by_role("link", name=re.compile(r"descargar|generar|certificado", re.I)).filter(
-            has_not_text=re.compile(r"manual|instructivo|ayuda", re.I))
-    ).or_(
-        page.locator("a[download], a[href*='.pdf' i]").filter(
-            has_not_text=re.compile(r"manual|instructivo|ayuda", re.I))
     )
-    return await pdf_del_sitio_o_captura(page, boton, ruta_documento("registraduria", persona), exigir_pdf=True)
+    return await pdf_del_sitio_o_captura(page, boton, ruta_documento("registraduria", persona))
 
 
 async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) -> Path:
@@ -1127,8 +827,7 @@ async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) ->
     async def llenar():
         nonlocal lleno_en, page, terminos, recaptcha, resultado, primera_carga
         reutilizar, primera_carga = primera_carga, False
-        page = await cargar_pagina(page, URL_INHABILIDADES, formulario_inhabilidades_listo, reutilizar=reutilizar,
-                                   vigencia=vigencia_precarga("inhabilidades"))
+        page = await cargar_pagina(page, URL_INHABILIDADES, formulario_inhabilidades_listo, reutilizar=reutilizar)
         terminos = page.locator("#cbCondiciones")
         recaptcha = page.locator("iframe[title='reCAPTCHA']").first
         resultado = page.locator("#res")
@@ -1154,7 +853,7 @@ async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) ->
             async with turnos.turno("inhabilidades", lambda: lleno_en, llenar) as turno:
                 # La página pudo cambiar mientras esperaba su turno (o no se pudo recargar a tiempo).
                 if not await recaptcha.count() or not await terminos.count() \
-                        or time.monotonic() - lleno_en > vigencia("inhabilidades"):
+                        or time.monotonic() - lleno_en > VIGENCIA_CAPTCHA:
                     await llenar()
                 if escuchando is not page:
                     if escuchando:
@@ -1167,8 +866,7 @@ async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) ->
                 await recaptcha.evaluate("e => e.scrollIntoView({block: 'center'})")
                 log("Inhabilidades (Policía): marca 'No soy un robot' en la ventana que quedó al frente.")
                 try:
-                    resuelto = await resolver_con_buster(page, "Inhabilidades (Policía)", recaptcha) \
-                        or await esperar_recaptcha(page, "Inhabilidades (Policía)", recaptcha)
+                    resuelto = await esperar_recaptcha(page, "Inhabilidades (Policía)", recaptcha)
                 except FueraDeServicio as error:
                     if intento == 2:
                         raise
@@ -1179,7 +877,6 @@ async def consultar_inhabilidades(page, persona: dict, turnos: Turnos, listo) ->
                     continue
                 try:
                     # El sitio responde con una página nueva que trae el resultado en la sección #res.
-                    await pausa_humana()
                     async with page.expect_navigation(timeout=30000):
                         await page.locator("#btnConsultar").click()
                         # Mientras el sitio responde ya se puede resolver el captcha siguiente.
@@ -1246,17 +943,10 @@ async def formulario_registraduria_listo(page):
 async def llenar_inhabilidades(page, persona: dict, tipo: str):
     terminos = page.locator("#cbCondiciones")
     await page.locator("#tipo").select_option(tipo)
-    await pausa_humana()
-    await escribir_despacio(page.locator("#nuip"), persona["numero"])
-    await pausa_humana()
-    await escribir_despacio(page.locator("#fechaExpNuip"), f"{persona['fecha_expedicion']:%d/%m/%Y}")
-    # Cierra el calendario que se abre al escribir la fecha.
-    await page.keyboard.press("Escape")
-    await pausa_humana()
-    await escribir_despacio(page.locator("#nombreEmpresa"), EMPRESA_INHABILIDADES)
-    await pausa_humana()
-    await escribir_despacio(page.locator("#nitEmpresa"), NIT_INHABILIDADES)
-    await pausa_humana()
+    await page.locator("#nuip").fill(persona["numero"])
+    await page.locator("#fechaExpNuip").fill(f"{persona['fecha_expedicion']:%d/%m/%Y}")
+    await page.locator("#nombreEmpresa").fill(EMPRESA_INHABILIDADES)
+    await page.locator("#nitEmpresa").fill(NIT_INHABILIDADES)
     # La casilla real está oculta: se pulsa el cuadro dibujado, lejos del enlace a los términos.
     await page.locator("label[for=cbCondiciones]").click(position={"x": 4, "y": 8})
     if not await terminos.is_checked():

@@ -45,19 +45,12 @@ class CargaPaginasTests(unittest.IsolatedAsyncioTestCase):
         self.log = self.parches.enter_context(patch.object(carga, "log"))
         self.detener = self.parches.enter_context(patch.object(carga, "_detener", new_callable=AsyncMock))
         self.parches.enter_context(patch.object(carga, "_precargadas", WeakKeyDictionary()))
-        self.parches.enter_context(patch.object(carga, "_respaldos", WeakKeyDictionary()))
-        self.parches.enter_context(patch.object(carga, "_reemplazos", WeakKeyDictionary()))
-        self.parches.enter_context(patch.object(carga, "_duraciones", {}))
-        # El procesador del equipo de pruebas no decide: por defecto, con respiro.
-        self.saturado = self.parches.enter_context(patch.object(carga.equipo, "saturado", return_value=False))
         self.orden = []
         self.estados = []
         self.page = self.pagina()
 
     def pagina(self, url="about:blank"):
-        # Sin aviso de bloqueo ni verificación de Cloudflare.
-        page = Mock(url=url, is_closed=Mock(return_value=False), wait_for_load_state=AsyncMock(),
-                    evaluate=AsyncMock(return_value=False))
+        page = Mock(url=url, is_closed=Mock(return_value=False), wait_for_load_state=AsyncMock())
 
         async def navegar(destino, **opciones):
             self.orden.append(("goto", destino, opciones.get("wait_until")))
@@ -148,104 +141,6 @@ class CargaPaginasTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await tarea
 
-    def respaldo(self, crear=None):
-        """Otra ventana del mismo navegador para la carga de respaldo de self.page."""
-        otra = self.pagina()
-        contexto = Mock(pages=[self.page, otra], browser=None)
-        for pagina in (self.page, otra):
-            pagina.context = contexto
-            pagina.close = AsyncMock()
-        carga.con_respaldo(self.page, crear or AsyncMock(return_value=otra))
-        return otra
-
-    async def test_si_no_abre_a_tiempo_se_carga_a_la_vez_en_otra_ventana_y_vale_la_primera(self):
-        otra = self.respaldo()
-
-        async def lista(page):
-            if page is self.page:
-                await sin_fin()
-
-        with patch.object(carga, "ESPERA_RESPALDO", 0.02):
-            self.assertIs(await carga.cargar_pagina(self.page, URL, lista), otra)
-        # La consulta sigue en la ventana nueva; la primera, que seguía cargando, se cierra.
-        self.assertIs(carga.vigente(self.page), otra)
-        self.page.close.assert_awaited_once()
-        otra.close.assert_not_awaited()
-        self.detener.assert_not_awaited()
-        self.assertIn("respaldo", self.log.call_args.args[0])
-
-    async def test_si_la_primera_abre_antes_que_el_respaldo_se_cierra_el_respaldo(self):
-        liberar = asyncio.Event()
-
-        async def crear():
-            asyncio.get_running_loop().call_later(0.02, liberar.set)
-            return otra
-
-        otra = self.respaldo(crear)
-
-        async def lista(page):
-            await (liberar.wait() if page is self.page else sin_fin())
-
-        with patch.object(carga, "ESPERA_RESPALDO", 0.02):
-            self.assertIs(await carga.cargar_pagina(self.page, URL, lista), self.page)
-        self.assertIs(carga.vigente(self.page), self.page)
-        otra.close.assert_awaited_once()
-        self.page.close.assert_not_awaited()
-
-    async def test_con_el_equipo_saturado_no_se_abre_otra_ventana_y_se_espera_la_primera(self):
-        crear = AsyncMock()
-        self.respaldo(crear)
-        self.saturado.return_value = True
-        liberar = asyncio.Event()
-        asyncio.get_running_loop().call_later(0.1, liberar.set)
-
-        async def lista(page):
-            await liberar.wait()
-
-        with patch.object(carga, "ESPERA_RESPALDO", 0.02), patch.object(carga.equipo, "MUESTRA", 0.01), \
-                patch.object(carga, "ESPERA_CARGA", 2):
-            self.assertIs(await carga.cargar_pagina(self.page, URL, lista), self.page)
-        crear.assert_not_awaited()
-        self.assertTrue(any("saturado" in llamada.args[0] for llamada in self.log.call_args_list))
-
-    async def test_cancelar_durante_la_espera_del_respaldo_no_deja_cargas_sueltas(self):
-        self.respaldo()
-        tarea = asyncio.create_task(carga.cargar_pagina(self.page, URL, sin_fin, espera=60))
-        await asyncio.sleep(0.05)
-        tarea.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await tarea
-        await asyncio.sleep(0)
-        sueltas = [t for t in asyncio.all_tasks() if "_abrir" in repr(t.get_coro())]
-        self.assertEqual(sueltas, [])
-
-    async def test_sin_ventana_de_respaldo_registrada_no_se_abre_otra(self):
-        self.assertIs(await carga.cargar_pagina(self.page, URL, abre_al_segundo()), self.page)
-        self.assertEqual(self.orden, [("goto", URL, "domcontentloaded")] * 2)
-
-    def test_espera_del_respaldo_se_adapta_al_equipo(self):
-        self.assertEqual(carga._espera_respaldo(URL), carga.ESPERA_RESPALDO)
-        for ultima, esperada in ((4, carga.ESPERA_RESPALDO_MINIMA), (18, 18 * carga.RESPALDO_VECES),
-                                 (100, carga.ESPERA_RESPALDO_MAXIMA)):
-            carga._duraciones["bot.test"] = ultima
-            self.assertEqual(carga._espera_respaldo(URL), esperada)
-
-    async def test_aplicacion_abierta_vuelve_al_formulario_con_su_atajo_sin_recargar(self):
-        self.page.url = "https://bot.test/#/resultado"
-        atajo = AsyncMock()
-        with patch.object(carga, "_atajos", {"https://bot.test/#/home": atajo}):
-            self.assertIs(await carga.cargar_pagina(self.page, "https://bot.test/#/home", AsyncMock()), self.page)
-        atajo.assert_awaited_once_with(self.page)
-        self.assertEqual(self.orden, [])
-
-    async def test_si_el_atajo_falla_se_recarga_la_aplicacion(self):
-        self.page.url = "https://bot.test/#/resultado"
-        atajo = AsyncMock(side_effect=PlaywrightError("sin captcha nuevo"))
-        with patch.object(carga, "_atajos", {"https://bot.test/#/home": atajo}):
-            await carga.cargar_pagina(self.page, "https://bot.test/#/home", AsyncMock())
-        self.assertEqual(self.orden, [("goto", "https://bot.test/#/home", "commit"),
-                                      ("reload", "https://bot.test/#/home", "domcontentloaded")])
-
     async def test_pagina_caida_se_captura_en_la_misma_pagina(self):
         async def fallar():
             raise carga.FueraDeServicio("sin respuesta")
@@ -316,42 +211,6 @@ class CargaNavegadorTests(unittest.IsolatedAsyncioTestCase):
                                               lambda p: p.locator("#documento").wait_for(timeout=5000), recargar=True)
                 self.assertEqual(len(pedidos), 2)
                 self.assertTrue(page.url.endswith("#/home"))
-            finally:
-                await browser.close()
-
-    async def test_runt_vuelve_al_formulario_con_captcha_nuevo_sin_recargar(self):
-        # Como el RUNT: aplicación de una sola página que pide un captcha nuevo cada vez que se entra al formulario.
-        html = """<body><script>
-            let n = 0;
-            function pintar() {
-                if (!location.hash.startsWith('#/consulta')) { document.body.innerHTML = '<p>Inicio</p>'; return; }
-                const c = document.createElement('canvas');
-                c.width = 80; c.height = 20;
-                c.getContext('2d').fillText('captcha ' + (++n), 5, 15);
-                document.body.innerHTML = '<input formcontrolname="documento"><img class="img-fluid" src="' +
-                    c.toDataURL() + '">';
-            }
-            addEventListener('hashchange', pintar);
-            pintar();
-        </script></body>"""
-        async with async_playwright() as p:
-            browser = await p.chromium.launch()
-            try:
-                page = await browser.new_page()
-                pedidos = []
-
-                async def responder(route):
-                    pedidos.append(route.request.url)
-                    await route.fulfill(body=html, content_type="text/html")
-
-                await page.context.route("https://bot.test/**", responder)
-                await page.goto("https://bot.test/" + main.RUTA_RUNT)
-                antes = await page.locator("img.img-fluid").get_attribute("src")
-                await page.locator("input").fill("123")
-                await main.volver_al_formulario_runt(page)
-                self.assertNotEqual(await page.locator("img.img-fluid").get_attribute("src"), antes)
-                self.assertEqual(await page.locator("input").input_value(), "")
-                self.assertEqual(len(pedidos), 1)
             finally:
                 await browser.close()
 
