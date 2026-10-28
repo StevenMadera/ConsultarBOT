@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -21,6 +22,8 @@ URL_CONSILIUM = "https://www.consilium.europa.eu/es/search/?query={nombre}"
 TITULO_CONSILIUM = "Search - Consilium"
 PUERTO_CDP = 9223
 PERFIL_CONSILIUM = Path(__file__).parent / "perfil_consilium"
+_PROCESO: subprocess.Popen | None = None
+_URL_ABIERTA: str | None = None
 COOKIES_NECESARIAS = r"solo.*necesarias|s[oó]lo.*necesarias|only.*necessary|necessary.*only|reject.*optional|rechazar.*opcionales"
 COOKIES_ACEPTAR = r"aceptar.*cookies|accept.*cookies|accept all|aceptar todas"
 
@@ -51,36 +54,58 @@ def url_consilium(persona: dict) -> str:
     return URL_CONSILIUM.format(nombre=quote(persona["nombre"]))
 
 
-def consultar_consilium(persona: dict, preguntar=input, antes=None) -> Path:
+def abrir_consilium(persona: dict):
+    """Abre la búsqueda en el Chrome de Consilium, que queda abierto entre consultas (así Cloudflare no vuelve a
+    verificar). Se llama al empezar la consulta para que la página ya esté cargada al capturarla."""
+    global _PROCESO, _URL_ABIERTA
+    url = url_consilium(persona)
+    if _PROCESO is not None and _PROCESO.poll() is None:
+        try:
+            # Pestaña nueva por la API HTTP de Chrome: sin conectarse a la página, Cloudflare no lo nota.
+            urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{PUERTO_CDP}/json/new?{quote(url, safe='')}", method="PUT"), timeout=10).close()
+            _URL_ABIERTA = url
+            return
+        except OSError:
+            _PROCESO.terminate()
     # Chrome normal (sin banderas de automatización) para que Cloudflare no deje la verificación en bucle.
     PERFIL_CONSILIUM.mkdir(parents=True, exist_ok=True)
-    proceso = subprocess.Popen([
+    _PROCESO = subprocess.Popen([
         _chrome(), f"--remote-debugging-port={PUERTO_CDP}", f"--user-data-dir={PERFIL_CONSILIUM}",
         "--no-first-run", "--no-default-browser-check", "--force-device-scale-factor=0.75",
-        f"--window-size={round(PAGINA_REFERENCIA[0] / 0.75)},{round(PAGINA_REFERENCIA[1] / 0.75) + 120}",
-        url_consilium(persona)])
-    try:
-        with PANTALLA, sync_playwright() as playwright:
-            # Cloudflare detecta el control del navegador: no se conecta hasta que la verificación haya pasado.
-            _esperar_verificacion(preguntar)
-            navegador = _conectar(playwright)
-            contexto = navegador.contexts[0]
-            page = next(p for p in contexto.pages if "consilium" in p.url)
-            preparar_consilium(page, preguntar)
-            page.wait_for_timeout(2000)
-            if page.evaluate(VERIFICACION_JS):
-                raise ValueError("Consilium: volvió la verificación; no se tomará la captura.")
-            ruta = CAPTURAS / f"consilium_{persona['numero']}_{datetime.now():%Y%m%d_%H%M%S}.png"
-            page.screenshot(path=str(ruta), timeout=15000)
-            # Cierre ordenado: guarda la cookie de Cloudflare en el perfil y la próxima consulta no se verifica.
-            try:
-                navegador.new_browser_cdp_session().send("Browser.close")
-                proceso.wait(timeout=10)
-            except Exception:
-                pass
-            return ruta
-    finally:
-        proceso.terminate()
+        f"--window-size={round(PAGINA_REFERENCIA[0] / 0.75)},{round(PAGINA_REFERENCIA[1] / 0.75) + 120}", url])
+    _URL_ABIERTA = url
+
+
+def cerrar_consilium():
+    global _PROCESO
+    if _PROCESO is not None:
+        _PROCESO.terminate()
+        _PROCESO = None
+
+
+def consultar_consilium(persona: dict, preguntar=input, antes=None) -> Path:
+    url = url_consilium(persona)
+    if _URL_ABIERTA != url or _PROCESO is None or _PROCESO.poll() is not None:
+        abrir_consilium(persona)
+    with PANTALLA, sync_playwright() as playwright:
+        # Cloudflare detecta el control del navegador: no se conecta hasta que la verificación haya pasado.
+        _esperar_verificacion(preguntar)
+        navegador = _conectar(playwright)
+        contexto = navegador.contexts[0]
+        paginas = [p for p in contexto.pages if p.url.startswith(url.split("?")[0])]
+        page = paginas[-1]
+        # Las pestañas de consultas anteriores sobran; queda solo la actual.
+        for vieja in contexto.pages:
+            if vieja is not page:
+                vieja.close()
+        page.bring_to_front()
+        preparar_consilium(page, preguntar)
+        if page.evaluate(VERIFICACION_JS):
+            raise ValueError("Consilium: volvió la verificación; no se tomará la captura.")
+        ruta = CAPTURAS / f"consilium_{persona['numero']}_{datetime.now():%Y%m%d_%H%M%S}.png"
+        page.screenshot(path=str(ruta), timeout=15000)
+        return ruta
 
 
 def _titulo_consilium() -> str:

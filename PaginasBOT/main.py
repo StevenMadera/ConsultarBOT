@@ -27,7 +27,7 @@ import captcha_runt
 import documentos
 import equipo
 from documentos import escribir_despacio, estado_ventana, pausa_humana
-from consulta_consilium import TITULO_CONSILIUM, consultar_consilium, url_consilium
+from consulta_consilium import TITULO_CONSILIUM, abrir_consilium, cerrar_consilium, consultar_consilium, url_consilium
 from consulta_fbi import TITULO_FBI, consultar_fbi, url_fbi
 from consulta_justicia import TITULO_JUSTICIA, consultar_justicia, url_justicia
 from consulta_terroristas import TITULO_TERRORISTAS, consultar_terroristas, url_terroristas
@@ -738,8 +738,9 @@ def borrar_capturas_viejas():
         log(f"Capturas: se borraron {borradas} imágenes y PDF de días anteriores.")
 
 
-def insertar_en_pdf(capturas: dict[str, Path], persona: dict, caidos: set[str] = frozenset()) -> Path:
-    """`caidos`: sitios fuera de servicio; su captura es la página caída."""
+def insertar_en_pdf(capturas: dict[str, Path], persona: dict, caidos: set[str] = frozenset(),
+                    ruta: Path | None = None) -> Path:
+    """`caidos`: sitios fuera de servicio; su captura es la página caída. Con `ruta`, reemplaza ese informe."""
     formato = persona["formato"]
     # Mujer.pdf trae un objeto interno mal ubicado: si la reparación automática llega al guardar, descarta los cambios.
     with pymupdf.open(PLANTILLAS[formato]) as plantilla:
@@ -767,6 +768,14 @@ def insertar_en_pdf(capturas: dict[str, Path], persona: dict, caidos: set[str] =
                 doc.insert_pdf(anexo)
         elif clave not in omitidos:
             log(f"PDF: falta el documento de {clave}; se omite.")
+    if ruta:
+        try:
+            # Sin compresión, las capturas PNG dejan el PDF en ~50 MB; deflate es sin pérdida.
+            doc.save(ruta, garbage=3, deflate=True)
+            doc.close()
+            return ruta
+        except Exception as e:
+            log(f"PDF: no se pudo reemplazar {ruta.name} ({e}); ¿está abierto? Se guarda con otro nombre.")
     carpeta = carpeta_salidas()
     base = re.sub(r'[<>:"/\\|?*]', "", f"{persona['numero']} - {persona['nombre']}").strip()
     ruta = carpeta / f"{base}.pdf"
@@ -774,7 +783,6 @@ def insertar_en_pdf(capturas: dict[str, Path], persona: dict, caidos: set[str] =
     while ruta.exists():
         ruta = carpeta / f"{base} ({contador}).pdf"
         contador += 1
-    # Sin compresión, las capturas PNG dejan el PDF en ~50 MB; deflate es sin pérdida.
     doc.save(ruta, garbage=3, deflate=True)
     doc.close()
     return ruta
@@ -1443,6 +1451,26 @@ async def consultar_ofac(page, persona: dict) -> Path:
     return ruta
 
 
+async def esperar_pdf_embebido(certificado, tope: float = 30):
+    """Espera a que el visor muestre el certificado: la imagen tiene contenido y deja de cambiar."""
+    import io
+    from PIL import Image
+    anterior, fin = None, time.monotonic() + tope
+    while time.monotonic() < fin:
+        await asyncio.sleep(0.8)
+        try:
+            actual = await certificado.screenshot(timeout=5000)
+        except PlaywrightError:
+            continue
+        # En blanco o gris liso mientras carga: pocos colores distintos.
+        colores = Image.open(io.BytesIO(actual)).convert("L").getcolors(256) or []
+        con_contenido = sum(1 for n, _ in colores if n > 20) > 8
+        if con_contenido and actual == anterior:
+            return
+        anterior = actual if con_contenido else None
+    log("Libreta militar: el certificado no terminó de mostrarse a tiempo; se captura como esté.")
+
+
 async def consultar_libreta(page, persona: dict) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
     page = await cargar_pagina(page, URL_LIBRETA, lambda p: p.locator("#tipoDocumento").wait_for(timeout=60000))
@@ -1455,8 +1483,7 @@ async def consultar_libreta(page, persona: dict) -> Path:
     mensaje = page.locator("iframe[srcdoc]")
     await certificado.or_(mensaje).first.wait_for(state="attached", timeout=15000)
     if await certificado.count():
-        # El certificado es un PDF embebido; necesita unos segundos para renderizar.
-        await page.wait_for_timeout(2500)
+        await esperar_pdf_embebido(certificado)
     else:
         texto = await page.frame_locator("iframe[srcdoc]").locator("body").inner_text()
         log(f"Libreta militar: sin certificado; el sitio respondió: {' '.join(texto.split())}")
@@ -2379,9 +2406,9 @@ CONSULTAS_CHROME = {
 
 
 def abrir_paginas_chrome(persona: dict) -> set[int] | None:
-    """Precarga el FBI en Chrome y devuelve las ventanas que ya había; Consilium usa su propia ventana visible."""
+    """Precarga el FBI y Justice.gov en Chrome y devuelve las ventanas que ya había; Consilium usa su propia ventana."""
     with PANTALLA:
-        antes = abrir_en_ventanas([url_fbi(persona)])
+        antes = abrir_en_ventanas([url_fbi(persona), url_justicia(persona)])
     if antes is None:
         log("Chrome: no se reconoce el navegador por defecto; el FBI se abrirá al capturarlo.")
     return antes
@@ -2400,7 +2427,7 @@ def consultas_edge(persona: dict, preguntar, claves: list[str], antes: set[int] 
         try:
             # State.gov y Justice llegan aquí solo si fallaron sin ventana: se abren ahora.
             with medir_sitio(clave):
-                capturas[clave] = CONSULTAS_CHROME[clave](persona, pedir, antes if clave in ("fbi", "consilium") else None)
+                capturas[clave] = CONSULTAS_CHROME[clave](persona, pedir, antes if clave in ("fbi", "consilium", "justicia") else None)
             log(f"Captura {clave}: {capturas[clave]}")
             avisar("sitio", clave=clave, estado="listo")
         except FueraDeServicio as e:
@@ -2441,9 +2468,16 @@ async def _consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) 
     omitidos = sin_fecha_expedicion(persona)
     if omitidos:
         log(f"Sin fecha de expedición: se omite {', '.join(c for c in documentos.ORDEN if c in omitidos)}.")
+    # En un reintento solo se consultan los sitios que fallaron.
+    solo = persona.get("solo")
+
+    def fuera(clave: str) -> bool:
+        return solo is not None and clave not in solo
+
     # Chrome espera a que cada sitio con captcha esté listo.
-    for clave in omitidos & listos.keys():
-        listos[clave].set()
+    for clave in listos:
+        if clave in omitidos or fuera(clave):
+            listos[clave].set()
     antes_chrome = None
     # Si el navegador automático no puede con State.gov o Justice, se capturan en Chrome como antes.
     a_chrome = []
@@ -2460,12 +2494,22 @@ async def _consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) 
 
     async def abrir_en_chrome():
         nonlocal antes_chrome
-        try:
-            antes_chrome = await asyncio.to_thread(abrir_paginas_chrome, persona)
-        except Exception as e:
-            log(f"Chrome: no se pudieron abrir de antemano FBI y Consilium ({e}); se abrirán al capturarlas.")
+        if not (fuera("fbi") and fuera("justicia")):
+            try:
+                antes_chrome = await asyncio.to_thread(abrir_paginas_chrome, persona)
+            except Exception as e:
+                log(f"Chrome: no se pudieron abrir de antemano FBI y Justice ({e}); se abrirán al capturarlas.")
+        # Después del FBI: si no, su ventana se tomaría como del navegador por defecto y se cerraría al terminar.
+        if not fuera("consilium"):
+            try:
+                await asyncio.to_thread(abrir_consilium, persona)
+            except Exception as e:
+                log(f"Consilium: no se pudo abrir de antemano ({e}); se abrirá al capturarlo.")
 
     async def registrar(clave: str, consulta):
+        if fuera(clave):
+            consulta.close()
+            return
         with medir_sitio(clave):
             await _registrar(clave, consulta)
 
@@ -2529,6 +2573,13 @@ async def _consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) 
 
     async def grupo_eeuu():
         async def sitio(clave, url, titulo):
+            if fuera(clave):
+                return
+            # Justice.gov reconoce el navegador automático y pone una espera de un minuto: va directo a Chrome.
+            if clave == "justicia":
+                a_chrome.append(clave)
+                return
+
             async def consultar():
                 aislado = await r["eeuu"].browser.new_context(
                     viewport=VIEWPORT, ignore_https_errors=True, user_agent=USER_AGENT)
@@ -2663,6 +2714,8 @@ async def _consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) 
             # Apenas carga su ventana se captura, en el primer hueco sin captchas esperando la pantalla. Si no carga
             # (o no se pudo abrir de antemano), se captura después de los captchas para no hacerlos esperar.
             await apertura_chrome
+            if fuera(clave):
+                return
             if clave == "consilium":
                 await en_chrome([clave])
                 return
@@ -2697,7 +2750,7 @@ async def _consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) 
         ("antecedentes", documentos.consultar_antecedentes),
         ("registraduria", documentos.consultar_registraduria, preguntar),
         ("inhabilidades", documentos.consultar_inhabilidades),
-    ) if clave not in omitidos]
+    ) if clave not in omitidos and not fuera(clave)]
     # Escalonado: primero los formularios con captcha, con el equipo para ellos (con todo a la vez tardaban más de un
     # minuto en abrir). Lo demás empieza cuando están llenos o a los ESPERA_FORMULARIOS s, mientras se resuelven.
     tareas_captcha = [asyncio.create_task(con_captcha(*captcha)) for captcha in captchas]
@@ -2777,7 +2830,13 @@ async def procesar(persona: dict, apertura: asyncio.Task, preguntar, preguntar_e
         + f" | {persona['sexo']} | apellido RUNT: {primer_apellido(persona['nombre'])}"
     )
     capturas, caidos = await consultar_persona(persona, await apertura, preguntar, preguntar_edge)
-    ruta = insertar_en_pdf(capturas, persona, caidos) if capturas else None
+    # Reintento: lo nuevo se suma a lo de la consulta anterior y reemplaza su informe.
+    previo = persona.get("informe") if persona.get("solo") else None
+    if previo:
+        caidos = (previo["caidos"] - capturas.keys()) | caidos
+        capturas = {**previo["capturas"], **capturas}
+    ruta = insertar_en_pdf(capturas, persona, caidos, previo and previo["ruta"]) if capturas else None
+    persona["informe"] = {"capturas": capturas, "caidos": caidos, "ruta": ruta}
     if ruta:
         log(f"PDF: {ruta}")
     log(f"Tiempo total: {minutos(time.monotonic() - inicio)}")
@@ -2786,6 +2845,7 @@ async def procesar(persona: dict, apertura: asyncio.Task, preguntar, preguntar_e
 
 async def cerrar_navegadores(apertura: asyncio.Task):
     apertura.cancel()
+    cerrar_consilium()
     await asyncio.to_thread(cerrar_ventanas_abiertas)
     recursos = (await asyncio.gather(apertura, return_exceptions=True))[0]
     if isinstance(recursos, dict):

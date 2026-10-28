@@ -354,6 +354,7 @@ class Interfaz:
                                     command=lambda: os.startfile(self.ruta))
         self.boton_carpeta = ttk.Button(botones, text="Abrir carpeta", command=self._abrir_carpeta)
         self.boton_carpeta.pack(side="left")
+        self.boton_reintentar = ttk.Button(botones, text="Reintentar fallidas", command=self._reintentar)
         self.fallos = ttk.Label(v, style="Error.TLabel", wraplength=360, justify="left")
         self.fallos.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
         self.caidos = ttk.Label(v, style="Aviso.TLabel", wraplength=360, justify="left")
@@ -597,15 +598,32 @@ class Interfaz:
         persona = self._validar()
         if persona is None:
             return
+        self._enviar(persona)
+
+    def _reintentar(self):
+        persona = self.persona
+        persona["solo"] = {clave for clave, estado in self.sitios.items() if estado in ("error", "fuera_servicio")}
+        anteriores, detalles = dict(self.sitios), dict(self.detalles)
+        if not self._enviar(persona):
+            return
+        for clave, estado in anteriores.items():
+            if clave not in persona["solo"]:
+                self.sitios[clave], self.detalles[clave] = estado, detalles.get(clave, "")
+                self._pintar(clave)
+        self._contar()
+
+    def _enviar(self, persona: dict) -> bool:
         try:
             self.bucle.call_soon_threadsafe(self.personas.put_nowait, persona)
         except RuntimeError:
             self._mostrar_error(f"El bot se detuvo. Cierra {NOMBRE} y vuelve a abrirlo; el motivo está en el registro.")
-            return
+            return False
+        self.persona = persona
         self.estado = "consultando"
         self.accion, self.capturando = None, ()
         self._preparar_progreso(persona)
         self._mostrar()
+        return True
 
     def _nueva(self):
         for entrada in self.entradas:
@@ -814,6 +832,10 @@ class Interfaz:
                   for clave, estado in self.sitios.items() if estado == "fuera_servicio"]
         if caidos:
             caidos.append("En el informe van sus páginas caídas, marcadas en la portada como «Fuera de servicio».")
+        if ruta and (fallos or caidos):
+            self.boton_reintentar.pack(side="left", padx=(8, 0))
+        else:
+            self.boton_reintentar.pack_forget()
         no_aplica = [SITIOS[clave] for clave, estado in self.sitios.items() if estado == "no_aplica"]
         omitidos = (f"Sin fecha de expedición se omitieron: {', '.join(self.omitidos)}." if self.omitidos else "")
         for etiqueta, texto in ((self.fallos, "\n".join(fallos)), (self.caidos, "\n".join(caidos)),
