@@ -56,6 +56,17 @@ Formato GALLAGHER (`UBICACION_PDF["Gallagher"]`, 26 filas en la portada): otro o
 - Los hilos de Playwright usan cada uno su `sync_playwright`.
 - Error ya corregido: en `main()` no se debe usar `consultar` como variable de bucle (sombreaba la función de la Procuraduría).
 
+## Rendimiento (27/10/2026: medido en el equipo de 2 núcleos i7-5500U, 8 GB)
+- El cuello de botella es el procesador, no la red ni los sitios (85 Mbps, servidores < 0,5 s): solos, los formularios con captcha abren en 4-18 s; con todo a la vez, en 75-130 s. Bajar la prioridad de los procesos del navegador automático no ayudó (empeoró): con hyper-threading el núcleo físico se comparte igual. Lo que sirve es no tenerlo todo a la vez.
+- **Escalonado** (`consultar_persona`): los cuatro formularios con captcha cargan primero; lo demás empieza cuando están llenos (`Turnos.preparado` / `esperar_preparados`) o a los `ESPERA_FORMULARIOS` s. Reemplazó la prioridad fija del RUNT (20 s).
+- **Precargas**: al abrir, al terminar cada consulta (`dejar_listos`) y al copiar una fila en la ventana (`anticipar`, llamado desde `interfaz.py`). SIMIT se mantiene listo en reposo (`mantener_en_reposo`). Vigencias medidas: SIMIT precargado servía a los 25 min (`VIGENCIA_SIMIT` 20 min); la sesión de Antecedentes vence entre 111 y 122 s (vigencia 100 s); Inhabilidades servía a los 4 min (180 s).
+- **RUNT**: es una aplicación de micro-frontends (manifiesto + ~15 `remoteEntry.js` + fragmentos); recargarla con el equipo ocupado tardaba 60-170 s. `volver_al_formulario_runt` (atajo de `carga_paginas.con_atajo`) da formulario vacío y captcha nuevo en 1-2 s con una ida y vuelta de ruta. Si el RUNT falla, su ventana queda en la página de error y la siguiente carga es completa.
+- **Carga de respaldo** (`carga_paginas.con_respaldo` / `vigente`): RUNT, Antecedentes e Inhabilidades (no la Registraduría) se cargan a la vez en otra ventana si no abren a tiempo, solo si el procesador no está saturado. Las ventanas de `r["ventanas"]` se leen con `ventana_de(r, clave)`, porque la de respaldo puede reemplazar a la original.
+- `equipo.py` mide la ocupación del procesador (GetSystemTimes). Lo aplazable (precargas para después, SIMIT en reposo, modelo de voz de Buster, lectores de códigos) espera respiro (`ESPERA_RESPIRO`); así se adapta a equipos más rápidos y a lo que el usuario tenga abierto.
+- SIMIT: su validación de seguridad (Web Worker de qxcaptcha) usa ~55-60 CPU-s por carga; bloquear sus rastreadores casi no cambia nada (solo se bloquea Crazy Egg). Se captura por CDP directo.
+- Casilla de Google con el aviso de cuota superada: si no avanza en `ESPERA_CON_CUOTA` s, se recarga (antes se perdían 50-65 s).
+- Medido mientras se programaba: VS Code consumía 1-1,5 núcleos (más que todo el bot al abrir). Abrir el bot y consultar a los pocos segundos es el peor caso: arranque de 4 navegadores + precargas + consulta.
+
 ## Entorno y trampas
 - El usuario ejecuta con `py main.py` (Python global 3.14). Las dependencias deben instalarse con `py -m pip install -r requirements.txt` (también existe un `.venv`, pero no es lo que usa el usuario).
 - La terminal de las herramientas a veces cambia de carpeta o rechaza `&`; usar rutas absolutas y, para scripts largos, escribir los resultados en un archivo y leerlo. Los comandos "sync" a veces devuelven antes de terminar: usar modo asíncrono y consultar la salida.

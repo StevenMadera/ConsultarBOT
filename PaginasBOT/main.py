@@ -1,18 +1,18 @@
 import asyncio
+import base64
+import contextlib
 import functools
 import os
 import re
-import io
-import pytesseract
+import shutil
 import sys
 import time
 import unicodedata
+import weakref
 from datetime import date, datetime, timedelta
 from difflib import get_close_matches
 from pathlib import Path
 from urllib.parse import quote_plus
-
-from PIL import Image, ImageOps, ImageFilter
 
 import pymupdf
 from playwright.async_api import Error as PlaywrightError
@@ -22,15 +22,17 @@ from win32com.shell import shell
 
 from captura_navegador import PAGINA_REFERENCIA, PANTALLA, abrir_en_ventanas, cerrar_ventanas_abiertas, pagina_cargada
 from comun import CAPTURAS, NOMBRE, FueraDeServicio, avisar, leer_respuesta, log
+import captcha_registraduria
+import captcha_runt
 import documentos
-from documentos import estado_ventana
+import equipo
+from documentos import escribir_despacio, estado_ventana, pausa_humana
 from consulta_consilium import TITULO_CONSILIUM, consultar_consilium, url_consilium
 from consulta_fbi import TITULO_FBI, consultar_fbi, url_fbi
 from consulta_justicia import TITULO_JUSTICIA, consultar_justicia, url_justicia
 from consulta_terroristas import TITULO_TERRORISTAS, consultar_terroristas, url_terroristas
-from ocr import buscar_tesseract
-from carga_paginas import (VISIBLES, cargar_cookies_cloudflare, cargar_pagina, esperar_estable, instante_carga,
-                           marcar_precarga)
+from carga_paginas import (VISIBLES, cargar_cookies_cloudflare, cargar_pagina, cerrar_ventana, con_atajo, con_respaldo,
+                           edad_precarga, esperar_estable, instante_carga, marcar_precarga, vigente)
 from rendimiento import capturar_pantalla, etapa, medir_sitio
 
 
@@ -43,9 +45,15 @@ ESPERA_PROCURADURIA = 240
 SEGUNDA_PROCURADURIA = 50
 URL_RUNT = "https://portalpublico.runt.gov.co/#/consulta-ciudadano-documento/consulta/consulta-ciudadano-documento"
 URL_SIMIT = "https://www.fcm.org.co/simit/#/home-public"
-# SIMIT tarda en abrir (20-45 s con el equipo ocupado): su formulario se deja listo al abrir y después de cada
-# consulta, y la siguiente lo usa si se cargó hace menos de estos segundos.
-VIGENCIA_SIMIT = 600
+# SIMIT tarda en abrir (20-45 s con el equipo ocupado, y su validación de seguridad ocupa el procesador 30-45 s): su
+# formulario se deja listo al abrir y después de cada consulta, y la siguiente lo usa si se cargó hace menos de estos
+# segundos. Precargado, a los 12 y a los 25 minutos seguía respondiendo sin repetir la validación.
+VIGENCIA_SIMIT = 20 * 60
+# En reposo SIMIT se recarga este tanto antes de que venza su formulario; sin actividad (consultas o filas copiadas) en
+# REPOSO_MAXIMO s ya no se mantiene.
+RENOVAR_SIMIT_ANTES = 60
+REPOSO_MAXIMO = 2 * 60 * 60
+PERIODO_REPOSO = 30
 URL_LIBRETA = "https://definicion.libretamilitar.mil.co/consulta-estado-situacion-militar"
 URL_OFAC = "https://sanctionssearch.ofac.treas.gov/"
 URL_GOVUK = "https://www.gov.uk/"
@@ -70,19 +78,129 @@ VIEWPORT_PROCURADURIA = {"width": 1920, "height": 1080}
 SALIDAS = Path(shell.SHGetKnownFolderPath(shell.FOLDERID_Documents)) / "PAGINAS"
 # El RUNT descarga unos 12 MB de código: con un perfil propio la caché queda para la próxima vez (8 s -> 3-4 s).
 PERFIL_RUNT = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / NOMBRE / "perfil_runt"
-# Al abrir, el RUNT carga solo hasta estos segundos: con todo a la vez tardaba 20-100 s en un equipo de 2 núcleos.
-PRIORIDAD_RUNT = 20
+# Buster: extensión que resuelve el reto de audio de la casilla «No soy un robot» (Antecedentes e Inhabilidades).
+EXTENSION_BUSTER = Path(__file__).resolve().parent / "buster-extension"
+PERFIL_BUSTER = Path(__file__).resolve().parent / "perfil_buster"
+# Buster reconoce el audio dentro del navegador («managed» con servicios locales: Whisper). Sus servicios remotos
+# fallan («Something went wrong»: la clave de Wit ya no sirve). Se escribe después de su configuración inicial, que
+# si no lo sobrescribe.
+AJUSTE_BUSTER_JS = """async () => {
+    for (let i = 0; i < 50; i++) {
+        const {storageVersion} = await chrome.storage.local.get('storageVersion');
+        if (storageVersion && storageVersion.includes('configure_managed_services')) break;
+        await new Promise(r => setTimeout(r, 200));
+    }
+    await chrome.storage.local.set({speechService: 'managed', enableManagedLocalServices: true,
+                                    enableManagedRemoteServices: false});
+}"""
+# El modelo de Whisper que usa Buster, en la caché del navegador: Buster solo lo descarga a medias y, sin él, no
+# resuelve el audio. Unos 42 MB la primera vez; después queda en perfil_buster.
+WHISPER_BUSTER_JS = """async () => {
+    const base = 'https://huggingface.co/Xenova/whisper-tiny/resolve/main/';
+    const archivos = ['config.json', 'generation_config.json', 'preprocessor_config.json', 'tokenizer.json',
+                      'tokenizer_config.json', 'onnx/encoder_model_quantized.onnx',
+                      'onnx/decoder_model_merged_quantized.onnx'];
+    const cache = await caches.open('transformers-cache');
+    let bajados = 0;
+    for (const f of archivos) {
+        if (await cache.match(base + f)) continue;
+        const r = await fetch(base + f);
+        if (!r.ok) throw new Error(f + ': HTTP ' + r.status);
+        await cache.put(base + f, new Response(await r.arrayBuffer(), {headers: r.headers}));
+        bajados++;
+    }
+    return bajados;
+}"""
+# Descargas del modelo de Buster en curso (referencia fuerte para que no se pierdan).
+TAREAS_BUSTER = set()
+# Parche a Buster para que Whisper quede cargado: sin él, en cada audio crea su documento interno («offscreen»), carga
+# el modelo, transcribe y cierra el documento. Con el parche el documento queda abierto, guarda el modelo y lo empieza
+# a cargar apenas se abre (el bot lo abre al iniciar). Los originales quedan como <archivo>.original.
+PARCHE_BUSTER = {
+    EXTENSION_BUSTER / "src" / "background" / "script.js": (
+        ('const{result:e}=await(0,$.Dy)({id:"transcribeAudio",audioString:(0,$.Yi)(n.slice(0)),audioOptions:r});'
+         'await Dk.offscreen.closeDocument(),a=e.text}',
+         'const{result:e}=await(0,$.Dy)({id:"transcribeAudio",audioString:(0,$.Yi)(n.slice(0)),audioOptions:r});'
+         'a=e.text}'),
+    ),
+    EXTENSION_BUSTER / "src" / "offscreen" / "script.js": (
+        ('function UM(){V.logLevel=U.ERROR,V.backends.onnx.wasm.wasmPaths=$M.runtime.getURL("src/wasm/")}',
+         'function UM(){V.logLevel=U.ERROR,V.backends.onnx.wasm.wasmPaths=$M.runtime.getURL("src/wasm/")}'
+         'setTimeout(()=>{if(!globalThis.__pbPipe){UM();globalThis.__pbPipe=OM(...DM())}},0);'),
+        ('try{return await OM(...e)}catch(e){console.log(e.toString())}}();if(n)try{const r=await n(e);'
+         'r&&(t.text=r.text.replace(RM,"").toLowerCase().trim())}catch(e){console.log(e.toString())}finally{n.dispose()}',
+         'try{return await(globalThis.__pbPipe||(globalThis.__pbPipe=OM(...e)))}catch(e){globalThis.__pbPipe=null;'
+         'console.log(e.toString())}}();if(n)try{const r=await n(e);'
+         'r&&(t.text=r.text.replace(RM,"").toLowerCase().trim())}catch(e){console.log(e.toString())}'),
+    ),
+}
+# Abre el documento interno de Buster (si no está), con lo que el parche empieza a cargar Whisper.
+PRECARGA_BUSTER_JS = """async () => {
+    const url = chrome.runtime.getURL('/src/offscreen/index.html');
+    if (!(await chrome.runtime.getContexts({contextTypes: ['OFFSCREEN_DOCUMENT'], documentUrls: [url]})).length)
+        await chrome.offscreen.createDocument({url: '/src/offscreen/index.html', reasons: ['USER_MEDIA'],
+                                               justification: 'process audio'});
+}"""
+
+
+def parchear_buster() -> bool:
+    """Aplica PARCHE_BUSTER (desde los originales) si falta. False si el código de Buster no es el esperado (otra
+    versión): entonces se deja como está y el modelo se carga en cada audio."""
+    try:
+        archivos = {}
+        for ruta, cambios in PARCHE_BUSTER.items():
+            original = ruta.with_name(ruta.name + ".original")
+            actual = ruta.read_text(encoding="utf-8")
+            if all(nuevo in actual for _, nuevo in cambios):
+                continue
+            base = original.read_text(encoding="utf-8") if original.exists() else actual
+            if not all(base.count(viejo) == 1 for viejo, _ in cambios):
+                log("Buster: su código no es el esperado (¿otra versión?); el modelo de voz se carga en cada audio.")
+                return False
+            for viejo, nuevo in cambios:
+                base = base.replace(viejo, nuevo)
+            archivos[ruta] = (original, actual, base)
+        for ruta, (original, actual, parcheado) in archivos.items():
+            if not original.exists():
+                original.write_text(actual, encoding="utf-8")
+            ruta.write_text(parcheado, encoding="utf-8")
+        if archivos:
+            # Chromium guarda una copia del código de la extensión: sin borrarla seguiría usando el anterior.
+            shutil.rmtree(PERFIL_BUSTER / "Default" / "Service Worker" / "ScriptCache", ignore_errors=True)
+            log("Buster: parche aplicado (el modelo de voz queda cargado).")
+        return True
+    except OSError as e:
+        log(f"Buster: no se pudo aplicar el parche ({e}); el modelo de voz se carga en cada audio.")
+        return False
+
+
+# Escalonado: los formularios con captcha cargan primero, con el equipo para ellos, y lo demás (consultas automáticas,
+# SIMIT, documentos, Chrome) empieza cuando están llenos, o a los ESPERA_FORMULARIOS s si alguno tarda (sitio lento o
+# caído). Con todo a la vez, en un equipo de 2 núcleos tardaban 75-130 s en abrir; escalonados, 5-30 s.
+ESPERA_FORMULARIOS = 35
+# Lo que puede esperar (precargas para la siguiente consulta, SIMIT en reposo, modelos) espera hasta estos segundos a
+# que el procesador no esté saturado (ver equipo.py).
+ESPERA_RESPIRO = 60
+# Entre copiar la fila y que la consulta use los formularios pasan unos segundos (revisar los datos, pulsar Consultar).
+ANTICIPO = 20
+# Formularios con captcha que se dejan listos de antemano: al abrir, al terminar cada consulta y al copiar una fila.
+PRECARGABLES = ("runt", "antecedentes", "inhabilidades")
+LIMITE_PRECARGAS = len(PRECARGABLES)
 # Google pone la casilla «No soy un robot» cada vez más difícil y lenta en la misma ventana: cada RENOVAR_CADA consultas,
 # o si la casilla tardó, la ventana se cambia por una limpia.
 CON_CASILLA = ("antecedentes", "inhabilidades")
+# La Registraduría no se precarga: cada visita de más acerca el «Acceso bloqueado» de su Cloudflare. Carga al empezar
+# la consulta, con los demás formularios con captcha.
 SIN_PRECARGA = ("registraduria",)
 RENOVAR_CADA = 5
 # FBI y Consilium se capturan apenas su página lleva estos segundos a la vista (su JavaScript aplica la búsqueda
 # después de cargar); si no carga en ESPERA_CHROME s, después de los captchas.
 MARGEN_CHROME = 5
 ESPERA_CHROME = 60
-# El OCR del RUNT tarda 0,4-2 s; con el equipo saturado llegó a 15-30 s, con el captcha ya a la vista.
+# La lectura del captcha del RUNT tarda 0,4-2 s; con el equipo saturado llegó a 15-30 s, con el captcha ya a la vista.
 ESPERA_OCR = 5
+# Captchas nuevos que lee el modelo antes de pedírselo a la persona.
+INTENTOS_MODELO_RUNT = 3
 # Si la precarga de un captcha no abrió (con todo cargando a la vez, aunque el sitio funcione), una carga más.
 ESPERA_REPETIR = 90
 # Sin la marca de navegador automatizado (navigator.webdriver), que también le hace poner la casilla más difícil.
@@ -107,6 +225,8 @@ HOSTS_BLOQUEADOS = (
     "googlesyndication.com", "googleadservices.com", "connect.facebook.net", "hotjar.com", "hotjar.io",
     "clarity.ms", "tawk.to", "zdassets.com", "livechatinc.com", "intercom.io", "intercomcdn.com",
     "crisp.chat", "jivosite.com", "hs-scripts.com", "botmaker.com", "cliengo.com", "freshchat.com",
+    # Grabación de sesiones (SIMIT).
+    "crazyegg.com",
 )
 REGLAS_BLOQUEO = ", ".join(f"MAP {host} ~NOTFOUND, MAP *.{host} ~NOTFOUND" for host in HOSTS_BLOQUEADOS)
 
@@ -155,54 +275,12 @@ EXPEDIDA_RE = re.compile(r"\b(expedida)\s+(el)\s+(\d{1,2})\s+(de)\s+([^\W\d_]+)\
 VALIDEZ_RE = re.compile(r"\b(hasta)\s+(el)\s+(\d{1,2})\s+(de)\s+([^\W\d_]+)\s+(de)\s+(\d{4})", re.IGNORECASE)
 
 
-tesseract = buscar_tesseract()
-if tesseract:
-    pytesseract.pytesseract.tesseract_cmd = str(tesseract)
-print("Ruta OCR:", pytesseract.pytesseract.tesseract_cmd)
-
-
-def leer_captcha(imagen):
-    if not imagen:
-        print("[CAPTCHA] No se recibió ninguna imagen.")
-        return None
-
+def leer_captcha(imagen: bytes) -> str | None:
+    """Lectura con el modelo propio del RUNT; None si no da 5 letras o números o si falla."""
     try:
-        # La captura de Playwright llega como bytes
-        img = Image.open(io.BytesIO(imagen)).convert("L")
-
-        # Mejorar el contraste y ampliar el texto
-        img = ImageOps.autocontrast(img)
-        img = img.resize(
-            (img.width * 3, img.height * 3)
-        )
-        img = img.filter(ImageFilter.SHARPEN)
-
-        # Reconocer texto, priorizando letras y números
-        texto = pytesseract.image_to_string(
-            img,
-            config="--oem 3 --psm 6"
-        )
-
-        print(f"\nTexto detectado en CAPTCHA:\n{texto}")
-
-        # Ajusta este patrón al formato real del ID
-        coincidencia = re.search(
-            r"\b(?=\d*[a-z])(?=[a-z]*\d)[a-z\d]+\b",
-            texto,
-            re.IGNORECASE
-        )
-
-        if coincidencia:
-            captcha = coincidencia.group(0)
-            print(f"[CAPTCHA] Captcha detectado: {captcha}")
-            return captcha
-
-        print("[CAPTCHA] No se detectó ningún captcha.")
-        return None
-
-
+        return captcha_runt.leer(imagen)
     except Exception as e:
-        print(f"Error leyendo CAPTCHA: {e}")
+        log(f"RUNT: el modelo no pudo leer el código ({e}).")
         return None
 
 
@@ -760,6 +838,29 @@ async def captura_aviso_sobre_datos(page, ruta: Path, aviso):
         await cdp.detach()
 
 
+# Ruta del formulario dentro de la aplicación del RUNT.
+RUTA_RUNT = "#" + URL_RUNT.split("#", 1)[1]
+CAPTCHA_NUEVO_RUNT_JS = """anterior => {
+    const i = document.querySelector('img.img-fluid');
+    return !!i && i.src.startsWith('data:image') && i.src !== anterior && i.getBoundingClientRect().width > 0;
+}"""
+
+
+async def volver_al_formulario_runt(page):
+    """Formulario vacío y captcha nuevo sin recargar la aplicación del RUNT (12 MB de código): ida y vuelta de ruta, en
+    1-2 s. Recargarla tardaba 4-25 s con el equipo libre y 60-130 s con todo cargando a la vez."""
+    anterior = await page.evaluate("() => document.querySelector('img.img-fluid')?.src ?? ''")
+    await page.evaluate("() => { location.hash = '#/'; }")
+    with contextlib.suppress(PlaywrightTimeoutError):
+        await page.wait_for_function("() => !document.querySelector('input[formcontrolname=documento]')",
+                                     timeout=5000, polling=100)
+    await page.evaluate("ruta => { location.hash = ruta; }", RUTA_RUNT)
+    await page.wait_for_function(CAPTCHA_NUEVO_RUNT_JS, arg=anterior, timeout=12000, polling=200)
+
+
+con_atajo(URL_RUNT, volver_al_formulario_runt)
+
+
 async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turnos, listo: asyncio.Event) -> Path:
     numero = re.sub(r"\D", "", persona["numero"])
     apellido = re.sub(r"[^\w\sñÑáéíóúÁÉÍÓÚüÜ]", "", primer_apellido(persona["nombre"]))
@@ -782,14 +883,21 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
         imagen_captcha = page.locator("img.img-fluid").first
         sin_registro = page.get_by_text(re.compile(r"no se ha encontrado la persona", re.I)).first
         await page.locator("mat-select[formcontrolname=tipoDocumento]").click()
+        await pausa_humana()
         await page.get_by_role("option", name=TIPOS_RUNT[persona["tipo"].upper()], exact=True).click()
-        await page.locator("input[formcontrolname=documento]").fill(numero)
-        await page.locator("input[formcontrolname=primerApellido]").fill(apellido)
+        await pausa_humana()
+        await escribir_despacio(page.locator("input[formcontrolname=documento]"), numero)
+        await pausa_humana()
+        await escribir_despacio(page.locator("input[formcontrolname=primerApellido]"), apellido)
         lleno_en = instante_carga(page)
 
     # Se llena minimizado; la ventana sale al frente cuando le toca el turno de captcha.
     await llenar()
-    for intento in range(3):
+    fallos_modelo = intentos_persona = 0
+    for intento in range(INTENTOS_MODELO_RUNT + 3):
+        # Tras 3 fallos del modelo, la persona tiene sus 3 intentos de siempre.
+        if intentos_persona >= 3:
+            break
         if intento:
             await llenar()
         async with turnos.turno("runt", lambda: lleno_en, llenar):
@@ -813,18 +921,31 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
                 print(f"[CAPID] Error en captura: {e}")
 
             pedido = time.monotonic()
-            # La lectura automática se prueba solo la primera vez: si falló, el código lo escribe la persona.
-            captcha = await leer_captcha_a_tiempo(imagen) if imagen and not intento else None
+            captcha = None
+            if fallos_modelo < INTENTOS_MODELO_RUNT:
+                # La imagen original (350x100) y no la captura de pantalla, que puede salir a otra escala.
+                try:
+                    src = await page.locator('img[src^="data:image"]').first.get_attribute("src", timeout=5000)
+                    original = base64.b64decode(src.split(",", 1)[1])
+                except (PlaywrightError, AttributeError, IndexError, ValueError):
+                    original = None
+                captcha = await leer_captcha_a_tiempo(original) if original else None
+                if not captcha:
+                    # Sin una lectura confiable se vuelve a pedir el código a la persona.
+                    log("RUNT: el modelo no dio una lectura confiable; se pide escribir el código.")
+                    fallos_modelo = INTENTOS_MODELO_RUNT
 
             if captcha:
                 respuesta = captcha
-                log(f"BASER: CAPID detectado automáticamente: {respuesta}")
+                log(f"RUNT: código leído por el modelo: {respuesta} "
+                    f"(intento {fallos_modelo + 1}/{INTENTOS_MODELO_RUNT})")
             else:
+                intentos_persona += 1
                 respuesta = await preguntar(
                     "CAPTCHA del RUNT: escríbelo manualmente: ",
                     titulo="captcha del RUNT",
                     imagen=imagen,
-                    intento=intento + 1
+                    intento=intentos_persona
                 )
 
             log(f"RUNT: código escrito en {time.monotonic() - pedido:.0f} s.")
@@ -835,13 +956,11 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
             # SOLUCIÓN GUI: Forzar el foco del elemento antes de escribir
             await campo_captcha.scroll_into_view_if_needed()
             await campo_captcha.click()  # Esto obliga al navegador a enfocar el input
-            await campo_captcha.fill(respuesta)
-            # Opcional: Si .fill() sigue fallando, usa focus de manera asíncrona:
-            # await campo_captcha.focus()
-            # await page.keyboard.type(respuesta)
+            await escribir_despacio(campo_captcha, respuesta)
 
             log(f"RUNT: se escribió el CAPTCHA: {respuesta}")
 
+            await pausa_humana()
             await page.get_by_role("button", name="Consultar Información").click()
         # Mientras el sitio responde ya se puede resolver el captcha siguiente.
         listo.set()
@@ -860,8 +979,14 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
             pass
         if await sin_registro.is_visible() or not await campo_captcha.is_visible():
             break
-        log(f"RUNT: captcha incorrecto o sin resultado, intento {intento + 1}/3")
+        if captcha:
+            fallos_modelo += 1
+            log(f"RUNT: el modelo leyó mal el captcha, intento {fallos_modelo}/{INTENTOS_MODELO_RUNT}")
+        else:
+            log(f"RUNT: captcha incorrecto o sin resultado, intento {intentos_persona}/3")
     else:
+        raise ValueError("RUNT: no se obtuvo resultado tras 3 intentos")
+    if intentos_persona >= 3 and await campo_captcha.is_visible() and not await sin_registro.is_visible():
         raise ValueError("RUNT: no se obtuvo resultado tras 3 intentos")
     ir_arriba = "document.querySelectorAll('*').forEach(e => { if (e.scrollTop) e.scrollTop = 0; }); window.scrollTo(0, 0)"
     CAPTURAS.mkdir(exist_ok=True)
@@ -890,11 +1015,51 @@ async def consultar_runt(page, persona: dict, preguntar, turnos: documentos.Turn
         await page.wait_for_timeout(500)
         await page.evaluate(ir_arriba)
         await page.wait_for_timeout(300)
-        await capturar_pantalla(page, path=str(ruta), full_page=True)
+        await alargar_hasta_ver(page, cdp)
+        # Hasta el final del apartado de licencias, sin el vacío ni el pie: la captura va en media página del PDF
+        # y una imagen más alta se vería más pequeña.
+        fin = await licencias.evaluate(
+            "e => (e.closest('mat-expansion-panel') || e).getBoundingClientRect().bottom"
+        ) if await licencias.count() else None
+        alto_visible = await page.evaluate("innerHeight")
+        if fin and fin + 16 < alto_visible:
+            ancho = await page.evaluate("innerWidth")
+            await capturar_pantalla(page, path=str(ruta), clip={"x": 0, "y": 0, "width": ancho, "height": fin + 16})
+        else:
+            await capturar_pantalla(page, path=str(ruta), full_page=True)
     finally:
         await cdp.send("Emulation.clearDeviceMetricsOverride")
         await cdp.detach()
     return ruta
+
+
+# Alto máximo de la pantalla virtual al alargarla para que quepan todas las licencias.
+ALTO_MAXIMO_RUNT = 4000
+# Lo que sobra dentro de los recuadros con desplazamiento propio (el RUNT pone el resultado en uno, entre la
+# cabecera y el pie fijos): esos píxeles no salen en la captura.
+SOBRANTE_JS = """() => Math.max(0, ...[document.scrollingElement, ...document.querySelectorAll('*')]
+    .filter(e => e && e.clientHeight > 50 && e.scrollHeight - e.clientHeight > 2
+        && (e === document.scrollingElement || /auto|scroll/.test(getComputedStyle(e).overflowY)))
+    .map(e => e.scrollHeight - e.clientHeight))"""
+
+
+async def alargar_hasta_ver(page, cdp):
+    """Si el resultado no cabe, alarga la pantalla virtual (mismo ancho, misma letra) hasta que quepa entero."""
+    try:
+        alto = PAGINA_REFERENCIA[1]
+        # Unas vueltas: al cambiar el alto la página se reacomoda.
+        for _ in range(3):
+            sobrante = await page.evaluate(SOBRANTE_JS)
+            if sobrante <= 0 or alto >= ALTO_MAXIMO_RUNT:
+                return
+            alto = min(ALTO_MAXIMO_RUNT, alto + int(sobrante) + 20)
+            log(f"RUNT: el resultado no cabía; la captura se alarga a {alto} px de alto.")
+            await pantalla_referencia(cdp, alto)
+            await page.wait_for_timeout(400)
+            await page.evaluate("document.querySelectorAll('*').forEach(e => { if (e.scrollTop) e.scrollTop = 0; }); "
+                                "window.scrollTo(0, 0)")
+    except PlaywrightError as e:
+        log(f"RUNT: no se pudo alargar la captura ({e}).")
 
 
 # null mientras SIMIT valida o carga; su validación de seguridad puede tardar más de 30 s.
@@ -996,7 +1161,7 @@ async def consultar_simit(page, persona: dict, pedir_seleccion=None) -> Path:
     await cerrar_aviso_simit(page)
     await page.locator("#txtBusqueda").fill(numero)
     await page.locator("#consultar").click(timeout=120000)
-    await page.wait_for_url("**/estado-cuenta", timeout=30000)
+    await page.wait_for_url("**/estado-cuenta", timeout=90000)
     estado = await esperar_simit(page)
     if estado == "varios":
         await seleccionar_persona_simit(page, persona, pedir_seleccion)
@@ -1018,8 +1183,39 @@ async def consultar_simit(page, persona: dict, pedir_seleccion=None) -> Path:
 
     CAPTURAS.mkdir(exist_ok=True)
     ruta = CAPTURAS / f"simit_{numero}_{datetime.now():%Y%m%d_%H%M%S}.png"
-    await captura_sin_pie(page, ruta)
+    await captura_simit(page, ruta)
     return ruta
+
+
+async def captura_simit(page, ruta: Path):
+    """Captura directa por CDP, que no espera las fuentes ni el siguiente cuadro: con el navegador ocupado, page.screenshot
+    de SIMIT se quedaba esperándolos (12-30 s, a veces sin terminar). Antes se espera a que la página esté estable. Si
+    CDP falla, page.screenshot."""
+    try:
+        with etapa("captura"):
+            dimensiones = await page.evaluate(
+                "[document.documentElement.scrollWidth, document.documentElement.scrollHeight]")
+            alto = await page.evaluate(ALTO_HASTA_PIE_JS) or dimensiones[1]
+            cdp = await page.context.new_cdp_session(page)
+            try:
+                datos = await asyncio.wait_for(cdp.send("Page.captureScreenshot", {
+                    "format": "png", "captureBeyondViewport": True, "fromSurface": True,
+                    "clip": {"x": 0, "y": 0, "width": page.viewport_size["width"], "height": alto, "scale": 1},
+                }), 45)
+            finally:
+                await cdp.detach()
+        ruta.write_bytes(base64.b64decode(datos["data"]))
+        return
+    except (PlaywrightError, TimeoutError) as e:
+        log(f"SIMIT: la captura por CDP no respondió ({primera_linea_error(e)}); se captura con Playwright.")
+    alto = await page.evaluate(ALTO_HASTA_PIE_JS)
+    recorte = {"x": 0, "y": 0, "width": page.viewport_size["width"], "height": alto} if alto else None
+    await capturar_pantalla(page, path=str(ruta), full_page=True, clip=recorte, timeout=30000,
+                            animations="disabled", caret="initial")
+
+
+def primera_linea_error(error) -> str:
+    return next(iter(str(error).strip().splitlines()), "") or type(error).__name__
 
 
 # Borde superior del pie del sitio (el último, si no está fijo en pantalla y empieza en la mitad inferior).
@@ -1705,6 +1901,72 @@ def limite_concurrencia() -> int:
     return max(2, min(4, nucleos, libre // 500 if libre is not None else nucleos))
 
 
+def preparar_lectores():
+    """Los lectores de los códigos del RUNT y la Registraduría tardan unos segundos en cargar (más con el equipo
+    ocupado): se cargan al abrir y no en plena consulta."""
+    for nombre, preparar in (("RUNT", captcha_runt.preparar), ("Registraduría", captcha_registraduria.preparar)):
+        try:
+            preparar()
+        except Exception as e:
+            log(f"{nombre}: no se pudo preparar el lector del código ({e}); se carga al usarlo.")
+
+
+def ventana_de(r: dict, clave: str):
+    """La ventana del sitio; si una carga de respaldo abrió antes que ella, la que la reemplazó."""
+    r["ventanas"][clave] = vigente(r["ventanas"][clave])
+    return r["ventanas"][clave]
+
+
+def precarga_vigente(r: dict, clave: str, margen: float = 0) -> bool:
+    """True si el formulario del sitio está precargado y seguirá sirviendo dentro de `margen` segundos. El RUNT, siempre
+    que su aplicación esté abierta: vuelve al formulario con un captcha nuevo en 1-2 s."""
+    page = ventana_de(r, clave)
+    url = r["formularios"][clave][0]
+    if page.is_closed():
+        return False
+    if clave == "runt":
+        return page.url.split("#")[0] == url.split("#")[0]
+    edad = edad_precarga(page, url)
+    return edad is not None and edad + margen < documentos.vigencia_precarga(clave)
+
+
+def anticipar(r: dict):
+    """Se copió una fila: la consulta empieza en unos segundos. Los formularios con captcha que para entonces ya no
+    servirían (y SIMIT, si vence pronto) se cargan ya, con el equipo libre."""
+    if r.get("consultando"):
+        return
+    r["ultima_actividad"] = time.monotonic()
+    for clave in PRECARGABLES:
+        if r["precargas"][clave].done() and not precarga_vigente(r, clave, ANTICIPO):
+            r["precargas"][clave] = asyncio.create_task(r["precargar"](clave))
+    vence = VIGENCIA_SIMIT - ANTICIPO - ESPERA_FORMULARIOS
+    if r["precargas"]["simit"].done() and time.monotonic() - r.get("simit_cargado_en", 0) > vence:
+        r["precargas"]["simit"] = asyncio.create_task(r["precargar_simit"]())
+
+
+def dejar_listos(r: dict):
+    """Al terminar la consulta, los formularios con captcha quedan listos para la siguiente (los que se renuevan ya lo
+    quedan al renovarse), sin quitarle el procesador a lo que siga en marcha."""
+    r["ultima_actividad"] = time.monotonic()
+    for clave in PRECARGABLES:
+        if r["precargas"][clave].done():
+            r["precargas"][clave] = asyncio.create_task(r["precargar"](clave, respiro=ESPERA_RESPIRO))
+
+
+async def mantener_en_reposo(r: dict):
+    """En reposo, SIMIT se vuelve a dejar listo antes de que venza su formulario: si no, la consulta lo carga y su
+    validación de seguridad ocupa el equipo 30-45 s. No empieza con el procesador saturado (se intenta en la siguiente
+    vuelta). Sin consultas ni filas copiadas en REPOSO_MAXIMO s, se deja de hacer (al copiar la siguiente fila se carga
+    de nuevo)."""
+    while True:
+        await asyncio.sleep(PERIODO_REPOSO)
+        if r.get("consultando") or time.monotonic() - r["ultima_actividad"] > REPOSO_MAXIMO:
+            continue
+        if r["precargas"]["simit"].done() and not equipo.saturado() \
+                and time.monotonic() - r.get("simit_cargado_en", 0) > VIGENCIA_SIMIT - RENOVAR_SIMIT_ANTES:
+            r["precargas"]["simit"] = asyncio.create_task(r["precargar_simit"]())
+
+
 async def abrir_perfil_runt(p, opciones: dict):
     """Navegador con ventana y perfil propio para el RUNT; None si otro PaginasBOT ya lo usa o no abre."""
     try:
@@ -1724,6 +1986,76 @@ async def abrir_perfil_runt(p, opciones: dict):
     except PlaywrightError as e:
         log(f"RUNT: no abrió el navegador con su caché ({(str(e).splitlines() or [''])[0]}); carga sin ella.")
         return None
+
+
+async def abrir_buster(p):
+    """Chromium con perfil propio y la extensión Buster para la casilla de Antecedentes e Inhabilidades; None si no
+    abre o la extensión no carga (esos sitios siguen en las ventanas de siempre, con la casilla a mano)."""
+    if not (EXTENSION_BUSTER / "manifest.json").is_file():
+        log(f"Buster: no está la extensión en {EXTENSION_BUSTER}; la casilla se marca a mano.")
+        return None
+    parcheado = await asyncio.to_thread(parchear_buster)
+    opciones = {**SIN_AUTOMATIZACION, "args": [*SIN_AUTOMATIZACION["args"], "--hide-crash-restore-bubble",
+                                               f"--disable-extensions-except={EXTENSION_BUSTER}",
+                                               f"--load-extension={EXTENSION_BUSTER}"]}
+    try:
+        # Solo el Chromium del bot y con perfil propio carga extensiones (Google Chrome bloquea --load-extension).
+        contexto = await p.chromium.launch_persistent_context(
+            PERFIL_BUSTER, channel="chromium", headless=False, no_viewport=True, ignore_https_errors=True, **opciones)
+    except PlaywrightError as e:
+        log(f"Buster: no abrió su navegador ({(str(e).splitlines() or [''])[0]}); la casilla se marca a mano.")
+        return None
+    try:
+        trabajador = contexto.service_workers[0] if contexto.service_workers else \
+            await contexto.wait_for_event("serviceworker", timeout=15000)
+    except PlaywrightError:
+        log("Buster: la extensión no cargó; la casilla se marca a mano.")
+        with contextlib.suppress(PlaywrightError):
+            await contexto.close()
+        return None
+    try:
+        await trabajador.evaluate(AJUSTE_BUSTER_JS)
+    except PlaywrightError as e:
+        log(f"Buster: no se pudo configurar su reconocimiento de voz ({(str(e).splitlines() or [''])[0]}).")
+
+    async def preparar_whisper():
+        try:
+            # Al abrir, los formularios con captcha cargan a la vez: el modelo espera a que haya procesador libre.
+            await equipo.esperar_respiro(ESPERA_RESPIRO)
+            if bajados := await trabajador.evaluate(WHISPER_BUSTER_JS):
+                log(f"Buster: modelo de voz descargado ({bajados} archivos).")
+            # El documento interno de Buster abierto: con el parche, Whisper empieza a cargarse ya.
+            if parcheado:
+                await trabajador.evaluate(PRECARGA_BUSTER_JS)
+                log("Buster: cargando el modelo de voz para el primer audio.")
+        except PlaywrightError as e:
+            log(f"Buster: no se pudo preparar su modelo de voz ({(str(e).splitlines() or [''])[0]}); si no está "
+                "listo, el reto de audio se resuelve a mano.")
+
+    # En segundo plano: la primera vez tarda, y la casilla muchas veces pasa sin reto de audio.
+    TAREAS_BUSTER.add(tarea := asyncio.create_task(preparar_whisper()))
+    tarea.add_done_callback(TAREAS_BUSTER.discard)
+    await cargar_cookies_cloudflare(contexto)
+    VISIBLES.add(contexto)
+    documentos.contextos_buster.add(contexto)
+    contexto.on("close", lambda c: documentos.contextos_buster.discard(c))
+    log("Buster: extensión cargada para Antecedentes e Inhabilidades.")
+    return contexto
+
+
+async def ventana_aparte(contexto, usadas):
+    """Una página de un navegador con perfil propio (Buster, RUNT) en su propia ventana: en pestañas de una misma
+    ventana, minimizar una minimizaría la otra."""
+    libre = next((pg for pg in contexto.pages if pg not in usadas and pg.url == "about:blank"), None)
+    if libre:
+        return libre
+    cdp = await contexto.new_cdp_session(contexto.pages[0])
+    try:
+        async with contexto.expect_page() as nueva:
+            await cdp.send("Target.createTarget", {"url": "about:blank", "newWindow": True})
+        return await nueva.value
+    finally:
+        await cdp.detach()
 
 
 async def abrir_visible(p):
@@ -1749,10 +2081,11 @@ async def abrir_navegadores(p) -> dict:
     # La Procuraduría bloquea el user agent "HeadlessChrome".
     opciones = {"ignore_https_errors": True, "user_agent": USER_AGENT}
     # El headless nuevo (canal "chromium") incluye el visor de PDF que usa la libreta.
-    automatico, visible, perfil_runt = await asyncio.gather(
+    automatico, visible, perfil_runt, buster = await asyncio.gather(
         p.chromium.launch(headless=True, channel="chromium", args=[f"--host-resolver-rules={REGLAS_BLOQUEO}"]),
         abrir_visible(p),
         abrir_perfil_runt(p, opciones),
+        abrir_buster(p),
     )
     # Una pestaña por contexto: Chrome frena las pestañas en segundo plano de una misma ventana.
     procuraduria, simit, libreta, grupo, eeuu, onu, eurlex, gallagher, pdfs = await asyncio.gather(
@@ -1773,9 +2106,24 @@ async def abrir_navegadores(p) -> dict:
         "ventanas": {},
         "precargas": {},
         "usos": dict.fromkeys(CON_CASILLA, 0),
+        "buster": buster,
     }
     # Sitios con captcha: cada uno en su ventana, minimizada mientras se llena; sale al frente en su turno.
-    async def nueva_ventana():
+    candado_buster = asyncio.Lock()
+    # Páginas de Buster ya entregadas: las ventanas se piden a la vez, antes de quedar en r["ventanas"].
+    entregadas = weakref.WeakSet()
+
+    async def nueva_ventana(clave=None):
+        buster = r["buster"]
+        if clave in CON_CASILLA and buster in documentos.contextos_buster:
+            try:
+                # Antecedentes e Inhabilidades piden su ventana a la vez: que no tomen la misma.
+                async with candado_buster:
+                    page = await ventana_aparte(buster, {*entregadas, *r["ventanas"].values()})
+                    entregadas.add(page)
+                    return page
+            except PlaywrightError as e:
+                log(f"Buster: no abrió una ventana ({(str(e).splitlines() or [''])[0]}); se usa la de siempre.")
         # Con el user agent propio del navegador: si no coincide con su versión real, Google desconfía.
         contexto = await visible.new_context(no_viewport=True, ignore_https_errors=True)
         # Las verificaciones de Cloudflare ya pasadas: con su cookie vigente no la vuelve a pedir.
@@ -1783,38 +2131,62 @@ async def abrir_navegadores(p) -> dict:
         VISIBLES.add(contexto)
         return await contexto.new_page()
 
+    async def ventana_de_respaldo(clave):
+        """Otra ventana para el sitio: si su formulario no abre a tiempo, se carga a la vez en ella (ver
+        carga_paginas.con_respaldo)."""
+        if clave == "runt" and perfil_runt and perfil_runt.pages:
+            page = await ventana_aparte(perfil_runt, set(perfil_runt.pages))
+        else:
+            page = await nueva_ventana(clave)
+        await estado_ventana(page, "minimized")
+        return page
+
+    def registrar(clave, page):
+        # La Registraduría no: una carga de más acerca el «Acceso bloqueado» de su Cloudflare.
+        if clave in PRECARGABLES:
+            con_respaldo(page, functools.partial(ventana_de_respaldo, clave))
+        return page
+
     async def ventana_minimizada(clave):
         if clave == "runt" and perfil_runt:
             page = perfil_runt.pages[0] if perfil_runt.pages else await perfil_runt.new_page()
         else:
-            page = await nueva_ventana()
+            page = await nueva_ventana(clave)
         await estado_ventana(page, "minimized")
-        return page
+        return registrar(clave, page)
 
     claves = ("runt", "antecedentes", "registraduria", "inhabilidades")
     r["ventanas"] = dict(zip(claves, await asyncio.gather(*(ventana_minimizada(clave) for clave in claves))))
     r["nueva_ventana"] = nueva_ventana
+    r["ventana_nueva_de"] = ventana_de_respaldo
+    r["registrar"] = registrar
 
-    limite_precarga = asyncio.Semaphore(2)
+    limite_precarga = asyncio.Semaphore(LIMITE_PRECARGAS)
 
-    async def esperar_al_runt():
-        # asyncio.wait no cancela la precarga del RUNT si se cancela quien espera.
-        await asyncio.wait([r["precargas"]["runt"]], timeout=PRIORIDAD_RUNT)
+    async def esperar_formularios():
+        """Lo que no es un captcha (SIMIT, documentos, lectores) espera a que se precarguen los formularios con captcha,
+        con tope: cargando todo a la vez, en un equipo de 2 núcleos tardaban minutos en abrir."""
+        pendientes = [r["precargas"][c] for c in PRECARGABLES if c in r["precargas"] and not r["precargas"][c].done()]
+        if pendientes:
+            # asyncio.wait no cancela las precargas si se cancela quien espera.
+            await asyncio.wait(pendientes, timeout=ESPERA_FORMULARIOS)
 
-    def despues_del_runt(cargar):
+    def despues_de_los_formularios(cargar):
         async def cargar_despues(page):
-            await esperar_al_runt()
+            await esperar_formularios()
             return await cargar(page)
         return cargar_despues
 
-    async def precargar_limitada(clave, url, lista):
+    async def precargar_limitada(clave, url, lista, respiro=0):
         with medir_sitio(f"precarga_{clave}"):
             with etapa("cola"):
-                if clave != "runt":
-                    await esperar_al_runt()
+                # La que es para más tarde no le quita el procesador a lo que está en marcha; si empieza una
+                # consulta, ya se necesita.
+                if respiro:
+                    await equipo.esperar_respiro(respiro, seguir=lambda: not r.get("consultando"))
                 await limite_precarga.acquire()
             try:
-                await documentos.precargar(r["ventanas"][clave], url, lista)
+                await documentos.precargar(ventana_de(r, clave), url, lista)
             finally:
                 limite_precarga.release()
 
@@ -1825,15 +2197,29 @@ async def abrir_navegadores(p) -> dict:
         "inhabilidades": (documentos.URL_INHABILIDADES, documentos.formulario_inhabilidades_listo),
     }
     for clave, (url, lista) in formularios.items():
-        # La Registraduría no se precarga: la consulta casi nunca alcanza a usarla (vence a los 30 s) y cada visita de
-        # más acerca el «Acceso bloqueado» de su Cloudflare. Su formulario carga al empezar, mientras va el RUNT.
         precarga = asyncio.sleep(0) if clave in SIN_PRECARGA else precargar_limitada(clave, url, lista)
         r["precargas"][clave] = asyncio.create_task(precarga)
     r["formularios"] = formularios
+    r["precargar"] = lambda clave, respiro=0: precargar_limitada(clave, *formularios[clave], respiro=respiro)
+
+    candado_renovar = asyncio.Lock()
 
     async def renovar(clave):
         """Cambia la ventana del sitio por una limpia (sin las cookies de Google) y deja su formulario listo."""
-        vieja = r["ventanas"][clave]
+        vieja = ventana_de(r, clave)
+        if vieja.context is r["buster"]:
+            # Un contexto con perfil propio no crea otros: se cierra y se abre de nuevo (con las dos ventanas).
+            async with candado_renovar:
+                if ventana_de(r, clave) is vieja:
+                    claves = [c for c in CON_CASILLA if ventana_de(r, c).context is vieja.context]
+                    # Con tope: si dejó de responder, cerrarlo también puede quedarse esperando.
+                    with contextlib.suppress(PlaywrightError, TimeoutError):
+                        await asyncio.wait_for(vieja.context.close(), 15)
+                    r["buster"] = await abrir_buster(p)
+                    for c in claves:
+                        r["ventanas"][c] = await ventana_minimizada(c)
+            await precargar_limitada(clave, *formularios[clave])
+            return
         r["ventanas"][clave] = await ventana_minimizada(clave)
         try:
             await vieja.context.close()
@@ -1846,9 +2232,16 @@ async def abrir_navegadores(p) -> dict:
     async def precargar_simit():
         """Deja el formulario de SIMIT listo para la próxima consulta."""
         with medir_sitio("precarga_simit"):
-            with etapa("cola"):
-                await esperar_al_runt()
-                await limite_precarga.acquire()
+            r["simit_en_cola"] = True
+            r["simit_cargado_en"] = time.monotonic()
+            try:
+                with etapa("cola"):
+                    await esperar_formularios()
+                    # Su validación de seguridad ocupa el procesador 30-45 s: espera a que haya respiro.
+                    await equipo.esperar_respiro(ESPERA_RESPIRO)
+                    await limite_precarga.acquire()
+            finally:
+                r["simit_en_cola"] = False
             try:
                 page = r["simit"]
                 await cargar_pagina(page, URL_SIMIT, formulario_simit_listo,
@@ -1860,10 +2253,19 @@ async def abrir_navegadores(p) -> dict:
 
     r["precargas"]["simit"] = asyncio.create_task(precargar_simit())
     r["precargar_simit"] = precargar_simit
-    r["consolidado"] = Documento(await onu.new_page(), despues_del_runt(cargar_consolidado), "consolidado",
+    r["ultima_actividad"] = time.monotonic()
+
+    async def preparar_lectores_despues():
+        await esperar_formularios()
+        await equipo.esperar_respiro(ESPERA_RESPIRO)
+        await asyncio.to_thread(preparar_lectores)
+
+    # Tareas de fondo: los lectores de los códigos (tardan unos segundos en cargar) y el mantenimiento en reposo.
+    r["fondo"] = [asyncio.create_task(preparar_lectores_despues()), asyncio.create_task(mantener_en_reposo(r))]
+    r["consolidado"] = Documento(await onu.new_page(), despues_de_los_formularios(cargar_consolidado), "consolidado",
                                  "Documento consolidado")
-    r["consolium"] = Documento(await eurlex.new_page(), despues_del_runt(cargar_eurlex), "consolium", "EUR-Lex",
-                               por_nombre=True)
+    r["consolium"] = Documento(await eurlex.new_page(), despues_de_los_formularios(cargar_eurlex), "consolium",
+                               "EUR-Lex", por_nombre=True)
     return r
 
 
@@ -1906,6 +2308,8 @@ async def con_caida(page, clave: str, persona: dict, consulta) -> Path:
         ruta = await consulta
     except FueraDeServicio as e:
         if e.captura is None:
+            # Si una carga de respaldo abrió antes, la consulta siguió en esa ventana.
+            page = vigente(page)
             try:
                 if e.direccion:
                     await documentos.aviso_tiempo_agotado(page, e.direccion)
@@ -1914,12 +2318,15 @@ async def con_caida(page, clave: str, persona: dict, consulta) -> Path:
                 log(f"{clave}: no se pudo guardar la página caída ({str(falla).splitlines()[0]}).")
         raise
     except Exception as e:
+        page = vigente(page)
         try:
             motivo, direccion = await documentos.motivo_caida(page, e)
         except PlaywrightError:
             motivo = None
         if not motivo:
             raise
+        # La causa técnica, para poder revisarla: el informe lleva la página caída.
+        log(f"{clave}: {motivo} (causa: {primera_linea_error(e)}).")
         captura = None
         try:
             if direccion:
@@ -1929,7 +2336,7 @@ async def con_caida(page, clave: str, persona: dict, consulta) -> Path:
             log(f"{clave}: no se pudo guardar la página caída ({str(falla).splitlines()[0]}).")
         raise FueraDeServicio(motivo, captura) from e
     # Tras enviar el formulario, la página de error del navegador o del servidor se imprimiría como el documento.
-    if clave in documentos.ORDEN and (motivo := await documentos.caida_en_pagina(page)):
+    if clave in documentos.ORDEN and (motivo := await documentos.caida_en_pagina(vigente(page))):
         raise FueraDeServicio(motivo, ruta)
     return ruta
 
@@ -1955,12 +2362,11 @@ CONSULTAS_CHROME = {
 
 
 def abrir_paginas_chrome(persona: dict) -> set[int] | None:
-    """FBI y Consilium solo cargan en Chrome: se abren al empezar, cada una en su ventana minimizada, y cargan
-    mientras se resuelven los captchas; al final solo queda capturarlas. Devuelve las ventanas que ya había."""
+    """Precarga el FBI en Chrome y devuelve las ventanas que ya había; Consilium usa su propia ventana visible."""
     with PANTALLA:
-        antes = abrir_en_ventanas([url_fbi(persona), url_consilium(persona)])
+        antes = abrir_en_ventanas([url_fbi(persona)])
     if antes is None:
-        log("Chrome: no se reconoce el navegador por defecto; FBI y Consilium se abrirán al capturarlas.")
+        log("Chrome: no se reconoce el navegador por defecto; el FBI se abrirá al capturarlo.")
     return antes
 
 
@@ -1998,6 +2404,16 @@ def minutos(segundos: float) -> str:
 
 async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -> tuple[dict[str, Path], set[str]]:
     """Las capturas de cada sitio y los sitios fuera de servicio (su captura es la página caída)."""
+    # Mientras dura, el mantenimiento en reposo y el anticipo al copiar una fila no cargan nada.
+    r["consultando"] = True
+    try:
+        return await _consultar_persona(persona, r, preguntar, preguntar_edge)
+    finally:
+        r["consultando"] = False
+        r["ultima_actividad"] = time.monotonic()
+
+
+async def _consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -> tuple[dict[str, Path], set[str]]:
     inicio = time.monotonic()
     capturas: dict[str, Path] = {}
     caidos: set[str] = set()
@@ -2064,6 +2480,11 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
     async def simit(page, *args):
         # Su formulario se deja cargado de antemano: si aún está cargando, se espera (si falló, se carga aquí).
         precarga = r["precargas"]["simit"]
+        # Si la precarga sigue en cola detrás del RUNT, esperarla puede tomar minutos: se carga aquí mismo.
+        if not precarga.done() and r.get("simit_en_cola"):
+            precarga.cancel()
+            await asyncio.gather(precarga, return_exceptions=True)
+            return await consultar_simit(page, *args)
         esperada = not precarga.done()
         with etapa("carga"):
             await asyncio.gather(precarga, return_exceptions=True)
@@ -2124,32 +2545,43 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
             caido = esperada and (isinstance(error, FueraDeServicio)
                                   or isinstance(error, PlaywrightTimeoutError) and str(error).startswith("Page.goto:"))
             # Un sitio que bloqueó la conexión no se vuelve a cargar: eso alarga el bloqueo.
-            if caido and not isinstance(error, documentos.SitioBloqueado) and not r["ventanas"][clave].is_closed():
+            if caido and not isinstance(error, documentos.SitioBloqueado) and not ventana_de(r, clave).is_closed():
                 log(f"{clave}: no abrió mientras se esperaba; se intenta una vez más.")
                 try:
                     with etapa("carga"):
-                        await asyncio.wait_for(documentos.precargar(r["ventanas"][clave], *r["formularios"][clave]),
+                        await asyncio.wait_for(documentos.precargar(ventana_de(r, clave), *r["formularios"][clave]),
                                                ESPERA_REPETIR)
                     caido = False
                 except (FueraDeServicio, PlaywrightError, TimeoutError):
                     pass
             for intento in range(2):
-                page = r["ventanas"][clave]
+                page = ventana_de(r, clave)
                 if page.is_closed():
                     # Se cerró la ventana: se abre otra en el mismo contexto.
                     try:
                         page = await page.context.new_page()
                     except PlaywrightError:
                         # El navegador con la caché del RUNT se cierra junto con su única ventana.
-                        page = await r["nueva_ventana"]()
-                    r["ventanas"][clave] = page
+                        page = await r["nueva_ventana"](clave)
+                    r["ventanas"][clave] = r["registrar"](clave, page)
                     await estado_ventana(page, "minimized")
                 try:
                     return await con_caida(page, clave, persona, precarga if caido else
                                            consulta(page, persona, *args, turnos, listos[clave]))
-                except FueraDeServicio:
-                    raise
+                except FueraDeServicio as e:
+                    # La ventana dejó de responder (con el equipo saturado le pasó a Antecedentes e Inhabilidades
+                    # recién precargadas), no el sitio: en otra ventana suele abrir. Una vez.
+                    if intento or caido or str(e) != documentos.SIN_RESPUESTA or clave not in PRECARGABLES:
+                        raise
+                    log(f"{clave}: {e}; se abre otra ventana y se repite la consulta.")
+                    vieja = ventana_de(r, clave)
+                    nueva = await r["ventana_nueva_de"](clave)
+                    r["ventanas"][clave] = r["registrar"](clave, nueva)
+                    await cerrar_ventana(vieja)
+                    continue
                 except Exception:
+                    # Si una carga de respaldo abrió antes, la consulta siguió en esa ventana.
+                    page = ventana_de(r, clave)
                     if page.is_closed() and not intento:
                         log(f"{clave}: se cerró su ventana durante la consulta; se abre otra y se repite.")
                         continue
@@ -2165,11 +2597,14 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
         try:
             await registrar(clave, ejecutar())
         finally:
+            # Si no llegó a llenar su formulario (falló o no aplica), lo demás no lo espera.
+            turnos.preparado(clave)
             listos[clave].set()
             # Se minimiza al terminar para que las ventanas no se acumulen en pantalla.
-            if not r["ventanas"][clave].is_closed():
+            page = ventana_de(r, clave)
+            if not page.is_closed():
                 try:
-                    await estado_ventana(r["ventanas"][clave], "minimized")
+                    await estado_ventana(page, "minimized")
                 except PlaywrightError:
                     pass
 
@@ -2211,6 +2646,9 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
             # Apenas carga su ventana se captura, en el primer hueco sin captchas esperando la pantalla. Si no carga
             # (o no se pudo abrir de antemano), se captura después de los captchas para no hacerlos esperar.
             await apertura_chrome
+            if clave == "consilium":
+                await en_chrome([clave])
+                return
             if antes_chrome is None or not await cargada(url, titulo):
                 await enviados()
             await en_chrome([clave])
@@ -2243,20 +2681,18 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
         ("registraduria", documentos.consultar_registraduria, preguntar),
         ("inhabilidades", documentos.consultar_inhabilidades),
     ) if clave not in omitidos]
-    # El RUNT, primer captcha, va solo hasta que le toca su turno: con todo a la vez, su página y las de los demás
-    # captchas tardaban más de un minuto en abrir. Lo demás carga mientras se escribe su código.
-    primero = asyncio.create_task(con_captcha(*captchas[0]))
-    # FBI y Consilium se abren ya: abrirlas toma la pantalla unos segundos y así no retrasan la pregunta del RUNT.
-    apertura_chrome = asyncio.create_task(abrir_en_chrome())
-    turno = asyncio.create_task(turnos.repartido.wait())
+    # Escalonado: primero los formularios con captcha, con el equipo para ellos (con todo a la vez tardaban más de un
+    # minuto en abrir). Lo demás empieza cuando están llenos o a los ESPERA_FORMULARIOS s, mientras se resuelven.
+    tareas_captcha = [asyncio.create_task(con_captcha(*captcha)) for captcha in captchas]
     try:
-        await asyncio.wait([primero, turno], timeout=PRIORIDAD_RUNT, return_when=asyncio.FIRST_COMPLETED)
+        await turnos.esperar_preparados([clave for clave, *_ in captchas], ESPERA_FORMULARIOS)
     except asyncio.CancelledError:
-        primero.cancel()
-        apertura_chrome.cancel()
+        for tarea in tareas_captcha:
+            tarea.cancel()
         raise
-    finally:
-        turno.cancel()
+    log(f"Tiempo: formularios con captcha listos a los {minutos(time.monotonic() - inicio)}")
+    # FBI y Consilium se abren ahora: su carga (y la verificación de Cloudflare) ya no le quita equipo a los formularios.
+    apertura_chrome = asyncio.create_task(abrir_en_chrome())
     eeuu = asyncio.create_task(grupo_eeuu())
 
     # Las más largas primero: el límite deja esperando a las últimas en un equipo débil.
@@ -2280,13 +2716,13 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
                 ("bid", consultar_bid), ("canada", consultar_canada), ("tesoro", consultar_tesoro))]
               if persona["formato"] == "Gallagher" else []),
         ),
-        primero,
-        *(con_captcha(*captcha) for captcha in captchas[1:]),
+        *tareas_captcha,
         edge(),
     )
     # FBI y Consilium se abren en ventanas nuevas en cada consulta: no queda ninguna abierta.
     await asyncio.to_thread(cerrar_ventanas_abiertas)
     renovar_ventanas(r, omitidos)
+    dejar_listos(r)
     r["precargas"]["simit"] = asyncio.create_task(r["precargar_simit"]())
     return capturas, caidos
 
@@ -2294,16 +2730,22 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
 def renovar_ventanas(r: dict, omitidos: set[str]):
     """Al terminar la consulta, con la pantalla libre, cambia por una limpia la ventana de cada casilla «No soy un
     robot» que ya lleva RENOVAR_CADA consultas o que tardó; la siguiente consulta espera a que esté lista."""
-    for clave in CON_CASILLA:
-        if clave in omitidos:
-            continue
+    claves = [c for c in CON_CASILLA if c not in omitidos]
+    for clave in claves:
         r["usos"][clave] += 1
-        lenta = r["ventanas"][clave].context in documentos.casillas_lentas
-        if lenta or r["usos"][clave] >= RENOVAR_CADA:
-            motivo = "su casilla tardó" if lenta else f"lleva {RENOVAR_CADA} consultas"
-            log(f"{clave}: se cambia su ventana por una limpia ({motivo}).")
-            r["usos"][clave] = 0
-            r["precargas"][clave] = asyncio.create_task(r["renovar"](clave))
+    renovar = {c for c in claves if ventana_de(r, c).context in documentos.casillas_lentas
+               or r["usos"][c] >= RENOVAR_CADA}
+    # Las ventanas de Buster comparten navegador: renovar una cierra las dos, así que se renuevan juntas.
+    if any(ventana_de(r, c).context is r["buster"] for c in renovar):
+        renovar |= {c for c in CON_CASILLA if ventana_de(r, c).context is r["buster"]}
+    for clave in CON_CASILLA:
+        if clave not in renovar:
+            continue
+        lenta = ventana_de(r, clave).context in documentos.casillas_lentas
+        motivo = "su casilla tardó" if lenta else f"lleva {r['usos'][clave]} consultas"
+        log(f"{clave}: se cambia su ventana por una limpia ({motivo}).")
+        r["usos"][clave] = 0
+        r["precargas"][clave] = asyncio.create_task(r["renovar"](clave))
 
 
 async def procesar(persona: dict, apertura: asyncio.Task, preguntar, preguntar_edge) -> Path | None:
@@ -2330,11 +2772,14 @@ async def cerrar_navegadores(apertura: asyncio.Task):
     await asyncio.to_thread(cerrar_ventanas_abiertas)
     recursos = (await asyncio.gather(apertura, return_exceptions=True))[0]
     if isinstance(recursos, dict):
-        for tarea in (recursos["consolidado"].carga, recursos["consolium"].carga, *recursos["precargas"].values()):
+        for tarea in (recursos["consolidado"].carga, recursos["consolium"].carga, *recursos["precargas"].values(),
+                      *recursos.get("fondo", ())):
             tarea.cancel()
             await asyncio.gather(tarea, return_exceptions=True)
         for navegador in recursos["navegadores"]:
             await navegador.close()
+        if recursos["buster"] in documentos.contextos_buster:
+            await recursos["buster"].close()
 
 
 async def principal():

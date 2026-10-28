@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+from weakref import WeakKeyDictionary
 
 from playwright.async_api import async_playwright
 
@@ -30,27 +31,34 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
     async def test_sin_fecha_de_expedicion_omite_las_consultas_que_la_piden(self):
         await self.verificar_cola("Hombre", fecha_expedicion=None)
 
-    async def test_al_empezar_el_runt_carga_antes_que_las_demas_consultas(self):
-        async def runt(page, persona, preguntar, turnos, listo):
-            await asyncio.sleep(0.1)
-            self.turno_runt = time.monotonic()
-            async with turnos.turno("runt", time.monotonic, AsyncMock()):
-                pass
-            listo.set()
-            return Path("runt.png")
+    async def test_los_formularios_con_captcha_se_llenan_antes_que_las_demas_consultas(self):
+        llenos = {}
 
-        await self.verificar_cola("Hombre", consultar_runt=runt)
-        self.assertGreaterEqual(min(self.inicios), self.turno_runt)
+        def sitio(clave, demora):
+            async def consulta(*args):
+                turnos, listo = args[-2], args[-1]
+                await asyncio.sleep(demora)
+                llenos[clave] = time.monotonic()
+                async with turnos.turno(clave, time.monotonic, AsyncMock()):
+                    pass
+                listo.set()
+                return Path(f"{clave}.pdf")
+            return consulta
 
-    async def test_si_el_runt_tarda_las_demas_no_lo_esperan_mas_de_su_prioridad(self):
-        async def runt(page, persona, preguntar, turnos, listo):
+        demoras = {"runt": 0.05, "registraduria": 0.1, "antecedentes": 0.15, "inhabilidades": 0.2}
+        await self.verificar_cola("Hombre", por_sitio={c: sitio(c, d) for c, d in demoras.items()},
+                                  espera_formularios=3)
+        self.assertEqual(set(llenos), set(demoras))
+        self.assertGreaterEqual(min(self.inicios), max(llenos.values()))
+
+    async def test_si_un_formulario_tarda_lo_demas_no_lo_espera_mas_del_tope(self):
+        async def lento(*args):
             await asyncio.sleep(1)
-            listo.set()
+            args[-1].set()
             return Path("runt.png")
 
         desde = time.monotonic()
-        with patch.object(main, "PRIORIDAD_RUNT", 0.1):
-            await self.verificar_cola("Hombre", consultar_runt=runt)
+        await self.verificar_cola("Hombre", por_sitio={"runt": lento}, espera_formularios=0.1)
         self.assertLess(min(self.inicios) - desde, 0.6)
 
     async def test_fbi_y_consilium_se_capturan_apenas_cargan_sin_esperar_los_captchas(self):
@@ -72,8 +80,30 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
         async def runt(*args):
             return Path("runt.png")
 
-        await self.verificar_cola("Hombre", consultar_runt=runt, captcha=captcha_lento, consultas_edge=en_chrome)
+        await self.verificar_cola("Hombre", por_sitio={"runt": runt}, captcha=captcha_lento, consultas_edge=en_chrome)
         self.assertEqual(sorted(claves), ["consilium", "fbi"])
+
+    async def test_ventana_de_captcha_que_no_responde_se_cambia_y_se_repite_una_vez(self):
+        paginas = []
+
+        async def antecedentes(page, persona, turnos, listo):
+            paginas.append(page)
+            if len(paginas) == 1:
+                raise main.FueraDeServicio(documentos.SIN_RESPUESTA)
+            return Path("antecedentes.pdf")
+
+        await self.verificar_cola("Hombre", por_sitio={"antecedentes": antecedentes})
+        self.assertEqual(len(paginas), 2)
+        self.r["ventana_nueva_de"].assert_awaited_once_with("antecedentes")
+
+    async def test_sitio_caido_no_se_repite_en_otra_ventana(self):
+        async def registraduria(*args):
+            raise main.FueraDeServicio(documentos.SIN_RESPUESTA)
+
+        # La Registraduría no se repite (cada visita de más acerca el bloqueo de su Cloudflare): queda caída.
+        await self.verificar_cola("Hombre", por_sitio={"registraduria": registraduria},
+                                  caidos_esperados={"registraduria"})
+        self.r["ventana_nueva_de"].assert_not_awaited()
 
     async def test_si_la_precarga_no_abre_mientras_se_espera_se_carga_una_vez_mas(self):
         async def precarga_caida():
@@ -98,8 +128,8 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "leer_captcha", return_value="abc12"):
             self.assertEqual(await main.leer_captcha_a_tiempo(b"png"), "abc12")
 
-    async def verificar_cola(self, formato, fecha_expedicion=date(2020, 1, 1), consultar_runt=None, captcha=None,
-                             consultas_edge=None, preparar=None):
+    async def verificar_cola(self, formato, fecha_expedicion=date(2020, 1, 1), por_sitio=None, captcha=None,
+                             consultas_edge=None, preparar=None, espera_formularios=0.3, caidos_esperados=frozenset()):
         activos, maximo = 0, 0
         iniciados = []
         self.inicios = []
@@ -145,7 +175,11 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
         r["precargas"] = {clave: asyncio.create_task(asyncio.sleep(0)) for clave in (*r["ventanas"], "simit")}
         r["usos"] = dict.fromkeys(main.CON_CASILLA, 0)
         r["renovar"] = AsyncMock()
+        r["precargar"] = AsyncMock()
         r["precargar_simit"] = AsyncMock()
+        r["ventana_nueva_de"] = AsyncMock(return_value=page)
+        r["registrar"] = lambda clave, pagina: pagina
+        self.r = r
         for nombre in ("consolidado", "consolium"):
             r[nombre] = SimpleNamespace(clave=nombre, page=page,
                                        buscar=lambda persona, nombre=nombre: trabajo(nombre))
@@ -166,7 +200,8 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
                 stack.enter_context(patch.object(main, nombre, side_effect=automatico))
             for modulo, nombre in ((main, "consultar_runt"), (documentos, "consultar_antecedentes"),
                                    (documentos, "consultar_registraduria"), (documentos, "consultar_inhabilidades")):
-                propia = consultar_runt if nombre == "consultar_runt" and consultar_runt else captcha
+                clave = nombre.removeprefix("consultar_")
+                propia = (por_sitio or {}).get(clave) or captcha
                 stack.enter_context(patch.object(modulo, nombre, side_effect=propia))
             for nombre in ("log", "avisar", "abrir_paginas_chrome"):
                 stack.enter_context(patch.object(main, nombre))
@@ -180,6 +215,8 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(main, "estado_ventana", new_callable=AsyncMock))
             stack.enter_context(patch.object(main, "pagina_cargada", return_value=True))
             stack.enter_context(patch.object(main, "MARGEN_CHROME", 0))
+            stack.enter_context(patch.object(main, "ESPERA_FORMULARIOS", espera_formularios))
+            stack.enter_context(patch.object(main, "cerrar_ventana", new_callable=AsyncMock))
             stack.enter_context(patch.object(main, "consultas_edge", side_effect=consultas_edge,
                                             return_value={"fbi": Path("fbi.png"), "consilium": Path("consilium.png")}))
             capturas, caidos = await asyncio.wait_for(main.consultar_persona(
@@ -188,7 +225,7 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
                 r, AsyncMock(), Mock()), 5)
         self.assertTrue(govuk_listo.is_set())
         self.assertEqual(maximo, 2)
-        self.assertFalse(caidos)
+        self.assertEqual(caidos, set(caidos_esperados))
         esperadas = {
             "procuraduria", "simit", "libreta", "consolidado", "consolium", "ofac", "govuk",
             "eumostwanted", "bdme", "contraloria", "rnmc", "terroristas", "justicia",
@@ -199,65 +236,76 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
         if fecha_expedicion is None:
             esperadas -= {"registraduria", "rnmc", "inhabilidades"}
             self.assertNotIn("rnmc", iniciados)
-        self.assertEqual(set(capturas), esperadas)
-        # Al terminar: no queda nada abierto en el Chrome del usuario y SIMIT se deja listo para la siguiente.
+        self.assertEqual(set(capturas), esperadas - set(caidos_esperados))
+        # Al terminar: no queda nada abierto en el Chrome del usuario, y SIMIT y los formularios con captcha se dejan
+        # listos para la siguiente.
         cerrar_ventanas.assert_called_once()
         r["precargar_simit"].assert_called_once()
+        self.assertEqual({llamada.args[0] for llamada in r["precargar"].call_args_list}, set(main.PRECARGABLES))
+        self.assertFalse(r["consultando"])
 
-    async def test_precargas_esperan_al_runt_un_tiempo_y_luego_van_de_dos_en_dos(self):
-        runt_liberado = asyncio.Event()
-        otra_iniciada = asyncio.Event()
+    @staticmethod
+    def _sin_fondo():
+        """Parches para abrir_navegadores sin Buster, sin lectores reales, sin mantenimiento en reposo y sin esperar a
+        que el procesador del equipo de pruebas tenga respiro."""
+        pila = ExitStack()
+        pila.enter_context(patch.object(main, "abrir_buster", AsyncMock(return_value=None)))
+        pila.enter_context(patch.object(main, "mantener_en_reposo", new_callable=AsyncMock))
+        pila.enter_context(patch.object(main, "preparar_lectores"))
+        pila.enter_context(patch.object(main.equipo, "esperar_respiro", AsyncMock(return_value=0)))
+        return pila
+
+    @staticmethod
+    async def _cancelar(r):
+        tareas = [*r["precargas"].values(), *r.get("fondo", ())]
+        for tarea in tareas:
+            tarea.cancel()
+        await asyncio.gather(*tareas, return_exceptions=True)
+
+    async def test_al_abrir_los_formularios_con_captcha_cargan_juntos_y_simit_espera_a_que_terminen(self):
+        liberar = asyncio.Event()
         activos, maximo = 0, 0
+
         async def precargar(page, url, lista):
             nonlocal activos, maximo
             activos += 1
             maximo = max(maximo, activos)
             try:
-                if url == main.URL_RUNT:
-                    await runt_liberado.wait()
-                else:
-                    otra_iniciada.set()
-                    await asyncio.sleep(0.005)
+                await liberar.wait()
             finally:
                 activos -= 1
 
-        async def cargar(page, url, lista, **_):
-            await precargar(page, url, lista)
-
-        with patch.object(main, "PRIORIDAD_RUNT", 0.3), \
-                patch.object(main, "estado_ventana", new_callable=AsyncMock), \
+        with self._sin_fondo(), patch.object(main, "estado_ventana", new_callable=AsyncMock), \
                 patch.object(main, "abrir_perfil_runt", AsyncMock(return_value=None)), \
                 patch.object(documentos, "precargar", side_effect=precargar), \
-                patch.object(main, "cargar_pagina", side_effect=cargar) as cargar_pagina, \
+                patch.object(main, "cargar_pagina", new_callable=AsyncMock) as cargar_pagina, \
                 patch.object(main, "cerrar_aviso_simit", new_callable=AsyncMock), \
                 patch.object(main, "Documento"), patch.object(rendimiento, "log"):
             r = await main.abrir_navegadores(self._playwright_falso())
             try:
                 await asyncio.sleep(0.05)
-                self.assertFalse(otra_iniciada.is_set())
-                # Si el RUNT tarda más que su prioridad, las demás ya no lo esperan.
-                await asyncio.wait_for(otra_iniciada.wait(), 2)
-                self.assertFalse(r["precargas"]["runt"].done())
-                runt_liberado.set()
-                await asyncio.gather(*r["precargas"].values())
+                self.assertEqual(maximo, len(main.PRECARGABLES))
+                # SIMIT (con su validación de seguridad, que ocupa el equipo) espera a los formularios.
+                cargar_pagina.assert_not_awaited()
+                liberar.set()
+                await asyncio.wait_for(asyncio.gather(*r["precargas"].values()), 2)
+                self.assertEqual(cargar_pagina.call_args.args[1:], (main.URL_SIMIT, main.formulario_simit_listo))
             finally:
-                for tarea in r["precargas"].values():
-                    tarea.cancel()
-                await asyncio.gather(*r["precargas"].values(), return_exceptions=True)
-        self.assertEqual(maximo, 2)
-        # SIMIT también queda listo de antemano, dentro del mismo límite.
-        self.assertEqual(cargar_pagina.call_args.args[1:], (main.URL_SIMIT, main.formulario_simit_listo))
+                await self._cancelar(r)
 
-    async def test_precargas_y_documentos_siguen_apenas_termina_el_runt(self):
+    async def test_al_abrir_documentos_y_lectores_cargan_tras_los_formularios(self):
         cargado = asyncio.Event()
+        orden = []
+
         async def precargar(page, url, lista):
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            orden.append(url)
 
         async def cargar(page):
+            orden.append("documento")
             cargado.set()
 
-        with patch.object(main, "PRIORIDAD_RUNT", 30), \
-                patch.object(main, "estado_ventana", new_callable=AsyncMock), \
+        with self._sin_fondo(), patch.object(main, "estado_ventana", new_callable=AsyncMock), \
                 patch.object(main, "abrir_perfil_runt", AsyncMock(return_value=None)), \
                 patch.object(main, "cargar_consolidado", cargar), \
                 patch.object(documentos, "precargar", side_effect=precargar) as precargas, \
@@ -266,18 +314,18 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "Documento") as documento, patch.object(rendimiento, "log"):
             r = await main.abrir_navegadores(self._playwright_falso())
             try:
-                await asyncio.wait_for(asyncio.gather(*r["precargas"].values()), 2)
                 carga_del_documento = documento.call_args_list[0].args[1]
                 await asyncio.wait_for(carga_del_documento(Mock()), 2)
                 self.assertTrue(cargado.is_set())
+                self.assertEqual(orden[-1], "documento")
+                await asyncio.wait_for(r["fondo"][0], 2)
+                main.preparar_lectores.assert_called_once()
                 # La Registraduría no se precarga: cada visita de más acerca el bloqueo de su Cloudflare.
                 cargadas = {llamada.args[1] for llamada in precargas.call_args_list}
                 self.assertNotIn(documentos.URL_REGISTRADURIA, cargadas)
                 self.assertIn(documentos.URL_INHABILIDADES, cargadas)
             finally:
-                for tarea in r["precargas"].values():
-                    tarea.cancel()
-                await asyncio.gather(*r["precargas"].values(), return_exceptions=True)
+                await self._cancelar(r)
 
     @staticmethod
     def _playwright_falso():
@@ -297,7 +345,7 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
             renovadas.append(clave)
 
         normal, lenta = Mock(), Mock()
-        r = {"usos": dict.fromkeys(main.CON_CASILLA, 0), "renovar": renovar, "precargas": {},
+        r = {"usos": dict.fromkeys(main.CON_CASILLA, 0), "renovar": renovar, "precargas": {}, "buster": None,
              "ventanas": {clave: Mock(context=normal) for clave in main.CON_CASILLA}}
         with patch.object(main, "log"):
             for _ in range(main.RENOVAR_CADA - 1):
@@ -328,16 +376,19 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
 
         p = self._playwright_falso()
         p.chromium.launch.return_value.new_context.return_value.new_page = AsyncMock(side_effect=nueva_pagina)
-        with patch.object(main, "estado_ventana", new_callable=AsyncMock), \
+        with self._sin_fondo(), patch.object(main, "estado_ventana", new_callable=AsyncMock), \
                 patch.object(main, "abrir_perfil_runt", AsyncMock(return_value=None)), \
                 patch.object(documentos, "precargar", side_effect=precargar), \
                 patch.object(main, "cargar_pagina", new_callable=AsyncMock), \
                 patch.object(main, "cerrar_aviso_simit", new_callable=AsyncMock), \
                 patch.object(main, "Documento"), patch.object(rendimiento, "log"):
             r = await main.abrir_navegadores(p)
-            await asyncio.wait_for(asyncio.gather(*r["precargas"].values()), 2)
-            vieja = r["ventanas"]["antecedentes"]
-            await asyncio.wait_for(r["renovar"]("antecedentes"), 2)
+            try:
+                await asyncio.wait_for(asyncio.gather(*r["precargas"].values()), 2)
+                vieja = r["ventanas"]["antecedentes"]
+                await asyncio.wait_for(r["renovar"]("antecedentes"), 2)
+            finally:
+                await self._cancelar(r)
         nueva = r["ventanas"]["antecedentes"]
         self.assertIsNot(nueva, vieja)
         vieja.context.close.assert_awaited_once()
@@ -393,6 +444,98 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("usuario=0.00s", next(l for l in lineas if "fallo:" in l))
         self.assertIn("carga=0.00s", next(l for l in lineas if "otro:" in l))
         self.assertIsNone(rendimiento._medicion.get())
+
+    @staticmethod
+    def _recursos_en_reposo():
+        hecha = asyncio.get_running_loop().create_future()
+        hecha.set_result(None)
+        urls = {"runt": main.URL_RUNT, "antecedentes": documentos.URL_ANTECEDENTES,
+                "inhabilidades": documentos.URL_INHABILIDADES, "registraduria": documentos.URL_REGISTRADURIA}
+        return {
+            "ventanas": {clave: Mock(url=url, is_closed=Mock(return_value=False)) for clave, url in urls.items()},
+            "formularios": {clave: (url, None) for clave, url in urls.items()},
+            "precargas": dict.fromkeys((*urls, "simit"), hecha),
+            "precargar": AsyncMock(), "precargar_simit": AsyncMock(), "simit_cargado_en": time.monotonic(),
+            "ultima_actividad": time.monotonic(),
+        }
+
+    async def test_al_copiar_una_fila_se_cargan_los_formularios_que_vencerian(self):
+        r = self._recursos_en_reposo()
+        with patch.object(carga, "_precargadas", WeakKeyDictionary()):
+            # Inhabilidades, precargada hace 10 s, sirve 150 s; Antecedentes, hace 60 s, vencería antes de usarla.
+            carga.marcar_precarga(r["ventanas"]["inhabilidades"], documentos.URL_INHABILIDADES)
+            carga._precargadas[r["ventanas"]["antecedentes"]] = (documentos.URL_ANTECEDENTES, time.monotonic() - 60)
+            r["consultando"] = True
+            main.anticipar(r)
+            r["precargar"].assert_not_called()
+            r["consultando"] = False
+            main.anticipar(r)
+        # El RUNT, con su aplicación abierta, vuelve al formulario en 1-2 s; la Registraduría no se precarga.
+        self.assertEqual([llamada.args[0] for llamada in r["precargar"].call_args_list], ["antecedentes"])
+        r["precargar_simit"].assert_not_called()
+        await asyncio.gather(*r["precargas"].values())
+        # SIMIT a punto de vencer también se deja listo.
+        r["simit_cargado_en"] = time.monotonic() - main.VIGENCIA_SIMIT
+        main.anticipar(r)
+        r["precargar_simit"].assert_called_once()
+        await asyncio.gather(*r["precargas"].values())
+
+    async def test_en_reposo_simit_se_recarga_antes_de_vencer_y_nunca_durante_una_consulta(self):
+        r = self._recursos_en_reposo()
+        r["precargar_simit"] = AsyncMock(side_effect=lambda: r.update(simit_cargado_en=time.monotonic()))
+        r["simit_cargado_en"] = time.monotonic() - main.VIGENCIA_SIMIT
+        r["consultando"] = True
+        with patch.object(main, "PERIODO_REPOSO", 0.01), patch.object(main.equipo, "saturado", return_value=False):
+            tarea = asyncio.create_task(main.mantener_en_reposo(r))
+            try:
+                await asyncio.sleep(0.05)
+                r["precargar_simit"].assert_not_called()
+                r["consultando"] = False
+                await asyncio.sleep(0.05)
+                # Una sola vez: recién cargado, no vuelve a cargarse hasta que esté por vencer.
+                r["precargar_simit"].assert_called_once()
+                # Sin actividad en mucho tiempo ya no se mantiene.
+                r["simit_cargado_en"] = time.monotonic() - main.VIGENCIA_SIMIT
+                r["ultima_actividad"] = time.monotonic() - main.REPOSO_MAXIMO - 1
+                await asyncio.sleep(0.05)
+                r["precargar_simit"].assert_called_once()
+            finally:
+                tarea.cancel()
+                await asyncio.gather(tarea, r["precargas"]["simit"], return_exceptions=True)
+
+    async def test_escalonado_espera_los_formularios_llenos_con_tope(self):
+        turnos = documentos.Turnos()
+        asyncio.get_running_loop().call_later(0.02, turnos.preparado, "runt")
+        self.assertTrue(await turnos.esperar_preparados(["runt"], 1))
+        self.assertFalse(await turnos.esperar_preparados(["runt", "antecedentes"], 0.05))
+        # Pedir turno es tener el formulario lleno.
+        async with turnos.turno("antecedentes", time.monotonic, AsyncMock()):
+            pass
+        self.assertTrue(await turnos.esperar_preparados(["runt", "antecedentes"], 0.05))
+        self.assertTrue(await turnos.esperar_preparados([], 0))
+
+    async def test_casilla_atascada_con_aviso_de_cuota_se_recarga_sin_esperar(self):
+        page = Mock(evaluate=AsyncMock(return_value=False), on=Mock(), remove_listener=Mock())
+        page.locator.return_value.count = AsyncMock(return_value=1)
+        recuadro = Mock()
+        recuadro.content_frame.locator.return_value.is_visible = AsyncMock(return_value=False)
+        with patch.object(documentos, "casilla_atascada", AsyncMock(return_value=True)), \
+                patch.object(documentos, "aviso_de_cuota", AsyncMock(return_value=True)), \
+                patch.object(documentos, "ESPERA_CON_CUOTA", 0.1), \
+                patch.object(documentos, "avisar"), patch.object(documentos, "log"):
+            inicio = time.monotonic()
+            with self.assertRaisesRegex(documentos.FueraDeServicio, "cuota"):
+                await documentos.esperar_recaptcha(page, "Prueba", recuadro)
+        # Sin esperar los ESPERA_CASILLA s de una casilla atascada sin ese aviso.
+        self.assertLess(time.monotonic() - inicio, documentos.ESPERA_CASILLA / 3)
+
+    def test_vigencia_de_precarga_por_sitio(self):
+        self.assertEqual(documentos.vigencia_precarga("registraduria"), carga.VIGENCIA_PRECARGA)
+        margen = documentos.VIGENCIA_CAPTCHA - carga.VIGENCIA_PRECARGA
+        for clave in ("antecedentes", "inhabilidades"):
+            self.assertEqual(documentos.vigencia_precarga(clave), documentos.VIGENCIAS[clave] - margen)
+        # La sesión de Antecedentes vence a los 2 minutos: su vigencia queda por debajo.
+        self.assertLess(documentos.vigencia("antecedentes"), 120)
 
     def test_concurrencia_moderada_segun_equipo(self):
         for nucleos, ram, esperado in ((16, 16000, 4), (8, 1500, 3), (2, 4000, 2)):

@@ -1,6 +1,15 @@
 # Lo que ve cada equipo en la ventana de novedades al actualizarse. Lo más nuevo arriba.
 # Cada versión empieza con una línea «== título ==» distinta; cada cambio, con «- ». Las líneas con # no se muestran.
 
+== 27 de octubre de 2026 (consultas más rápidas) ==
+- Al empezar la consulta, las páginas con captcha (RUNT, Registraduría, Antecedentes e Inhabilidades) cargan primero, con el equipo para ellas; lo demás empieza cuando están listas. Antes, con todo a la vez, tardaban 1-2 minutos en abrir.
+- Con PaginasBOT abierto, esas páginas y SIMIT quedan listas de antemano: al terminar cada consulta, al copiar la fila siguiente y mientras está en reposo. Déjalo abierto durante el día: la primera consulta después de abrirlo es la más lenta.
+- El RUNT vuelve a su formulario con un código nuevo en 1-2 segundos, sin cargarse entero.
+- Si una página con captcha se queda cargando, se carga a la vez en otra ventana y vale la que abra primero.
+- Si la casilla «No soy un robot» se traba porque Google avisa que el sitio superó su cuota, se recarga en segundos en vez de esperar un minuto. Antecedentes lo reintenta en vez de quedar fuera de servicio.
+- Si la ventana del RUNT, Antecedentes o Inhabilidades se queda sin responder, la consulta se repite una vez en otra ventana.
+- PaginasBOT mide qué tan ocupado está el equipo: lo que puede esperar no arranca con el procesador al límite. Cerrar programas pesados mientras consultas (por ejemplo Visual Studio Code) también ayuda.
+
 == 22 de octubre de 2026 (Registraduría) ==
 - La Registraduría ya no se carga al abrir PaginasBOT, solo al consultar: cada visita de más acerca su «Acceso bloqueado», que bloquea la conexión de toda la oficina.
 - Si la Registraduría bloqueó la conexión, durante 15 minutos no se vuelve a abrir (eso alarga el bloqueo): se marca Fuera de Servicio de una vez.

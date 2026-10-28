@@ -11,3 +11,18 @@ salidas/
 log.txt
 # Verificación de Cloudflare pasada (cookie de sesión del navegador)
 cookies_cloudflare.json
+
+# Entrenamiento del captcha del RUNT: datos generados y pesados
+entrenamiento_runt/dataset_sintetico/
+entrenamiento_runt/reales_sin_etiquetar/
+entrenamiento_runt/dddd_trainer/projects/*/cache/
+entrenamiento_runt/dddd_trainer/projects/*/checkpoints/
+entrenamiento_runt/prueba_tmp/
+
+entrenamiento_runt/colab_paquete.zip
+entrenamiento_runt/reales_entrenamiento.zip
+
+# Perfil del navegador con Buster (cookies y caché)
+PaginasBOT/perfil_buster/
+
+PaginasBOT/perfil_consilium/

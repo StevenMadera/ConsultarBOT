@@ -23,8 +23,8 @@ from playwright.async_api import async_playwright
 import comun
 from captura_navegador import PANTALLA
 from comun import NOMBRE, RAIZ, log
-from main import (CAMPOS, FORMATO, SEXOS, abrir_navegadores, carpeta_salidas, cerrar_navegadores, minutos, parece_fila,
-                  partir_fila, procesar, sin_fecha_expedicion, sitios_de, validar)
+from main import (CAMPOS, FORMATO, SEXOS, abrir_navegadores, anticipar, carpeta_salidas, cerrar_navegadores, minutos,
+                  parece_fila, partir_fila, procesar, sin_fecha_expedicion, sitios_de, validar)
 
 # actualizar.py está en la carpeta que contiene las apps; si PaginasBOT se copió sola, no hay botón de actualizar.
 sys.path.append(str(RAIZ.parent))
@@ -235,6 +235,7 @@ class Interfaz:
         self.bucle = asyncio.new_event_loop()
         self.personas = asyncio.Queue()
         self.sesion = None
+        self.apertura = None
         comun.escuchar(lambda tipo, datos: self.eventos.put((tipo, datos)))
         threading.Thread(target=self._hilo_bot, daemon=True).start()
         if actualizar:
@@ -510,6 +511,7 @@ class Interfaz:
                 len(campos) == len(CAMPOS) or parece_fila(campos)):
             return None
         self._llenar(campos)
+        self._anticipar()
         return "break"
 
     def _vigilar_portapapeles(self):
@@ -545,6 +547,7 @@ class Interfaz:
         if self.estado == "resultado":
             self._nueva()
         vacia = self._llenar(campos)
+        self._anticipar()
         if self.root.state() == "iconic":
             self.root.deiconify()
         dar_foco(self.hwnd)
@@ -685,7 +688,7 @@ class Interfaz:
     async def _sesion(self):
         self.sesion = asyncio.current_task()
         async with async_playwright() as p:
-            apertura = asyncio.create_task(abrir_navegadores(p))
+            apertura = self.apertura = asyncio.create_task(abrir_navegadores(p))
             apertura.add_done_callback(self._navegadores_listos)
             try:
                 while True:
@@ -707,6 +710,19 @@ class Interfaz:
     def _cancelar_sesion(self):
         if self.sesion:
             self.sesion.cancel()
+
+    def _anticipar(self):
+        """Con una fila copiada, la consulta empieza en unos segundos: el bot deja listos ya los formularios con captcha
+        que para entonces habrían vencido."""
+        def en_el_bot():
+            apertura = self.apertura
+            if apertura and apertura.done() and not apertura.cancelled() and not apertura.exception():
+                anticipar(apertura.result())
+
+        try:
+            self.bucle.call_soon_threadsafe(en_el_bot)
+        except RuntimeError:
+            pass
 
     async def preguntar(self, mensaje: str, **datos) -> str:
         return await asyncio.to_thread(self._preguntar_con_pantalla, mensaje, datos)
