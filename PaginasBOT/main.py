@@ -2003,6 +2003,8 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
     inicio = time.monotonic()
     capturas: dict[str, Path] = {}
     caidos: set[str] = set()
+    # Si se detiene la consulta, el informe se arma con lo que alcanzó a capturarse.
+    r["parciales"] = (capturas, caidos)
     limite = asyncio.Semaphore(limite_concurrencia())
     # Un captcha a la vez: mientras se resuelve uno, los demás sitios ya se están llenando o procesando el suyo.
     turnos = documentos.Turnos()
@@ -2322,7 +2324,24 @@ async def procesar(persona: dict, apertura: asyncio.Task, preguntar, preguntar_e
         + (f"expedición {expedicion:%d/%m/%Y}" if expedicion else "sin fecha de expedición")
         + f" | {persona['sexo']} | apellido RUNT: {primer_apellido(persona['nombre'])}"
     )
-    capturas, caidos = await consultar_persona(persona, await apertura, preguntar, preguntar_edge)
+    r = await apertura
+    consulta = asyncio.create_task(consultar_persona(persona, r, preguntar, preguntar_edge))
+    detener = persona.get("detener")
+    if detener:
+        parada = asyncio.create_task(detener.wait())
+        await asyncio.wait({consulta, parada}, return_when=asyncio.FIRST_COMPLETED)
+        parada.cancel()
+    if consulta.done():
+        capturas, caidos = consulta.result()
+    else:
+        log("Consulta detenida por el usuario: el informe lleva lo capturado hasta ahora.")
+        consulta.cancel()
+        # Una captura de Chrome en su hilo no se puede interrumpir: no se la espera.
+        await asyncio.wait({consulta}, timeout=15)
+        capturas, caidos = dict(r["parciales"][0]), set(r["parciales"][1])
+        await asyncio.to_thread(cerrar_ventanas_abiertas)
+        if r["precargas"]["simit"].done():
+            r["precargas"]["simit"] = asyncio.create_task(r["precargar_simit"]())
     ruta = insertar_en_pdf(capturas, persona, caidos) if capturas else None
     if ruta:
         log(f"PDF: {ruta}")

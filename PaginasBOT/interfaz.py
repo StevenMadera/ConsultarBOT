@@ -317,6 +317,8 @@ class Interfaz:
         registro = ttk.Label(v, text="Ver registro", style="Enlace.TLabel", cursor="hand2")
         registro.pack(anchor="e")
         registro.bind("<Button-1>", lambda _: os.startfile(RAIZ / "log.txt"))
+        self.boton_detener = ttk.Button(v, text="Detener consulta", command=self._detener)
+        self.boton_detener.pack(anchor="w")
         return v
 
     def _armar_resultado(self) -> ttk.Frame:
@@ -575,14 +577,36 @@ class Interfaz:
         persona = self._validar()
         if persona is None:
             return
+        self.detener = persona["detener"] = asyncio.Event()
         try:
             self.bucle.call_soon_threadsafe(self.personas.put_nowait, persona)
         except RuntimeError:
             self._mostrar_error(f"El bot se detuvo. Cierra {NOMBRE} y vuelve a abrirlo; el motivo está en el registro.")
             return
         self.estado = "consultando"
+        self.detenida = False
+        self.boton_detener.configure(state="normal", text="Detener consulta")
         self.accion, self.capturando = None, ()
         self._preparar_progreso(persona)
+        self._mostrar()
+
+    def _detener(self):
+        if self.estado != "consultando" or self.detenida:
+            return
+        if not messagebox.askyesno(NOMBRE, "¿Detener la consulta? El informe se armará con las páginas ya capturadas.",
+                                   parent=self.root):
+            return
+        self.detenida = True
+        self.boton_detener.configure(state="disabled", text="Deteniendo…")
+        self.linea_estado.configure(text="Deteniendo la consulta y armando el PDF con lo capturado…")
+        for pregunta in self.preguntas:
+            if not pregunta["futuro"].done():
+                pregunta["futuro"].set_exception(RuntimeError("Consulta detenida."))
+        self.preguntas.clear()
+        try:
+            self.bucle.call_soon_threadsafe(self.detener.set)
+        except RuntimeError:
+            pass
         self._mostrar()
 
     def _nueva(self):
@@ -763,6 +787,10 @@ class Interfaz:
             return
         self.estado = "resultado"
         self.ruta = ruta
+        if self.detenida:
+            for clave, estado in self.sitios.items():
+                if estado not in TERMINADOS:
+                    self.sitios[clave], self.detalles[clave] = "error", "se detuvo la consulta"
         self.accion, self.capturando = None, ()
         self.tiempo.configure(text=minutos(time.monotonic() - self.inicio))
         if ruta:

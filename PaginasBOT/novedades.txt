@@ -1,6 +1,9 @@
 # Lo que ve cada equipo en la ventana de novedades al actualizarse. Lo más nuevo arriba.
 # Cada versión empieza con una línea «== título ==» distinta; cada cambio, con «- ». Las líneas con # no se muestran.
 
+== 29 de octubre de 2026 (botón Detener consulta) ==
+- Mientras se consulta hay un botón «Detener consulta»: si algo se demora mucho, se detiene y el informe se arma con las páginas ya capturadas. Las que faltaron quedan como fallidas y se pueden reintentar.
+
 == 29 de octubre de 2026 (Justice.gov en descanso) ==
 - Justice.gov queda «Fuera de servicio» sin abrirse. Desde el 28 de octubre su cuenta regresiva («Your request is being processed…») se repite sin fin desde cualquier conexión, también desde celulares y con VPN: el problema es del sitio. Así se deja descansar; cuando vuelva a mostrar la búsqueda, el bot la consultará de nuevo.
 - El bot ya no reinicia la conexión de red del equipo después de actualizarse.
