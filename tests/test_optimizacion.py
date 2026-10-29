@@ -75,6 +75,17 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
         await self.verificar_cola("Hombre", consultar_runt=runt, captcha=captcha_lento, consultas_edge=en_chrome)
         self.assertEqual(sorted(claves), ["consilium", "fbi"])
 
+    async def test_justice_en_descanso_no_se_visita_y_queda_fuera_de_servicio(self):
+        real = main.consultas_edge
+
+        def en_chrome(persona, preguntar, pedidas, antes, caidos):
+            # Justice.gov pasa por la función de verdad, que la da por caída sin abrirla.
+            if pedidas == ["justicia"]:
+                return real(persona, preguntar, pedidas, antes, caidos)
+            return {clave: Path(f"{clave}.png") for clave in pedidas}
+
+        await self.verificar_cola("Hombre", consultas_edge=en_chrome, descanso=True)
+
     async def test_si_la_precarga_no_abre_mientras_se_espera_se_carga_una_vez_mas(self):
         async def precarga_caida():
             await asyncio.sleep(0.05)
@@ -99,7 +110,7 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await main.leer_captcha_a_tiempo(b"png"), "abc12")
 
     async def verificar_cola(self, formato, fecha_expedicion=date(2020, 1, 1), consultar_runt=None, captcha=None,
-                             consultas_edge=None, preparar=None):
+                             consultas_edge=None, preparar=None, descanso=False):
         activos, maximo = 0, 0
         iniciados = []
         self.inicios = []
@@ -180,6 +191,7 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(main, "estado_ventana", new_callable=AsyncMock))
             stack.enter_context(patch.object(main, "pagina_cargada", return_value=True))
             stack.enter_context(patch.object(main, "MARGEN_CHROME", 0))
+            stack.enter_context(patch.object(main.consulta_justicia, "DESCANSO", descanso))
             stack.enter_context(patch.object(main, "consultas_edge", side_effect=consultas_edge,
                                             return_value={"fbi": Path("fbi.png"), "consilium": Path("consilium.png")}))
             capturas, caidos = await asyncio.wait_for(main.consultar_persona(
@@ -188,7 +200,7 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
                 r, AsyncMock(), Mock()), 5)
         self.assertTrue(govuk_listo.is_set())
         self.assertEqual(maximo, 2)
-        self.assertFalse(caidos)
+        self.assertEqual(caidos, {"justicia"} if descanso else set())
         esperadas = {
             "procuraduria", "simit", "libreta", "consolidado", "consolium", "ofac", "govuk",
             "eumostwanted", "bdme", "contraloria", "rnmc", "terroristas", "justicia",
@@ -199,6 +211,9 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
         if fecha_expedicion is None:
             esperadas -= {"registraduria", "rnmc", "inhabilidades"}
             self.assertNotIn("rnmc", iniciados)
+        if descanso:
+            esperadas.discard("justicia")
+            self.assertNotIn("justicia", iniciados)
         self.assertEqual(set(capturas), esperadas)
         # Al terminar: no queda nada abierto en el Chrome del usuario y SIMIT se deja listo para la siguiente.
         cerrar_ventanas.assert_called_once()

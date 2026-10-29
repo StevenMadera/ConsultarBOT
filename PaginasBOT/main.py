@@ -26,6 +26,7 @@ import documentos
 from documentos import estado_ventana
 from consulta_consilium import TITULO_CONSILIUM, consultar_consilium, url_consilium
 from consulta_fbi import TITULO_FBI, consultar_fbi, url_fbi
+import consulta_justicia
 from consulta_justicia import TITULO_JUSTICIA, consultar_justicia, url_justicia
 from consulta_terroristas import TITULO_TERRORISTAS, consultar_terroristas, url_terroristas
 from ocr import buscar_tesseract
@@ -1981,7 +1982,8 @@ def consultas_edge(persona: dict, preguntar, claves: list[str], antes: set[int] 
             log(f"Captura {clave}: {capturas[clave]}")
             avisar("sitio", clave=clave, estado="listo")
         except FueraDeServicio as e:
-            capturas[clave] = e.captura
+            if e.captura:
+                capturas[clave] = e.captura
             caidos.add(clave)
             log(f"FUERA DE SERVICIO {clave}: {e}; en el informe va la página caída: {e.captura}")
             avisar("sitio", clave=clave, estado="fuera_servicio", detalle=str(e))
@@ -2107,10 +2109,13 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
                     await aislado.close()
             await en_cupo(clave, consultar)
 
-        await asyncio.gather(
-            sitio("terroristas", url_terroristas(persona), TITULO_TERRORISTAS),
-            sitio("justicia", url_justicia(persona), TITULO_JUSTICIA),
-        )
+        sitios = [sitio("terroristas", url_terroristas(persona), TITULO_TERRORISTAS)]
+        if consulta_justicia.DESCANSO:
+            # No se visita: en Chrome se da por caída sin abrirla.
+            a_chrome.append("justicia")
+        else:
+            sitios.append(sitio("justicia", url_justicia(persona), TITULO_JUSTICIA))
+        await asyncio.gather(*sitios)
 
     async def con_captcha(clave: str, consulta, *args):
         async def ejecutar():

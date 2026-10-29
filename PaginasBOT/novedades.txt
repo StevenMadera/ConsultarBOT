@@ -1,6 +1,10 @@
 # Lo que ve cada equipo en la ventana de novedades al actualizarse. Lo más nuevo arriba.
 # Cada versión empieza con una línea «== título ==» distinta; cada cambio, con «- ». Las líneas con # no se muestran.
 
+== 29 de octubre de 2026 (Justice.gov en descanso) ==
+- Justice.gov queda «Fuera de servicio» sin abrirse. Desde el 28 de octubre su cuenta regresiva («Your request is being processed…») se repite sin fin desde cualquier conexión, también desde celulares y con VPN: el problema es del sitio. Así se deja descansar; cuando vuelva a mostrar la búsqueda, el bot la consultará de nuevo.
+- El bot ya no reinicia la conexión de red del equipo después de actualizarse.
+
 == 22 de octubre de 2026 (Registraduría) ==
 - La Registraduría ya no se carga al abrir PaginasBOT, solo al consultar: cada visita de más acerca su «Acceso bloqueado», que bloquea la conexión de toda la oficina.
 - Si la Registraduría bloqueó la conexión, durante 15 minutos no se vuelve a abrir (eso alarga el bloqueo): se marca Fuera de Servicio de una vez.

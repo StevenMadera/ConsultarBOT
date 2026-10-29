@@ -128,25 +128,6 @@ def explicar(detalle: str) -> str:
         return "no se pudo conectar con el sitio"
     return detalle if len(detalle) <= 110 else detalle[:109] + "…"
 
-def reiniciar_conexion_red():
-    """Libera y renueva la IP de Windows para saltar límites de descarga."""
-    try:
-        log("Reiniciando dirección IP para refrescar límites...")
-        # Liberar la IP de forma global (aplica a lo que esté conectado)
-        subprocess.run(["ipconfig", "/release"], capture_output=True, text=True, check=False, creationflags=subprocess.CREATE_NO_WINDOW)
-        
-        # Pequeña pausa para asegurar que el router procese la desconexión
-        time.sleep(2)
-        
-        # Solicitar la nueva IP pública/local
-        subprocess.run(["ipconfig", "/renew"], capture_output=True, text=True, check=False, creationflags=subprocess.CREATE_NO_WINDOW)
-        
-        # Limpiar caché DNS por si acaso
-        subprocess.run(["ipconfig", "/flushdns"], capture_output=True, text=True, check=False, creationflags=subprocess.CREATE_NO_WINDOW)
-        log("IP reiniciada correctamente.")
-    except Exception as e:
-        log(f"No se pudo reiniciar la red de forma automática: {e}")
-
 
 def novedades_pendientes() -> list[tuple[str, list[str]]]:
     """Las versiones de novedades.txt que este equipo aún no vio, la más nueva primero."""
@@ -797,7 +778,8 @@ class Interfaz:
         caidos = [f"!  {SITIOS[clave]}: fuera de servicio, {explicar(self.detalles.get(clave) or 'no respondió')}."
                   for clave, estado in self.sitios.items() if estado == "fuera_servicio"]
         if caidos:
-            caidos.append("En el informe van sus páginas caídas, marcadas en la portada como «Fuera de servicio».")
+            caidos.append("Quedan marcadas en la portada como «Fuera de servicio»; si se alcanzaron a abrir, en el "
+                          "informe va su página caída.")
         no_aplica = [SITIOS[clave] for clave, estado in self.sitios.items() if estado == "no_aplica"]
         omitidos = (f"Sin fecha de expedición se omitieron: {', '.join(self.omitidos)}." if self.omitidos else "")
         for etiqueta, texto in ((self.fallos, "\n".join(fallos)), (self.caidos, "\n".join(caidos)),
@@ -902,47 +884,6 @@ class Interfaz:
             self.eventos.put(("actualizado", {"error": None}))
         except Exception as e:
             self.eventos.put(("actualizado", {"error": primera_linea(e)}))
-        finally:
-            # === REINICIO DE IP AUTOMÁTICO SEGÚN EL ADAPTADOR ACTIVO ===
-            try:
-                # 1. Detectar cuál interfaz tiene internet en este momento
-                comando_interfaces = subprocess.run(
-                    ["netsh", "interface", "ipv4", "show", "interfaces"], 
-                    capture_output=True, text=True, check=False, creationflags=0x08000000
-                )
-                
-                # Buscar el nombre del adaptador que esté conectado (estado "connected" o "conectado")
-                adaptador = None
-                lineas = comando_interfaces.stdout.splitlines()
-                for linea in lineas:
-                    # Filtramos líneas que muestren estado conectado y extraemos el nombre al final
-                    if "connected" in linea.lower() or "conectado" in linea.lower():
-                        # El nombre suele estar al final de la línea en el comando netsh
-                        partes = linea.split()
-                        if len(partes) > 4:
-                            # Unimos el nombre en caso de que tenga espacios (ej: "Ethernet 2")
-                            adaptador = " ".join(partes[4:])
-                            break
-                
-                # Si no detecta ninguno activo, usamos "Wi-Fi" por defecto por seguridad
-                if not adaptador:
-                    adaptador = "Wi-Fi"
-                    
-                # 2. Ejecutar el ciclo de reinicio en el adaptador detectado
-                # Liberamos la IP
-                subprocess.run(["ipconfig", "/release", adaptador], capture_output=True, check=False, creationflags=0x08000000)
-                
-                # Espera de 10 segundos para que el módem del proveedor asigne una nueva IP pública
-                time.sleep(10) 
-                
-                # Solicitamos la nueva IP
-                subprocess.run(["ipconfig", "/renew", adaptador], capture_output=True, check=False, creationflags=0x08000000)
-                subprocess.run(["ipconfig", "/flushdns"], capture_output=True, check=False, creationflags=0x08000000)
-                
-            except Exception:
-                pass
-            # ==========================================================
-
 
     def _al_actualizado(self, error: str | None):
         if self.estado != "actualizando":

@@ -9,8 +9,18 @@ from unittest.mock import MagicMock, Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "PaginasBOT"))
 try:
     import captura_navegador as captura
+    import consulta_justicia as justicia
 finally:
     sys.path.pop(0)
+
+
+class JusticiaTests(unittest.TestCase):
+    def test_en_descanso_queda_fuera_de_servicio_sin_abrir_el_sitio(self):
+        with patch.object(justicia, "DESCANSO", True), patch.object(justicia, "capturar_navegador") as capturar:
+            with self.assertRaisesRegex(justicia.FueraDeServicio, "descanso") as error:
+                justicia.consultar_justicia({"numero": "1", "nombre": "Ana Perez"})
+        self.assertIsNone(error.exception.captura)
+        capturar.assert_not_called()
 
 
 class CierreNavegadorTests(unittest.TestCase):

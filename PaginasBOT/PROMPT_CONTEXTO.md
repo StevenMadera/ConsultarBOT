@@ -22,7 +22,7 @@ Dada una fila de Excel con `nombre, documento, empresa, fecha consulta, quien co
 - Una clase `Trabajador` (hilo con su propio navegador Playwright, que se abre con la primera tarea y se reutiliza; solo se recarga la página antes de cada consulta). Cada página es una función `consultar_*(page, persona) -> Path` y un trabajador en el diccionario `trabajadores`.
 - El captcha del RUNT lo escribe el usuario en la consola (cola `solicitudes_captcha`). No se resuelve automáticamente: es una decisión tomada, no se debe automatizar.
 - La consola toma el foco al pedir el captcha (`enfocar_consola`). No se fija encima de las demás ventanas: así tapaba y bloqueaba la parte baja de la pantalla.
-- El FBI y Consilium se abren en Chrome al empezar la consulta (ventanas minimizadas que cargan mientras se resuelven los captchas) y se capturan al final, porque necesitan la pantalla y pueden pedir la verificación manual. State.gov y Justice van en el navegador automático; solo si este falla se capturan en Chrome.
+- El FBI y Consilium se abren en Chrome al empezar la consulta (ventanas minimizadas que cargan mientras se resuelven los captchas) y se capturan al final, porque necesitan la pantalla y pueden pedir la verificación manual. State.gov va en el navegador automático; solo si este falla se captura en Chrome. Justice.gov está en descanso (`consulta_justicia.DESCANSO`): queda fuera de servicio sin abrirse.
 - `UBICACION_PDF[sexo]` indica dónde va cada captura en cada plantilla: `(página 0-based, hueco)`. Huecos: `arriba` (entre los dos cuadros de título), `abajo` (desde el segundo cuadro hasta el pie), `unico` (página con un solo cuadro). Las zonas se calculan leyendo los cuadros grises de la plantilla (`zona_pdf`), nunca con coordenadas fijas; las capturas se toman con la proporción del recuadro de la plantilla de la persona (`proporcion_zona(clave, sexo)`).
 - `captura_ajustada` / `ajustar_ventana_a_recuadro`: ensanchan la ventana del navegador hasta que la página completa tenga la proporción del recuadro; si la página es muy larga (ancho > `ANCHO_MAXIMO`), captura solo el inicio.
 - Nombre del PDF: `<numero> - <nombre>.pdf`; si existe, se añade ` (2)`, ` (3)`...
@@ -38,7 +38,7 @@ Dada una fila de Excel con `nombre, documento, empresa, fecha consulta, quien co
 | 6 ONU | `consolidatedLegacyByNAME.html` local | Se busca el número en el documento; se dibuja una barra tipo Ctrl+F con el conteo real y se resaltan coincidencias | pág. 4, abajo |
 | 7 GOV.UK | gov.uk | Rechaza cookies, busca el nombre | pág. 5, arriba |
 | 8 FBI | fbi.gov/wanted/fugitives?SearchableText=<nombre> | Navegador del usuario + captura de pantalla (Cloudflare bloquea la automatización; no se debe evadir) | pág. 5, abajo |
-| 9 Dpto. de Justicia | justice.gov | Playwright headless (si falla, navegador del usuario); busca el nombre | pág. 6, arriba |
+| 9 Dpto. de Justicia | justice.gov | Playwright headless (si falla, navegador del usuario); hoy en descanso (fuera de servicio sin abrirse, `DESCANSO`) | pág. 6, arriba |
 | 12 EUMOSTWANTED | eumostwanted.eu | Playwright; rechaza cookies y busca el nombre | pág. 7, abajo |
 | 13 Lista UE terroristas | consilium.europa.eu/es/search/?query=<nombre> | Igual que el FBI (Cloudflare) | pág. 8, único |
 
