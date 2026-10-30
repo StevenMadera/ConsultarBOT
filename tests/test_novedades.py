@@ -104,6 +104,20 @@ class NovedadesTests(unittest.TestCase):
         self.assertEqual(interfaz.novedades_pendientes(), [])
 
 
+class ReintentarTests(unittest.TestCase):
+    def reintentables(self, descanso: bool) -> set[str]:
+        objeto = interfaz.Interfaz.__new__(interfaz.Interfaz)
+        objeto.sitios = {"justicia": "fuera_servicio", "fbi": "listo", "runt": "error", "simit": "fuera_servicio"}
+        with patch.object(interfaz.consulta_justicia, "DESCANSO", descanso):
+            return objeto._reintentables()
+
+    def test_justice_en_descanso_no_se_reintenta(self):
+        self.assertEqual(self.reintentables(descanso=True), {"runt", "simit"})
+
+    def test_justice_activa_se_reintenta_si_cayo(self):
+        self.assertEqual(self.reintentables(descanso=False), {"justicia", "runt", "simit"})
+
+
 class PegarFilaTests(unittest.TestCase):
     def setUp(self):
         root = tk.Tk()

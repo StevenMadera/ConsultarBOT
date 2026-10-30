@@ -60,6 +60,32 @@ class SalidasTests(unittest.TestCase):
             self.assertEqual(len(doc), 1)
             self.assertIn("Plantilla de prueba", doc[0].get_text())
 
+    def test_reintento_reemplaza_el_mismo_informe_y_si_no_puede_guarda_otro(self):
+        plantilla = Path(self.temporal.name) / "plantilla.pdf"
+        with pymupdf.open() as doc:
+            doc.new_page().insert_text((72, 72), "Plantilla de prueba")
+            doc.save(plantilla)
+        persona = {"formato": "Prueba", "numero": "123456", "nombre": "Persona Prueba",
+                   "fecha_consulta": date(2020, 1, 1), "fecha_expedicion": date(2015, 1, 1)}
+        with patch.object(main, "date") as reloj, \
+                patch.object(main, "PLANTILLAS", {"Prueba": plantilla}), \
+                patch.object(main, "UBICACION_PDF", {"Prueba": {}}), \
+                patch.object(main, "rellenar_portada"), patch.object(main, "mover_chulos"), \
+                patch.object(main, "sitios_de", return_value=()), patch.object(main.documentos, "ORDEN", ()), \
+                patch.object(main, "log") as log:
+            reloj.today.return_value = date(2026, 10, 20)
+            primera = main.insertar_en_pdf({}, persona)
+            primera.write_bytes(b"informe anterior")
+            reemplazo = main.insertar_en_pdf({}, persona, ruta=primera)
+            # Si no se puede escribir encima (por ejemplo, está abierto), se guarda con otro nombre.
+            otra = main.insertar_en_pdf({}, persona, ruta=Path(self.temporal.name) / "no existe" / "informe.pdf")
+        self.assertEqual(reemplazo, primera)
+        with pymupdf.open(primera) as doc:
+            self.assertIn("Plantilla de prueba", doc[0].get_text())
+        self.assertEqual(otra, primera.with_name("123456 - Persona Prueba (2).pdf"))
+        self.assertTrue(otra.exists())
+        self.assertIn("no se pudo reemplazar", log.call_args.args[0])
+
     def test_no_oculta_error_de_permisos(self):
         with patch.object(Path, "mkdir", side_effect=PermissionError("sin permiso")):
             with self.assertRaisesRegex(PermissionError, "sin permiso"):

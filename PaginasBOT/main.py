@@ -659,8 +659,9 @@ def borrar_capturas_viejas():
         log(f"Capturas: se borraron {borradas} imágenes y PDF de días anteriores.")
 
 
-def insertar_en_pdf(capturas: dict[str, Path], persona: dict, caidos: set[str] = frozenset()) -> Path:
-    """`caidos`: sitios fuera de servicio; su captura es la página caída."""
+def insertar_en_pdf(capturas: dict[str, Path], persona: dict, caidos: set[str] = frozenset(),
+                    ruta: Path | None = None) -> Path:
+    """`caidos`: sitios fuera de servicio; su captura es la página caída. Con `ruta`, reemplaza ese informe."""
     formato = persona["formato"]
     # Mujer.pdf trae un objeto interno mal ubicado: si la reparación automática llega al guardar, descarta los cambios.
     with pymupdf.open(PLANTILLAS[formato]) as plantilla:
@@ -688,6 +689,14 @@ def insertar_en_pdf(capturas: dict[str, Path], persona: dict, caidos: set[str] =
                 doc.insert_pdf(anexo)
         elif clave not in omitidos:
             log(f"PDF: falta el documento de {clave}; se omite.")
+    if ruta:
+        try:
+            # Sin compresión, las capturas PNG dejan el PDF en ~50 MB; deflate es sin pérdida.
+            doc.save(ruta, garbage=3, deflate=True)
+            doc.close()
+            return ruta
+        except Exception as e:
+            log(f"PDF: no se pudo reemplazar {ruta.name} ({e}); ¿está abierto? Se guarda con otro nombre.")
     carpeta = carpeta_salidas()
     base = re.sub(r'[<>:"/\\|?*]', "", f"{persona['numero']} - {persona['nombre']}").strip()
     ruta = carpeta / f"{base}.pdf"
@@ -695,7 +704,6 @@ def insertar_en_pdf(capturas: dict[str, Path], persona: dict, caidos: set[str] =
     while ruta.exists():
         ruta = carpeta / f"{base} ({contador}).pdf"
         contador += 1
-    # Sin compresión, las capturas PNG dejan el PDF en ~50 MB; deflate es sin pérdida.
     doc.save(ruta, garbage=3, deflate=True)
     doc.close()
     return ruta
@@ -1955,13 +1963,15 @@ CONSULTAS_CHROME = {
 }
 
 
-def abrir_paginas_chrome(persona: dict) -> set[int] | None:
-    """FBI y Consilium solo cargan en Chrome: se abren al empezar, cada una en su ventana minimizada, y cargan
-    mientras se resuelven los captchas; al final solo queda capturarlas. Devuelve las ventanas que ya había."""
+def abrir_paginas_chrome(persona: dict, claves: list[str]) -> set[int] | None:
+    """FBI y Consilium (las de `claves`) solo cargan en Chrome: se abren al empezar, cada una en su ventana
+    minimizada, y cargan mientras se resuelven los captchas; al final solo queda capturarlas. Devuelve las ventanas
+    que ya había."""
+    urls = {"fbi": url_fbi, "consilium": url_consilium}
     with PANTALLA:
-        antes = abrir_en_ventanas([url_fbi(persona), url_consilium(persona)])
+        antes = abrir_en_ventanas([urls[clave](persona) for clave in claves])
     if antes is None:
-        log("Chrome: no se reconoce el navegador por defecto; FBI y Consilium se abrirán al capturarlas.")
+        log("Chrome: no se reconoce el navegador por defecto; sus páginas se abrirán al capturarlas.")
     return antes
 
 
@@ -2012,9 +2022,18 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
     omitidos = sin_fecha_expedicion(persona)
     if omitidos:
         log(f"Sin fecha de expedición: se omite {', '.join(c for c in documentos.ORDEN if c in omitidos)}.")
+    # En un reintento solo se consultan los sitios que fallaron.
+    solo = persona.get("solo")
+    if solo is not None:
+        log(f"Reintento: se consulta de nuevo {', '.join(sorted(solo))}.")
+
+    def fuera(clave: str) -> bool:
+        return solo is not None and clave not in solo
+
     # Chrome espera a que cada sitio con captcha esté listo.
-    for clave in omitidos & listos.keys():
-        listos[clave].set()
+    for clave in listos:
+        if clave in omitidos or fuera(clave):
+            listos[clave].set()
     antes_chrome = None
     # Si el navegador automático no puede con State.gov o Justice, se capturan en Chrome como antes.
     a_chrome = []
@@ -2031,12 +2050,18 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
 
     async def abrir_en_chrome():
         nonlocal antes_chrome
+        claves = [clave for clave in ("fbi", "consilium") if not fuera(clave)]
+        if not claves:
+            return
         try:
-            antes_chrome = await asyncio.to_thread(abrir_paginas_chrome, persona)
+            antes_chrome = await asyncio.to_thread(abrir_paginas_chrome, persona, claves)
         except Exception as e:
-            log(f"Chrome: no se pudieron abrir de antemano FBI y Consilium ({e}); se abrirán al capturarlas.")
+            log(f"Chrome: no se pudieron abrir de antemano sus páginas ({e}); se abrirán al capturarlas.")
 
     async def registrar(clave: str, consulta):
+        if fuera(clave):
+            consulta.close()
+            return
         with medir_sitio(clave):
             await _registrar(clave, consulta)
 
@@ -2114,7 +2139,8 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
         sitios = [sitio("terroristas", url_terroristas(persona), TITULO_TERRORISTAS)]
         if consulta_justicia.DESCANSO:
             # No se visita: en Chrome se da por caída sin abrirla.
-            a_chrome.append("justicia")
+            if not fuera("justicia"):
+                a_chrome.append("justicia")
         else:
             sitios.append(sitio("justicia", url_justicia(persona), TITULO_JUSTICIA))
         await asyncio.gather(*sitios)
@@ -2217,6 +2243,8 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
         async def abierta(clave, url, titulo):
             # Apenas carga su ventana se captura, en el primer hueco sin captchas esperando la pantalla. Si no carga
             # (o no se pudo abrir de antemano), se captura después de los captchas para no hacerlos esperar.
+            if fuera(clave):
+                return
             await apertura_chrome
             if antes_chrome is None or not await cargada(url, titulo):
                 await enviados()
@@ -2236,7 +2264,7 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
                              abierta("consilium", url_consilium(persona), TITULO_CONSILIUM),
                              respaldo(), tiempo_captchas())
         log(f"Tiempo: capturas en Chrome listas a los {minutos(time.monotonic() - inicio)}")
-        if persona["formato"] == "Gallagher":
+        if persona["formato"] == "Gallagher" and not fuera("insight"):
             async with turnos.pantalla():
                 await registrar("insight", insight())
 
@@ -2249,10 +2277,11 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
         ("antecedentes", documentos.consultar_antecedentes),
         ("registraduria", documentos.consultar_registraduria, preguntar),
         ("inhabilidades", documentos.consultar_inhabilidades),
-    ) if clave not in omitidos]
+    ) if clave not in omitidos and not fuera(clave)]
     # El RUNT, primer captcha, va solo hasta que le toca su turno: con todo a la vez, su página y las de los demás
-    # captchas tardaban más de un minuto en abrir. Lo demás carga mientras se escribe su código.
-    primero = asyncio.create_task(con_captcha(*captchas[0]))
+    # captchas tardaban más de un minuto en abrir. Lo demás carga mientras se escribe su código. Un reintento puede
+    # no tener captchas.
+    primero = asyncio.create_task(con_captcha(*captchas[0]) if captchas else asyncio.sleep(0))
     # FBI y Consilium se abren ya: abrirlas toma la pantalla unos segundos y así no retrasan la pregunta del RUNT.
     apertura_chrome = asyncio.create_task(abrir_en_chrome())
     turno = asyncio.create_task(turnos.repartido.wait())
@@ -2293,8 +2322,10 @@ async def consultar_persona(persona: dict, r: dict, preguntar, preguntar_edge) -
     )
     # FBI y Consilium se abren en ventanas nuevas en cada consulta: no queda ninguna abierta.
     await asyncio.to_thread(cerrar_ventanas_abiertas)
-    renovar_ventanas(r, omitidos)
-    r["precargas"]["simit"] = asyncio.create_task(r["precargar_simit"]())
+    # Lo que no se consultó en un reintento conserva su ventana y su formulario precargado.
+    renovar_ventanas(r, omitidos | {clave for clave in CON_CASILLA if fuera(clave)})
+    if not fuera("simit"):
+        r["precargas"]["simit"] = asyncio.create_task(r["precargar_simit"]())
     return capturas, caidos
 
 
@@ -2316,7 +2347,9 @@ def renovar_ventanas(r: dict, omitidos: set[str]):
 async def procesar(persona: dict, apertura: asyncio.Task, preguntar, preguntar_edge) -> Path | None:
     """Consulta a la persona en todos los sitios y arma su informe; devuelve el PDF (None si no hubo capturas)."""
     inicio = time.monotonic()
-    await asyncio.to_thread(borrar_capturas_viejas)
+    # Un reintento arma el informe con las capturas de la consulta anterior: no se borran aunque sean de otro día.
+    if not persona.get("solo"):
+        await asyncio.to_thread(borrar_capturas_viejas)
     expedicion = persona["fecha_expedicion"]
     log(
         f"Datos: {persona['nombre']} | {persona['tipo']} {persona['numero']} | {persona['empresa']} | "
@@ -2342,7 +2375,13 @@ async def procesar(persona: dict, apertura: asyncio.Task, preguntar, preguntar_e
         await asyncio.to_thread(cerrar_ventanas_abiertas)
         if r["precargas"]["simit"].done():
             r["precargas"]["simit"] = asyncio.create_task(r["precargar_simit"]())
-    ruta = insertar_en_pdf(capturas, persona, caidos) if capturas else None
+    # Reintento: lo nuevo se suma a lo de la consulta anterior y reemplaza su informe.
+    previo = persona.get("informe") if persona.get("solo") else None
+    if previo:
+        caidos = (previo["caidos"] - capturas.keys()) | caidos
+        capturas = {**previo["capturas"], **capturas}
+    ruta = insertar_en_pdf(capturas, persona, caidos, previo and previo["ruta"]) if capturas else None
+    persona["informe"] = {"capturas": capturas, "caidos": caidos, "ruta": ruta}
     if ruta:
         log(f"PDF: {ruta}")
     log(f"Tiempo total: {minutos(time.monotonic() - inicio)}")

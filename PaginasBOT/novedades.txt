@@ -1,6 +1,10 @@
 # Lo que ve cada equipo en la ventana de novedades al actualizarse. Lo más nuevo arriba.
 # Cada versión empieza con una línea «== título ==» distinta; cada cambio, con «- ». Las líneas con # no se muestran.
 
+== 30 de octubre de 2026 (botón Reintentar fallidas) ==
+- Al terminar, si alguna página falló o quedó «Fuera de servicio», aparece el botón «Reintentar fallidas»: vuelve a consultar solo esas páginas, sin repetir las demás, y actualiza el mismo informe con lo nuevo. Si el PDF está abierto y no se puede reemplazar, se guarda con otro nombre.
+- Mientras Justice.gov esté en descanso no hace aparecer «Reintentar fallidas»: el botón sale solo si otra página falló.
+
 == 29 de octubre de 2026 (botón Detener consulta) ==
 - Mientras se consulta hay un botón «Detener consulta»: si algo se demora mucho, se detiene y el informe se arma con las páginas ya capturadas. Las que faltaron quedan como fallidas y se pueden reintentar.
 

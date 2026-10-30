@@ -86,6 +86,70 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
 
         await self.verificar_cola("Hombre", consultas_edge=en_chrome, descanso=True)
 
+    async def test_reintento_solo_consulta_las_fallidas(self):
+        pedidas_chrome = []
+
+        def en_chrome(persona, preguntar, pedidas, antes, caidos):
+            pedidas_chrome.extend(pedidas)
+            return {clave: Path(f"{clave}.png") for clave in pedidas}
+
+        solo = {"inhabilidades", "fbi", "govuk", "terroristas", "rnmc"}
+        resultado = await self.verificar_cola("Hombre", consultas_edge=en_chrome, solo=solo)
+        self.assertEqual(set(resultado.capturas), solo)
+        self.assertEqual(resultado.caidos, set())
+        self.assertEqual(sorted(resultado.iniciados), ["govuk", "rnmc", "terroristas"])
+        # En Chrome solo se abre y se captura lo que falló.
+        self.assertEqual(self.abrir_chrome.call_args.args[1], ["fbi"])
+        self.assertEqual(pedidas_chrome, ["fbi"])
+        # Lo que no se reintentó conserva su formulario precargado y no gasta su ventana de captcha.
+        resultado.r["precargar_simit"].assert_not_called()
+        self.assertEqual(resultado.r["usos"], {"antecedentes": 0, "inhabilidades": 1})
+
+    async def test_reintento_sin_captchas_ni_justice_en_descanso(self):
+        def en_chrome(persona, preguntar, pedidas, antes, caidos):
+            return {clave: Path(f"{clave}.png") for clave in pedidas}
+
+        resultado = await self.verificar_cola("Hombre", consultas_edge=en_chrome, descanso=True,
+                                              solo={"simit", "consilium"})
+        self.assertEqual(set(resultado.capturas), {"simit", "consilium"})
+        self.assertEqual(resultado.caidos, set())
+        self.assertEqual(resultado.iniciados, ["automatica"])
+        self.assertEqual(self.abrir_chrome.call_args.args[1], ["consilium"])
+        resultado.r["precargar_simit"].assert_called_once()
+        self.assertEqual(resultado.r["usos"], {"antecedentes": 0, "inhabilidades": 0})
+
+    async def procesar(self, persona: dict, capturas: dict, caidos: set):
+        apertura = asyncio.get_running_loop().create_future()
+        apertura.set_result({})
+        persona["detener"] = asyncio.Event()
+        with patch.object(main, "consultar_persona", AsyncMock(return_value=(capturas, caidos))), \
+                patch.object(main, "insertar_en_pdf",
+                             side_effect=lambda capturas, persona, caidos, ruta=None: ruta or Path("informe.pdf")) \
+                as insertar, patch.object(main, "borrar_capturas_viejas") as borrar, patch.object(main, "log"):
+            ruta = await main.procesar(persona, apertura, AsyncMock(), Mock())
+        return ruta, insertar, borrar
+
+    async def test_reintento_suma_lo_nuevo_y_reemplaza_el_mismo_informe(self):
+        persona = {"nombre": "Persona Prueba", "tipo": "CC", "numero": "123", "empresa": "EMPRESA",
+                   "ciudad": "Bogotá", "fecha_consulta": date(2026, 10, 30), "consultor": "PRUEBA",
+                   "fecha_expedicion": None, "sexo": "Hombre"}
+        ruta, insertar, borrar = await self.procesar(
+            persona, {"runt": Path("runt.png"), "fbi": Path("fbi_caida.png")}, {"fbi", "simit"})
+        self.assertEqual(ruta, Path("informe.pdf"))
+        borrar.assert_called_once()
+        self.assertIsNone(insertar.call_args.args[3])
+
+        persona["solo"] = {"fbi", "simit"}
+        ruta, insertar, borrar = await self.procesar(persona, {"fbi": Path("fbi.png")}, {"simit"})
+        self.assertEqual(ruta, Path("informe.pdf"))
+        # Las capturas de la consulta anterior pueden ser de ayer: un reintento no las borra.
+        borrar.assert_not_called()
+        capturas, _, caidos, anterior = insertar.call_args.args
+        self.assertEqual(capturas, {"runt": Path("runt.png"), "fbi": Path("fbi.png")})
+        self.assertEqual(caidos, {"simit"})
+        self.assertEqual(anterior, Path("informe.pdf"))
+        self.assertEqual(persona["informe"], {"capturas": capturas, "caidos": caidos, "ruta": Path("informe.pdf")})
+
     async def test_si_la_precarga_no_abre_mientras_se_espera_se_carga_una_vez_mas(self):
         async def precarga_caida():
             await asyncio.sleep(0.05)
@@ -110,7 +174,7 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await main.leer_captcha_a_tiempo(b"png"), "abc12")
 
     async def verificar_cola(self, formato, fecha_expedicion=date(2020, 1, 1), consultar_runt=None, captcha=None,
-                             consultas_edge=None, preparar=None, descanso=False):
+                             consultas_edge=None, preparar=None, descanso=False, solo=None):
         activos, maximo = 0, 0
         iniciados = []
         self.inicios = []
@@ -179,8 +243,9 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
                                    (documentos, "consultar_registraduria"), (documentos, "consultar_inhabilidades")):
                 propia = consultar_runt if nombre == "consultar_runt" and consultar_runt else captcha
                 stack.enter_context(patch.object(modulo, nombre, side_effect=propia))
-            for nombre in ("log", "avisar", "abrir_paginas_chrome"):
+            for nombre in ("log", "avisar"):
                 stack.enter_context(patch.object(main, nombre))
+            self.abrir_chrome = stack.enter_context(patch.object(main, "abrir_paginas_chrome"))
             cerrar_ventanas = stack.enter_context(patch.object(main, "cerrar_ventanas_abiertas"))
             stack.enter_context(patch.object(rendimiento, "log"))
             stack.enter_context(patch.object(main, "limite_concurrencia", return_value=2))
@@ -194,10 +259,14 @@ class OptimizacionTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(main.consulta_justicia, "DESCANSO", descanso))
             stack.enter_context(patch.object(main, "consultas_edge", side_effect=consultas_edge,
                                             return_value={"fbi": Path("fbi.png"), "consilium": Path("consilium.png")}))
-            capturas, caidos = await asyncio.wait_for(main.consultar_persona(
-                {"formato": formato, "sexo": "Hombre", "nombre": "Prueba", "tipo": "CC",
-                 "fecha_expedicion": fecha_expedicion},
-                r, AsyncMock(), Mock()), 5)
+            persona = {"formato": formato, "sexo": "Hombre", "nombre": "Prueba", "tipo": "CC",
+                       "fecha_expedicion": fecha_expedicion}
+            if solo is not None:
+                persona["solo"] = solo
+            capturas, caidos = await asyncio.wait_for(main.consultar_persona(persona, r, AsyncMock(), Mock()), 5)
+        if solo is not None:
+            cerrar_ventanas.assert_called_once()
+            return SimpleNamespace(capturas=capturas, caidos=caidos, iniciados=iniciados, r=r)
         self.assertTrue(govuk_listo.is_set())
         self.assertEqual(maximo, 2)
         self.assertEqual(caidos, {"justicia"} if descanso else set())
