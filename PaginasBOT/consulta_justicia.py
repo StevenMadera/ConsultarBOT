@@ -11,7 +11,7 @@ URL_JUSTICIA = (
 )
 TITULO_JUSTICIA = "Information for Victims in Large Cases"
 # Desde el 28/10/2026 su cuenta regresiva no termina desde ninguna red: se da por caído sin abrirlo.
-DESCANSO = False
+DESCANSO = True
 MOTIVO_DESCANSO = "en descanso: el sitio repite sin fin su cuenta regresiva desde cualquier conexión"
 
 
